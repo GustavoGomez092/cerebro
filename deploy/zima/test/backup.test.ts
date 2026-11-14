@@ -286,31 +286,55 @@ echo done
   const backups = (f: string) => readdirSync(root).filter((n) => n.startsWith(`${f}.bak-cerebro-`));
   const occurrences = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 
-  test("adds the cerebro excludes once, next to the postgres one, and keeps the script valid", () => {
+  // The data dir as deploy/zima/lib.sh defines it (db, ollama models and the Claude login all live under it).
+  const DATA = run(["bash", "-c", `source ${join(ZIMA, "lib.sh")}; printf %s "$DATA"`]).out;
+  const LINE = `    --exclude '${DATA}/' \\\n`;
+  const PG_LINE = "    --exclude '/DATA/AppData/postgres/data/' \\\n";
+
+  test("lib.sh's data dir is the one the exclusion covers", () => {
+    expect(DATA).toBe("/DATA/AppData/cerebro/data");
+  });
+
+  test("adds the cerebro data exclude once, next to the postgres one, and keeps the script valid", () => {
     const f = join(root, "zima-backup.sh");
     writeFileSync(f, SAMPLE);
     expect(exclude(f).code).toBe(0);
     const once = readFileSync(f, "utf8");
     expect(exclude(f).code).toBe(0); // idempotent
     expect(readFileSync(f, "utf8")).toBe(once);
-    expect(occurrences(once, /AppData\/cerebro\/db/g)).toBe(1);
-    expect(occurrences(once, /AppData\/cerebro\/ollama/g)).toBe(1);
-    expect(once).toContain("    --exclude '/DATA/AppData/postgres/data/' \\\n    --exclude '/DATA/AppData/cerebro/db/' \\\n    --exclude '/DATA/AppData/cerebro/ollama/' \\\n");
-    expect(once.replace(/.*cerebro.*\n/g, "")).toBe(SAMPLE); // nothing else changed
+    expect(once).toContain(PG_LINE + LINE);
+    expect(occurrences(once, /cerebro/g)).toBe(1);
+    expect(once.replace(LINE, "")).toBe(SAMPLE); // nothing else changed
     expect(run(["bash", "-n", f]).code).toBe(0);
     const [bak, ...rest] = backups("zima-backup.sh");
     expect(rest).toEqual([]); // the idempotent second run made no second backup
     expect(readFileSync(join(root, bak), "utf8")).toBe(SAMPLE);
   });
 
-  test("a half-applied script only gets the missing line, and comments do not count", () => {
+  test("an earlier wrong pair (cerebro/db, cerebro/ollama) is replaced by the data exclude", () => {
+    const f = join(root, "old-pair.sh");
+    const old = SAMPLE.replace(PG_LINE, PG_LINE + "    --exclude '/DATA/AppData/cerebro/db/' \\\n    --exclude '/DATA/AppData/cerebro/ollama/' \\\n");
+    writeFileSync(f, old);
+    const r = exclude(f);
+    expect(r.code, r.out + r.err).toBe(0);
+    const out = readFileSync(f, "utf8");
+    expect(out).toBe(SAMPLE.replace(PG_LINE, PG_LINE + LINE));
+    expect(run(["bash", "-n", f]).code).toBe(0);
+    expect(readFileSync(join(root, backups("old-pair.sh")[0]), "utf8")).toBe(old);
+    expect(exclude(f).code).toBe(0);
+    expect(readFileSync(f, "utf8")).toBe(out);
+  });
+
+  test("a half-applied wrong pair is replaced too, and comments do not count", () => {
     const f = join(root, "half.sh");
-    const half = SAMPLE.replace("    --exclude '/DATA/AppData/postgres/data/' \\\n", "    --exclude '/DATA/AppData/postgres/data/' \\\n    --exclude '/DATA/AppData/cerebro/db/' \\\n").replace("#!/bin/bash\n", "#!/bin/bash\n# TODO exclude AppData/cerebro/ollama someday\n");
+    const half = SAMPLE.replace(PG_LINE, PG_LINE + "    --exclude '/DATA/AppData/cerebro/db/' \\\n")
+      .replace("#!/bin/bash\n", "#!/bin/bash\n# TODO exclude /DATA/AppData/cerebro/data/ someday\n");
     writeFileSync(f, half);
     expect(exclude(f).code).toBe(0);
     const out = readFileSync(f, "utf8");
-    expect(occurrences(out, /--exclude '\/DATA\/AppData\/cerebro\/db/g)).toBe(1);
-    expect(occurrences(out, /--exclude '\/DATA\/AppData\/cerebro\/ollama/g)).toBe(1);
+    expect(occurrences(out, /--exclude '\/DATA\/AppData\/cerebro\/data\/'/g)).toBe(1);
+    expect(out).not.toContain("cerebro/db");
+    expect(out).toContain("# TODO exclude /DATA/AppData/cerebro/data/ someday");
     expect(run(["bash", "-n", f]).code).toBe(0);
   });
 

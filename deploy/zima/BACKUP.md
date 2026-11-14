@@ -12,8 +12,9 @@
   worker catch up (weekly dumps already contain the vectors).
 - `secrets/` is covered by the nightly `zima-backup` snapshot of `/DATA/AppData`. The Claude login dir is not backed
   up: re-login is the recovery.
-- `exclude-from-zima-backup.sh` (owner, once, root): adds `/DATA/AppData/cerebro/db` and `/DATA/AppData/cerebro/ollama`
-  to the excludes of `/DATA/AppData/backup/zima-backup.sh`, mirroring its `postgres/data` exclude. Idempotent, keeps
-  `zima-backup.sh.bak-cerebro`. Afterwards record it in the `operating-zima-home-server` skill (Backups row).
+- `exclude-from-zima-backup.sh` (owner, once, root): adds `/DATA/AppData/cerebro/data/` (Postgres files, Ollama
+  models, Claude login) to the excludes of `/DATA/AppData/backup/zima-backup.sh`, mirroring its `postgres/data`
+  exclude (an earlier `cerebro/db` + `cerebro/ollama` pair is replaced). Idempotent, keeps
+  `zima-backup.sh.bak-cerebro-<timestamp>`. Afterwards record it in the `operating-zima-home-server` skill (Backups row).
 - Install the timer: copy `systemd/cerebro-backup.{service,timer}` to `/etc/systemd/system/`, `systemctl daemon-reload`,
   `systemctl enable --now cerebro-backup.timer`.
