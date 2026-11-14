@@ -3,6 +3,7 @@ import type { Binding, SearchHit, SearchRequest, SearchResponse, SearchScope } f
 import { resolveBinding } from "./bindings";
 import { EmbedderError, toVector, type Embedder } from "./embed/embedder";
 import type { EmbedGate } from "./worker";
+import { pgState } from "./db";
 
 const CANDIDATES = 50;
 const RRF_K = 60;
@@ -57,7 +58,7 @@ export function queryTerms(query: string): string[] {
   return [...new Set(kept.length ? kept : words)].slice(0, 16);
 }
 
-const isTimeout = (e: unknown) => ((e as any)?.code ?? (e as any)?.errno) === "57014";
+const isTimeout = (e: unknown) => pgState(e) === "57014";
 
 async function ftsLeg(sql: SQL, scope: SearchScope, req: SearchRequest, terms: string[]) {
   if (!terms.length) return [];

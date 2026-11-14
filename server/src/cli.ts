@@ -1,11 +1,25 @@
 import { loadConfig } from "./config";
 import { connect, migrate } from "./db";
 import { createToken, revokeToken } from "./auth";
+import { redactSession } from "./redact-session";
 
-const usage = "usage: bun server/src/cli.ts token create|revoke <machine> | token list";
+const usage = [
+  "usage: bun server/src/cli.ts token create|revoke <machine>",
+  "       bun server/src/cli.ts token list",
+  "       bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret and rebuild its search index",
+].join("\n");
 
 async function main(argv: string[]) {
   const [area, cmd, name] = argv;
+  if (area === "redact" && cmd) {
+    const sql = connect(loadConfig(process.env).databaseUrl);
+    try {
+      await migrate(sql);
+      const r = await redactSession(sql, cmd, name);
+      console.log(`redacted ${r.events} event(s); rebuilt ${r.chunks} search chunk(s), queued for re-embedding`);
+    } finally { await sql.close(); }
+    return;
+  }
   if (area !== "token" || !cmd) throw new Error(usage);
   const sql = connect(loadConfig(process.env).databaseUrl);
   try {
@@ -13,6 +27,7 @@ async function main(argv: string[]) {
     if (cmd === "create" && name) {
       const { token } = await createToken(sql, name);
       console.log(`Token for ${name} (shown once, store it on that machine):\n${token}`);
+      console.log("Do not create tokens inside a recorded Claude Code session: the token would be saved in Cerebro's memory.");
     } else if (cmd === "revoke" && name) {
       console.log((await revokeToken(sql, name)) ? `revoked ${name}` : `no active token for ${name}`);
     } else if (cmd === "list") {

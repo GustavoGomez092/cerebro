@@ -9,4 +9,4 @@ COPY shared shared
 COPY server server
 USER bun
 EXPOSE 8790
-CMD ["bun", "server/src/main.ts"]
+CMD ["bun", "--no-install", "server/src/main.ts"]

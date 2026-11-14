@@ -25,12 +25,13 @@ export const INDEXABLE_CHARS = 32_000;
 
 /**
  * Extra full-text terms for identifiers the tokenizer keeps whole: `server/src/indexer.ts`
- * also yields `server src indexer ts`, `chunkEvents` yields `chunk events`.
+ * also yields `server src indexer ts`, `chunkEvents` yields `chunkevents chunk events`.
  */
 export function searchTerms(text: string): string {
   const out = new Set<string>();
   for (const m of text.matchAll(/[\p{L}\p{N}]+(?:[/._-][\p{L}\p{N}]+)+|\p{Ll}+\p{Lu}[\p{L}\p{N}]*/gu)) {
     for (const part of m[0].split(/[/._-]/)) {
+      if (part.length > 1) out.add(part.toLowerCase());
       for (const w of part.split(/(?<=\p{Ll})(?=\p{Lu})/u)) if (w.length > 1) out.add(w.toLowerCase());
     }
   }

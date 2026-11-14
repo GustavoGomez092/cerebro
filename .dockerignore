@@ -4,3 +4,9 @@ node_modules
 .superpowers
 docs
 **/test
+.env
+.env.*
+**/.env
+**/.env.*
+*.local
+**/*.local

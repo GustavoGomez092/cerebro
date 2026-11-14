@@ -62,3 +62,9 @@ export async function checkEmbedSettings(sql: SQL, model: string, dims: number):
   if (s.embed_model !== model || s.embed_dims !== dims)
     throw new Error(`stored embeddings use ${s.embed_model} (${s.embed_dims} dims); configured ${model} (${dims}). Re-embedding is required to switch.`);
 }
+
+/** SQLSTATE of a Postgres error (Bun reports it in `errno`), or null. */
+export function pgState(e: unknown): string | null {
+  const s = (e as any)?.errno;
+  return typeof s === "string" && /^[0-9A-Z]{5}$/.test(s) ? s : null;
+}

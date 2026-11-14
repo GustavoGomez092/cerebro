@@ -5,7 +5,8 @@ import {
   type IngestRejection, type IngestResult,
 } from "@cerebro/shared";
 import { normalizeSubpath, BindingError } from "./bindings";
-import { chunkEvents, searchTerms, type ChunkInput } from "./chunker";
+import type { ChunkInput } from "./chunker";
+import { storeChunks } from "./chunk-store";
 import type { Machine } from "./auth";
 
 const MIN_YEAR = 1970, MAX_YEAR = 2200;
@@ -148,28 +149,7 @@ export async function ingestBatch(
       list.push({ seq: r.seq, ts: r.ts.toISOString(), kind: r.kind, text: r.text, toolName: r.tool_name, toolInput: r.tool_input });
       bySession.set(r.session_id, list);
     }
-    const chunkRows: any[] = [];
-    for (const [sessionId, list] of bySession) {
-      list.sort((a, b) => a.seq - b.seq);
-      for (const c of chunkEvents(list)) {
-        chunkRows.push({
-          session_id: sessionId, first_seq: c.firstSeq, last_seq: c.lastSeq, part: c.part, ts_from: c.tsFrom, ts_to: c.tsTo,
-          text: c.text, extra_terms: searchTerms(c.text), priority: existing.get(sessionId) ? 1 : 0,
-        });
-      }
-    }
-    if (chunkRows.length) {
-      await tx`
-        with ins as (
-          insert into chunks (session_id, first_seq, last_seq, part, ts_from, ts_to, text, extra_terms)
-          select x.session_id, x.first_seq, x.last_seq, x.part, x.ts_from, x.ts_to, x.text, x.extra_terms
-          from jsonb_to_recordset(${JSON.stringify(chunkRows)}::text::jsonb) as x(
-            session_id text, first_seq integer, last_seq integer, part integer, ts_from timestamptz, ts_to timestamptz, text text, extra_terms text)
-          on conflict (session_id, first_seq, last_seq, part) do nothing
-          returning id, session_id)
-        insert into embed_queue (chunk_id, priority)
-        select ins.id, case when s.imported then 1 else 0 end from ins join sessions s on s.id = ins.session_id`;
-    }
+    for (const [sessionId, list] of bySession) await storeChunks(tx, sessionId, list, existing.get(sessionId) ? 1 : 0);
 
     // Session bookkeeping: last activity only moves forward; later activity reopens an ended session.
     if (bySession.size) {

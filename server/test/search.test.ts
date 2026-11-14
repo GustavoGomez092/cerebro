@@ -21,7 +21,7 @@ async function world(opts: { embedder?: Embedder } = {}) {
   const day = (d: number) => new Date(Date.UTC(2026, 9, d, 12)).toISOString();
   const add = async (sid: string, binding: any, repo: string, text: string, ts: string) =>
     ingest(t, { sessions: [{ ...sess(sid, binding.id, { repo }), startedAt: ts }], events: [{ ...ev(sid, 1, "user", text), ts }] });
-  await add("s1", b1, "github.com/a/one", "pricing tiers for the Acme dashboard, fixed the login bug on staging in auth/cookies.ts", day(1));
+  await add("s1", b1, "github.com/a/one", "pricing tiers for the Acme dashboard, fixed the login bug on staging in auth/cookies.ts via lib/authCookies.ts", day(1));
   await add("s2", b2, "github.com/b/two", "pricing for Beta Corp renewal", day(10));
   await add("s3", b3, "github.com/a/three", "pricing notes for Acme marketing", day(20));
   await embedPending(t.sql, fakeEmbedder(), { state: newWorkerState() });
@@ -116,7 +116,7 @@ test("date range filters by chunk time; an inverted range is 400", async () => {
 test("natural questions and file names match through full-text alone", async () => {
   const { t, search } = await world({ embedder: down });
   try {
-    for (const q of ["how did we fix the login bug on staging?", "cookies.ts", "cookies", "Cookies", "auth"]) {
+    for (const q of ["how did we fix the login bug on staging?", "cookies.ts", "cookies", "Cookies", "auth", "authCookies"]) {
       const r = await search({ query: q, scope: "open" });
       expect(r.degraded).toBe(true);
       expect(r.hits.map((h: any) => h.sessionId)).toContain("s1");

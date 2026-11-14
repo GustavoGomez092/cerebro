@@ -53,3 +53,8 @@ test("identifiers yield extra search terms", () => {
   expect(terms).toEqual(expect.arrayContaining(["server", "src", "auth", "cookies", "ts", "chunk", "events", "my", "file", "name"]));
   expect(searchTerms("plain words only")).toBe("");
 });
+
+test("camelCase path segments are searchable whole as well as split", () => {
+  const terms = searchTerms("see server/src/launchPlan.ts").split(" ");
+  expect(terms).toEqual(expect.arrayContaining(["launchplan", "launch", "plan"]));
+});
