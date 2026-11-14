@@ -186,8 +186,10 @@ export async function ingestBatch(
 }
 
 export async function endSession(sql: SQL, sessionId: string, endedAt: string): Promise<boolean> {
-  const rows = await sql`update sessions set ended_at = ${endedAt} where id = ${sessionId} returning id, imported`;
-  if (!rows.length) return false;
-  await enqueueSummary(sql, sessionId, { priority: rows[0].imported ? 1 : 0 });
-  return true;
+  return sql.begin(async (tx) => {
+    const rows = await tx`update sessions set ended_at = ${endedAt} where id = ${sessionId} returning id, imported`;
+    if (!rows.length) return false;
+    await enqueueSummary(tx, sessionId, { priority: rows[0].imported ? 1 : 0 });
+    return true;
+  });
 }

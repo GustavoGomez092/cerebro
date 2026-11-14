@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { authedApp } from "./helpers";
+import { connect } from "../src/db";
 import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
 import {
@@ -48,7 +49,9 @@ test("claim prefers live jobs and never hands one job to two workers", async () 
     await enqueueSummary(t.sql, "imp", { priority: 1 });
     await enqueueSummary(t.sql, "live1", { priority: 0 });
     await enqueueSummary(t.sql, "live2", { priority: 0 });
-    const [a, b] = await Promise.all([claimSummaryJob(t.sql), claimSummaryJob(t.sql)]);
+    const c1 = connect(t.url, { max: 1 }), c2 = connect(t.url, { max: 1 });
+    let a, b;
+    try { [a, b] = await Promise.all([claimSummaryJob(c1), claimSummaryJob(c2)]); } finally { await c1.close(); await c2.close(); }
     expect(a && b).toBeTruthy();
     expect(a!.sessionId).not.toBe(b!.sessionId);
     expect(new Set([a!.sessionId, b!.sessionId])).toEqual(new Set(["live1", "live2"]));
@@ -149,5 +152,81 @@ test("retryable failures keep attempts at 0; five real failures dead-letter", as
     }
     await t.sql`update summary_jobs set due_at = now()`;
     expect(await claimSummaryJob(t.sql)).toBeNull();
+  } finally { await t.drop(); }
+});
+
+test("scheduling queues imported sessions at low priority", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, {
+      sessions: [sess("imp", binding.id, { imported: true }), sess("live", binding.id)],
+      events: [...msgs("imp", 1, 150), ...msgs("live", 1, 150)],
+    });
+    await t.sql`delete from summary_jobs`;
+    expect(await scheduleGrowingSessions(t.sql)).toBe(2);
+    const rows = await t.sql`select session_id, priority from summary_jobs order by session_id`;
+    expect(rows.map((r: any) => [r.session_id, r.priority])).toEqual([["imp", 1], ["live", 0]]);
+  } finally { await t.drop(); }
+});
+
+test("completing waits for the job lock so a concurrent enqueue's new events are not lost", async () => {
+  const t = await authedApp();
+  const a = connect(t.url, { max: 1 }), b = connect(t.url, { max: 1 });
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)], events: msgs("s", 1, 10) });
+    await enqueueSummary(t.sql, "s", { priority: 0 });
+    let done: Promise<void> | undefined;
+    await a.begin(async (tx) => {
+      await tx`select 1 from summary_jobs where session_id = 's' for update`;
+      done = completeSummaryJob(b, "s", 10);
+      await Bun.sleep(300);
+      await tx`insert into events (session_id, key, seq, ts, kind, text) values ('s', 's:11', 11, now(), 'user', 'late')`;
+    });
+    await done;
+    const rows = await t.sql`select covered_seq from summary_jobs where session_id = 's'`;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].covered_seq).toBe(10);
+  } finally { await a.close(); await b.close(); await t.drop(); }
+});
+
+test("claim never reports coverage behind the stored summaries", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)], events: msgs("s", 1, 60) });
+    await enqueueSummary(t.sql, "s", { priority: 0 });
+    await t.sql`update summary_jobs set covered_seq = -1 where session_id = 's'`;
+    await t.sql`insert into summaries (session_id, kind, binding_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+      values ('s', 'session', ${binding.id}, 1, 40, now(), now(), 't', '{}', 'x', 'm')`;
+    expect((await claimSummaryJob(t.sql))!.coveredSeq).toBe(40);
+  } finally { await t.drop(); }
+});
+
+test("a retryable failure honours an explicit dueAt", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)] });
+    await enqueueSummary(t.sql, "s", { priority: 0 });
+    await claimSummaryJob(t.sql);
+    const at = new Date(Date.now() + 5 * 3600_000);
+    await failSummaryJob(t.sql, "s", "limit", { retryable: true, dueAt: at });
+    const [j] = await t.sql`select due_at from summary_jobs where session_id = 's'`;
+    expect(Math.abs(j.due_at.getTime() - at.getTime())).toBeLessThan(1000);
+  } finally { await t.drop(); }
+});
+
+test("ending a session and queueing its job are one transaction", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)] });
+    await t.sql`create function fail_job() returns trigger language plpgsql as $$ begin raise exception 'nope'; end $$`;
+    await t.sql`create trigger fail_job before insert on summary_jobs for each row execute function fail_job()`;
+    await expect(endSession(t.sql, "s", new Date().toISOString())).rejects.toThrow();
+    const [s] = await t.sql`select ended_at from sessions where id = 's'`;
+    expect(s.ended_at).toBeNull();
   } finally { await t.drop(); }
 });

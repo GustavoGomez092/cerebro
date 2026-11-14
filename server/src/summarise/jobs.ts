@@ -41,7 +41,8 @@ export async function scheduleGrowingSessions(
       group by cov.id
     )
     insert into summary_jobs (session_id, priority, covered_seq)
-    select unc.id, 0, cov.covered from unc join cov using (id)
+    select unc.id, case when s.imported then 1 else 0 end, cov.covered
+    from unc join cov using (id) join sessions s on s.id = unc.id
     where unc.n >= ${minNew}
        or (unc.n >= 20 and unc.oldest < now() - make_interval(hours => ${maxAge}))
     on conflict (session_id) do nothing
@@ -54,7 +55,9 @@ export async function claimSummaryJob(
   sql: SQL, leaseSeconds = 900,
 ): Promise<{ sessionId: string; priority: number; coveredSeq: number } | null> {
   const rows = await sql`
-    update summary_jobs set locked_until = now() + make_interval(secs => ${leaseSeconds})
+    update summary_jobs set locked_until = now() + make_interval(secs => ${leaseSeconds}),
+      covered_seq = greatest(covered_seq,
+        (select coalesce(max(m.last_seq), -1) from summaries m where m.session_id = summary_jobs.session_id and m.kind = 'session'))
     where session_id = (
       select j.session_id from summary_jobs j
       join sessions s on s.id = j.session_id
@@ -70,9 +73,14 @@ export async function claimSummaryJob(
   return { sessionId: r.session_id, priority: r.priority, coveredSeq: r.covered_seq };
 }
 
-/** Records coverage up to `coveredSeq`. Done when no user/assistant events remain beyond it; else re-dued. */
+/**
+ * Records coverage up to `coveredSeq`. Done (job deleted) when no user/assistant events remain beyond
+ * it; else re-dued. The job row is locked first, so an enqueue racing with this either lands before
+ * the count (and is seen) or waits and re-creates the job afterwards.
+ */
 export async function completeSummaryJob(sql: SQL, sessionId: string, coveredSeq: number): Promise<void> {
   await sql.begin(async (tx) => {
+    await tx`select 1 from summary_jobs where session_id = ${sessionId} for update`;
     const [{ n }] = await tx`
       select count(*)::int as n from events where session_id = ${sessionId} and kind in ('user', 'assistant') and seq > ${coveredSeq}`;
     if (n === 0) {
@@ -88,15 +96,15 @@ export async function completeSummaryJob(sql: SQL, sessionId: string, coveredSeq
 
 /**
  * Releases the lease after a failure. Retryable failures (budget, usage limit, login) do not count
- * as attempts; the others back off exponentially and dead-letter after five.
+ * as attempts (and use `dueAt` when given); the others back off exponentially and dead-letter after five.
  */
 export async function failSummaryJob(
-  sql: SQL, sessionId: string, error: string, opts: { retryable: boolean },
+  sql: SQL, sessionId: string, error: string, opts: { retryable: boolean; dueAt?: Date },
 ): Promise<void> {
   if (opts.retryable) {
     await sql`
       update summary_jobs set last_error = ${error}, locked_until = null,
-        due_at = now() + make_interval(mins => least(360, 5 * power(2, attempts))::int)
+        due_at = coalesce(${opts.dueAt?.toISOString() ?? null}::timestamptz, now() + make_interval(mins => least(360, 5 * power(2, attempts))::int))
       where session_id = ${sessionId}`;
     return;
   }
