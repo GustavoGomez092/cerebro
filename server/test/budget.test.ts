@@ -22,7 +22,9 @@ test("budget is share x window, used counts the last 5 hours only", async () => 
     expect(canSpend(s, 100)).toBe(true);
     expect(canSpend(s, 101)).toBe(false);
     await record(sql, 25, "state");
-    const s2 = await budgetState(sql, cfg, new Date());
+    // A second ahead: the row's `at` is the database clock (microseconds), which may be ahead of
+    // this host's millisecond Date.
+    const s2 = await budgetState(sql, cfg, new Date(Date.now() + 1000));
     expect(s2.used).toBe(25);
   } finally { await drop(); }
 });

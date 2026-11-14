@@ -100,7 +100,7 @@ export function summaryEmbedText(row: { title: string; body: { overview?: string
 }
 
 /** Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it). */
-async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<void> {
+export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<void> {
   const ctl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

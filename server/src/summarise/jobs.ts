@@ -13,10 +13,11 @@ const MAX_ERROR_CHARS = 2000;
 export async function enqueueSummary(
   sql: SQL, sessionId: string, opts: { priority: 0 | 1; dueAt?: Date },
 ): Promise<void> {
-  const dueAt = (opts.dueAt ?? new Date()).toISOString();
+  // "Now" is the database's clock: claims compare due_at with now(), and the app host's clock may run ahead.
+  const dueAt = opts.dueAt?.toISOString() ?? null;
   await sql`
     insert into summary_jobs (session_id, priority, due_at, covered_seq)
-    values (${sessionId}, ${opts.priority}, ${dueAt}::timestamptz,
+    values (${sessionId}, ${opts.priority}, coalesce(${dueAt}::timestamptz, now()),
       (select coalesce(max(last_seq), -1) from summaries where session_id = ${sessionId} and kind = 'session'))
     on conflict (session_id) do update set
       priority = least(summary_jobs.priority, excluded.priority),

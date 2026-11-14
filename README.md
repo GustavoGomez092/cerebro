@@ -70,7 +70,10 @@ project; anything else may search all clients. Repo spellings are normalised ser
 | `PATCH /v1/sessions/:id` | Move one session to another active binding |
 | `POST /v1/ingest` | Batch of ≤ 2000 events / ≤ 200 sessions (≤ 10 MB). Returns `{sessions, inserted, duplicates, rejected[]}`; bad items are rejected individually, the rest is stored. Event keys are unique per session. |
 | `POST /v1/sessions/:id/end` | Mark a session ended (later events reopen it) |
-| `POST /v1/search` | Hybrid search → `{scope, binding, hits[], degraded, degradedReasons[]}`; hits carry `matched` (`fts`/`vec`) and `distance` |
+| `POST /v1/search` | Hybrid search over summaries and raw chunks → `{scope, binding, hits[], degraded, degradedReasons[]}`. `include`: `all` (default), `summaries` or `raw`. Hits carry `kind` (`summary`/`chunk`), `summaryId` or `chunkId`, `matched` (`fts`/`vec`) and `distance`; summaries rank first on ties. `degradedReasons`: `embedder`, `fts_timeout`, `vector_timeout`, `summary_fts_timeout`, `summary_vector_timeout` |
+| `GET /v1/state` | The scope's running project state → `{scope, state: {doc, text, version, updatedAt} \| null}`. `scope` is `project:<id>` (locked folder, or `projectId`), `client:<id>` (`clientId`, or a client-only folder), or null |
+| `GET /v1/summaries` | Summaries in scope, newest first (`from`, `to`, `limit` ≤ 100, cursor `before`) → `{summaries[], next}`; each has `kind` (`session`/`history`), session range (null for history), dates, `title`, `overview`, `facts`, client and project names |
+| `POST /v1/summaries` | Save a folder's initial history `{repo, subpath, title ≤ 200, text ≤ 20 000, tsFrom, tsTo}` (written by the client's own Claude; no server tokens). Redacted, then embedded in the background (the reply does not wait); one per folder and period (re-sending replaces, 200; new, 201). `404 unknown_binding` if the folder is unbound, `409 binding_declined` if declined |
 | `GET /v1/sessions` | Sessions in scope, newest first (`from`, `to`, `limit`, cursor `before`) |
 | `GET /v1/sessions/:id/events` | Raw events in scope (`afterSeq`, `limit` ≤ 1000, `nextSeq`; `full=1` for untruncated tool output, capped at 2 MB per page) |
 
