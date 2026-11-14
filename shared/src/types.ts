@@ -33,3 +33,53 @@ export interface IngestSession {
 
 export interface IngestBatch { sessions: IngestSession[]; events: IngestEvent[] }
 export interface IngestResult { sessions: number; inserted: number; duplicates: number }
+
+export interface SearchRequest {
+  query: string;
+  repo?: string;
+  subpath?: string;
+  clientId?: string;
+  projectId?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+}
+
+export type SearchScope =
+  | { kind: "project"; projectId: string }
+  | { kind: "open"; clientId?: string; projectId?: string };
+
+export interface SearchHit {
+  chunkId: number;
+  sessionId: string;
+  firstSeq: number;
+  lastSeq: number;
+  tsFrom: string;
+  tsTo: string;
+  snippet: string;
+  score: number;
+  clientName: string | null;
+  projectName: string | null;
+}
+
+export interface EventView {
+  seq: number;
+  ts: string;
+  kind: EventKind;
+  text: string;
+  toolName: string | null;
+  toolInput: unknown;
+  truncated: boolean;
+}
+
+export interface SessionView {
+  id: string;
+  clientName: string | null;
+  projectName: string | null;
+  machine: string;
+  cwd: string;
+  startedAt: string;
+  lastEventAt: string | null;
+  endedAt: string | null;
+  imported: boolean;
+}

@@ -6,6 +6,8 @@ import { statusRoutes } from "./routes/status";
 import { catalogRoutes } from "./routes/catalog";
 import { bindingRoutes } from "./routes/bindings";
 import { ingestRoutes } from "./routes/ingest";
+import { searchRoutes } from "./routes/search";
+import { readRoutes } from "./routes/read";
 
 export interface AppDeps { sql: SQL; embedder: Embedder }
 export type Env = { Variables: { machine: Machine } };
@@ -22,5 +24,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.route("/v1", catalogRoutes(deps));
   app.route("/v1", bindingRoutes(deps));
   app.route("/v1", ingestRoutes(deps));
+  app.route("/v1", searchRoutes(deps));
+  app.route("/v1", readRoutes(deps));
   return app;
 }
