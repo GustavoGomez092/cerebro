@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
-import { authedApp } from "./helpers";
+import { authedApp, freshDb } from "./helpers";
+import { buildServer } from "../src/main";
 import { failoverEmbedder } from "../src/embed/failover";
 import { newWorkerState } from "../src/worker";
 
@@ -56,5 +57,39 @@ test("/v1/status with an embedder that has no routing reports the primary as uns
     expect(e).toMatchObject({ lastSuccessAt: null, lastError: null, pausedUntil: null, primary: { url: null, state: "unset" }, lastUsed: null });
   } finally {
     await t.drop();
+  }
+});
+
+test("buildServer wires one failover embedder from EMBED_PRIMARY_URL / EMBED_MODEL_DIGEST / EMBED_URL", async () => {
+  const db = await freshDb();
+  const primary = fakeOllama();
+  const fallback = fakeOllama();
+  const log = console.log;
+  console.log = () => {};
+  try {
+    const built = await buildServer({
+      DATABASE_URL: db.url, EMBED_URL: fallback.url, EMBED_PRIMARY_URL: primary.url, EMBED_MODEL_DIGEST: "790764642607",
+      SUMMARISER_ENABLED: "false",
+    });
+    try {
+      // The fake primary lists no models: the digest check fails, the fallback embeds, nothing fails.
+      expect((await built.embedder.embed(["a"]))[0]).toHaveLength(1024);
+      expect(built.embedder.routing?.()).toMatchObject({
+        primary: { url: primary.url, state: "digest_mismatch" }, fallback: { url: fallback.url }, lastUsed: "fallback",
+      });
+    } finally { await built.sql.close(); }
+
+    const plain = await buildServer({ DATABASE_URL: db.url, EMBED_URL: fallback.url, SUMMARISER_ENABLED: "false" });
+    try {
+      await plain.embedder.embed(["a"]);
+      expect(plain.embedder.routing?.()).toMatchObject({ primary: { url: null, state: "unset" }, lastUsed: "fallback" });
+    } finally { await plain.sql.close(); }
+
+    await expect(buildServer({ DATABASE_URL: db.url, EMBED_URL: fallback.url, EMBED_PRIMARY_URL: "mac:11434" })).rejects.toThrow(/EMBED_PRIMARY_URL/);
+  } finally {
+    console.log = log;
+    await db.drop();
+    primary.server.stop(true);
+    fallback.server.stop(true);
   }
 });
