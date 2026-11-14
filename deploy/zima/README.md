@@ -136,18 +136,27 @@ ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.
 quotes keep the single-quoted regex intact through ssh. Requeue dead summary jobs only after fixing their cause
 (`check.sh` shows the last error; `claude-smoke` shows the class): otherwise they dead-letter again.
 
-## Embedding on the Mac mini (optional)
+## Embedding on the Macs (optional)
 
-bge-m3 on the Zima's CPU embeds ~0.22 chunks/s (~4.5 s a chunk, ~0.45 s a search query). The Mac mini (M4 Pro,
-Ollama on Metal) runs the same model, same digest, at ~16 chunks/s and ~0.02 s a query. With the two settings
-below, the server embeds on the Mac mini whenever it answers and falls back to `cerebro-ollama` on its own when
-it doesn't, so nothing stops when the Mac is asleep, restarting or away: it is only slower.
+bge-m3 on the Zima's CPU embeds ~0.22 chunks/s (~4.5 s a chunk, ~0.45 s a search query). A Mac running Ollama on
+Metal runs the same model, same digest, ~70 times faster (the Mac mini, M4 Pro: ~16 chunks/s, ~0.02 s a query;
+vectors from the two Macs for the same text agree to cosine 0.999999). With the settings below, **each Mac embeds
+its own work on its own Ollama**: the chunks and summaries of the sessions it uploaded, and the searches it
+makes. One Mac's work never goes to the other Mac. The Zima's `cerebro-ollama` (`EMBED_URL`) embeds everything
+else and is the fallback, so nothing stops when a Mac is asleep, restarting or away: it is only slower.
+
+| Machine (token name) | Ollama |
+|---|---|
+| `mac-mini` | `http://192.168.4.42:11434` (Ollama 0.40.2) |
+| `macbook-pro` | `http://192.168.4.45:11434` (Ollama 0.40.14) |
+
+Both serve bge-m3 `7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`, the same as `cerebro-ollama`.
 
 **Enable it**: on the server, edit `/DATA/AppData/cerebro/secrets/server.env` (root 600; `deploy.sh --first-run`
 writes the two lines commented out) so that it has:
 
 ```sh
-EMBED_PRIMARY_URL=http://192.168.4.42:11434
+EMBED_MACHINE_URLS=mac-mini=http://192.168.4.42:11434,macbook-pro=http://192.168.4.45:11434
 EMBED_MODEL_DIGEST=790764642607
 ```
 
@@ -155,45 +164,62 @@ EMBED_MODEL_DIGEST=790764642607
 ssh -t zima sudo nano /DATA/AppData/cerebro/secrets/server.env
 ```
 
-then redeploy (`deploy/zima/deploy.sh`) so the server restarts with them. `EMBED_MODEL_DIGEST` is the `ollama list`
-ID of bge-m3 (12 hex) or its full sha256 from `/api/tags`, the same value as `BGE_M3_DIGEST` in `deploy/.env`. Leave
-both unset (or commented) to embed on the Zima alone, exactly as before. A malformed URL or digest stops the server
-at startup, and the deploy's health gate rolls back.
+then redeploy (`deploy/zima/deploy.sh`) so the server restarts with them. The names are the machine-token names
+(`token list`, see Maintenance); a machine not in the list (e.g. `check`) embeds on the Zima. `EMBED_MODEL_DIGEST`
+is the `ollama list` ID of bge-m3 (12 hex) or its full sha256 from `/api/tags`, the same value as `BGE_M3_DIGEST` in
+`deploy/.env`, and applies to every Mac. Leave both unset (or commented) to embed on the Zima alone, exactly as
+before. A malformed list or digest stops the server at startup, and the deploy's health gate rolls back.
 
-How the server routes (`server/src/embed/failover.ts`):
+How the server routes (`server/src/embed/failover.ts`, `server/src/worker.ts`):
 
-- every embedding (the worker, search queries, summaries) tries the Mac first. The Mac gets 2 s to answer a
-  query (plus 0.4 ms per character for chunks, ~2.6 s for a 1,600-char chunk): a sleeping Mac doesn't answer
-  at all, and the search's own 6 s budget must leave room for the fallback;
-- when the Mac is unreachable, refuses, times out, answers 404/5xx or with the wrong vectors (wrong dims), the
-  same call is retried on `cerebro-ollama`, and the Mac is skipped for 60 s; the next call after that tries it
-  again. A 400 (bad input) is not retried: `cerebro-ollama` would refuse it too;
-- with `EMBED_MODEL_DIGEST` set, the server reads the Mac's `/api/tags` before its first use and again each time it
-  comes back after being down. A different digest, or no bge-m3, means the Mac is not used (a warning is logged,
-  and the call goes to `cerebro-ollama`); it is checked again 60 s later, so a fixed Mac is picked up by itself.
-  Vectors from two different models never mix;
-- `/v1/status` shows `embedder.primary` (`url`, `state`: `up`, `down`, `digest_mismatch`, `unknown` before the first
-  call, or `unset`; `lastError`, `downUntil`) and `embedder.lastUsed` (`primary` or `fallback`). `check.sh` warns
-  (`embed-route`, never a failure) while the Mac is down or mismatched: "embedding on the Zima CPU (slow)".
+- **Chunks**: the embed worker runs one lane per Mac, plus a Zima lane, each on its own: a slow or stuck lane
+  never holds another up. A Mac's lane embeds only the chunks of sessions that Mac uploaded (the session's
+  `machine_id`, recorded at ingest and never changed), live sessions before imported history, on that Mac only.
+  While the Mac is down or mismatched, its chunks wait: they are released without charging an attempt and retried
+  after 30 s, and its lane sits out a 60 s window before trying the Mac again. The Zima lane embeds unmapped
+  machines' chunks and, after those, the waiting chunks of a Mac that is down, one chunk per call, so nothing is
+  stranded while a Mac is away; it never takes a chunk of a Mac that is up.
+- **Search queries** embed on the asking machine's Mac. If it is down, mismatched, or hasn't answered within 2 s,
+  that query embeds on the Zima instead (~0.45 s idle), inside the search's 6 s budget.
+- **Summaries** embed on the Mac that uploaded the session (a history: the Mac that posted it), with the Zima as
+  fallback.
+- **Down** means unreachable, refused, 404/5xx, a malformed answer (e.g. wrong dims), or no answer within 15 s:
+  the Mac is then skipped for 60 s, and the next call after that tries it again. A Mac that is just reloading
+  bge-m3 (it unloads after idle minutes; a cold call took 1.6 s against 0.17 s warm) is not down: a query that
+  can't wait falls back once while the load finishes, and the Mac is used again from the next call. The server
+  asks each Mac to keep the model loaded 30 minutes (`keep_alive: "30m"`); the Zima keeps it loaded forever. A
+  400 (bad input) is not retried on the Zima: it would refuse it too.
+- **Digest**: with `EMBED_MODEL_DIGEST` set, the server reads each Mac's `/api/tags` before its first use and again
+  each time it comes back after being down. A different digest, or no bge-m3, keeps that Mac out (a warning is
+  logged; its queries use the Zima, its chunks wait); it is checked again 60 s later, so a fixed Mac is picked up
+  by itself. Vectors from two different models never mix.
+- `/v1/status` shows `embedder.endpoints` (per Mac: `machine`, `url`, `state`: `up`, `down`, `digest_mismatch` or
+  `unknown` before its first call; `lastError`, `downUntil`, `lastUsedAt`) and `embedder.fallback` (`url`,
+  `lastUsedAt`). `check.sh` warns (`embed-route`, never a failure) for each Mac that is down or mismatched, naming
+  it: "macbook-pro: embedding on the Zima CPU (slow): …".
 
-**The Mac side** (the Mac mini, once):
+**Each Mac** (the Mac mini and the MacBook Pro, once each):
 
 1. Ollama must listen on the LAN, not only on 127.0.0.1: turn on "Expose Ollama to the network" in the Ollama
    app's settings, or `launchctl setenv OLLAMA_HOST 0.0.0.0:11434` and quit and reopen the Ollama app (the
    `launchctl` setting is lost at reboot; the app setting is not). Check from the Zima:
-   `ssh zima curl -s -m 5 http://192.168.4.42:11434/api/tags`.
+   `ssh zima curl -s -m 5 http://192.168.4.42:11434/api/tags` (`.45` for the MacBook Pro).
 2. `ollama pull bge-m3` and check that `ollama list` shows the same ID as `cerebro-ollama`
    (`ssh zima sudo docker exec cerebro-ollama ollama list`), i.e. `EMBED_MODEL_DIGEST`.
-3. Never sleep: System Settings, Energy, "Prevent automatic sleeping when the display is off" (and "Wake for
-   network access"). A sleeping Mac only costs speed, not data, but every search after it sleeps pays the 2 s once.
-4. Give the Mac a fixed address: an **eero DHCP reservation** (eero app, Settings, Network settings,
-   Reservations & port forwarding, the Mac mini, Reserve IP address) for 192.168.4.42, so `EMBED_PRIMARY_URL`
-   keeps pointing at it.
+3. Either never sleep (System Settings, Energy: "Prevent automatic sleeping when the display is off", "Wake for
+   network access"), or accept the Zima fallback while it sleeps: nothing is lost, its chunks wait or embed slowly
+   on the Zima, and a search from it waits up to 2 s about once a minute (each time the server tries it again). A MacBook that leaves home is
+   simply down until it is back on the LAN.
+4. Give each Mac a fixed address: an **eero DHCP reservation** per Mac (eero app, Settings, Network settings,
+   Reservations & port forwarding, the Mac, Reserve IP address): 192.168.4.42 for the Mac mini, 192.168.4.45 for
+   the MacBook Pro, so `EMBED_MACHINE_URLS` keeps pointing at them.
 
-**Security**: Ollama has no authentication. Exposed on the LAN, anyone on the home network can use the Mac's
-models (run them, pull or delete models). Keep it to the home LAN (no port forward on the eero), and don't
-enable it on a Mac that joins untrusted networks. The server sends the text it embeds (conversation chunks and
-search queries) to the Mac in plain HTTP over the LAN.
+**Security**: Ollama has no authentication. Exposed on the LAN, anyone on the home network can use a Mac's models
+(run them, pull or delete models). Keep it to the home LAN (no port forward on the eero). The MacBook Pro joins
+other networks: there, "Expose Ollama to the network" exposes it to that network too, so turn the setting off
+when away (its work then embeds on the Zima), or rely on the macOS firewall to block incoming connections to
+Ollama off the home network. The server sends the text it embeds (conversation chunks, summaries and search
+queries) to the Mac in plain HTTP over the LAN.
 
 ## Upgrades and rollback
 
@@ -315,7 +341,8 @@ From a terminal on the Mac (`<dump>` = e.g. `/DATA/Backup/cerebro/nightly/2026-1
   means a process inside hit the limit and was killed while the container kept running.
 - `deploy.sh` says another deploy holds the lock: wait for it, or remove `/DATA/AppData/cerebro/state/deploy.lock`
   only when that deploy is certainly dead.
-- `check.sh` `embed-route` warns "embedding on the Zima CPU (slow)": the Mac mini's Ollama is unreachable
-  (asleep, Ollama not running or not exposed on the LAN, a new IP) or serves a different bge-m3 (`mismatch`; the
-  line shows both digests). Fix the Mac (see "Embedding on the Mac mini"); the server tries it again every 60 s.
+- `check.sh` `embed-route` warns "<machine>: embedding on the Zima CPU (slow)": that Mac's Ollama is unreachable
+  (asleep, away, Ollama not running or not exposed on the LAN, a new IP) or serves a different bge-m3 (`mismatch`;
+  the line shows both digests). Its chunks wait or embed on the Zima meanwhile. Fix the Mac (see "Embedding on
+  the Macs"); the server tries it again every 60 s.
 - "cannot reach zima": an ssh ban; wait ~90 s before one more try.
