@@ -1,6 +1,6 @@
 import type { SQL } from "bun";
 import { redactSecrets, storable } from "@cerebro/shared";
-import { toVector, type Embedder } from "../embed/embedder";
+import { embedderFor, toVector, type Embedder } from "../embed/embedder";
 import { budgetState, canSpend, estimateTokens, record } from "./budget";
 import { HEALTH_PROBE, type runClaude } from "./claude";
 import { completeSummaryJob, failSummaryJob, releaseSummaryJob } from "./jobs";
@@ -123,8 +123,18 @@ export function summaryEmbedText(row: { title: string; body: { overview?: string
  * Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it; the
  * summariser loop retries later). True when the vector was stored.
  */
-export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<boolean> {
+export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string, machine?: string | null): Promise<boolean> {
   const ctl = new AbortController();
+  if (embedder.forMachine) {
+    // On the machine that owns the work (EMBED_MACHINE_URLS): the session's uploader, else the given machine.
+    if (machine === undefined) {
+      const [row] = await sql`
+        select m.name from summaries sm join sessions s on s.id = sm.session_id join machines m on m.id = s.machine_id
+        where sm.id = ${id}`.catch(() => []);
+      machine = row?.name ?? null;
+    }
+    embedder = embedderFor(embedder, machine ?? null);
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<never>((_, reject) => {

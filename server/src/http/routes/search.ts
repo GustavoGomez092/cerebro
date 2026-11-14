@@ -4,6 +4,7 @@ import type { AppDeps, Env } from "../app";
 import { search, ScopeError } from "../../search";
 import { BindingError } from "../../bindings";
 import { parseBody, uuid } from "../validate";
+import { embedderFor } from "../../embed/embedder";
 
 const iso = z.string().datetime({ offset: true });
 const schema = z.object({
@@ -25,7 +26,8 @@ export function searchRoutes({ sql, embedder, gate }: AppDeps) {
     const b = await parseBody(c, schema);
     if (b instanceof Response) return b;
     try {
-      return c.json(await search(sql, embedder, b, { gate }));
+      // The query embeds on the asking machine's own Ollama (EMBED_MACHINE_URLS), else on the Zima.
+      return c.json(await search(sql, embedderFor(embedder, c.get("machine").name), b, { gate }));
     } catch (e) {
       if (e instanceof ScopeError) return c.json({ error: "scope_required", message: e.message }, 400);
       if (e instanceof BindingError) return c.json({ error: "invalid_subpath", message: e.message }, 400);

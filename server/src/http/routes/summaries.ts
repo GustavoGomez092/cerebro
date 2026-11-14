@@ -157,7 +157,7 @@ export function summaryRoutes({ sql, embedder, log = (l: string) => console.log(
     if (!saved) return declined();
     // In the background, so a slow embedder never makes a committed save look failed. Best effort:
     // un-embedded, the history is still found by full-text search. Logs carry no user content.
-    embedSummary(sql, embedder, saved.id, summaryEmbedText({ title, body })).catch((e) =>
+    embedSummary(sql, embedder, saved.id, summaryEmbedText({ title, body }), c.get("machine").name).catch((e) =>
       log(JSON.stringify({ level: "error", t: new Date().toISOString(), what: "history_embed", error: (e as Error)?.name ?? "Error" })));
     const [row] = await sql.unsafe(`select ${VIEW_COLS} from summaries sm ${NAMES} where sm.id = $1`, [saved.id]);
     return c.json({ summary: toView(row) }, saved.created ? 201 : 200);
