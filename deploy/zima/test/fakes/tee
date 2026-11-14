@@ -1,0 +1,9 @@
+#!/bin/bash
+# Fake tee: fails (writing nothing) when its arguments contain FAKE_TEE_FAIL, like a full or read-only disk;
+# otherwise the real tee.
+if [[ -n ${FAKE_TEE_FAIL-} && "$*" == *"$FAKE_TEE_FAIL"* ]]; then
+  cat >/dev/null
+  echo "tee: $*: No space left on device" >&2
+  exit 1
+fi
+exec /usr/bin/tee "$@"

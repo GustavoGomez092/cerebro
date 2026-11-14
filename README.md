@@ -171,3 +171,24 @@ Maintainers publish a release with `scripts/release-plugin.sh <version>` (`--dry
 to preview, `--remote <url>` to publish somewhere other than `origin`, which must be
 this GitHub repo): it compiles the arm64 and x64 binaries and force-pushes `plugin/` (atomically with the tag) as a
 single commit on `plugin-dist`, tagged `plugin-v<version>`.
+
+## Deploying to the Zima server
+
+`deploy/zima/deploy.sh [--first-run]` (owner-specific; `ssh zima`) syncs the committed tree,
+builds `cerebro-server:<sha7>` on the server, migrates, and switches only after `/health`
+reports `ok` and `db` within 60 s. A failed start, a failed health gate or an interrupt (Ctrl-C)
+rolls back to `cerebro-server:prev` and exits 1. `deploy/zima/check.sh` prints `ALL OK` or
+the failing checks.
+
+**[deploy/zima/README.md](deploy/zima/README.md)** is the runbook: first deploy (Caddy route,
+Claude login, tokens, backup timer, zima-backup exclusion), manual rollback, backups and the
+restore steps.
+
+- **Migrations must be backward-compatible (expand/contract).** They run before the new
+  server starts, and a rollback starts `:prev` on the already-migrated schema; nothing undoes a
+  migration. Add columns and tables first, and drop or rename them only in a later release, once
+  no deployed code reads them.
+- Before migrations the schema hasn't seen, the deploy saves a pre-deploy dump and marks it
+  `pending` until migrate succeeds, so a failed or interrupted migrate never loses its recovery
+  point to retries. It is never restored automatically.
+- `:prev` is always the last release that passed the health gate (`state/deployed`).

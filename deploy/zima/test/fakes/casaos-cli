@@ -1,0 +1,9 @@
+#!/bin/bash
+# Fake casaos-cli: `app-management install -f <compose>` stores the compose like ZimaOS does.
+echo "casaos-cli $*" >> "$FAKE_LOG"
+# FAKE_CASAOS_RC: the install fails (nothing stored).
+[[ -z ${FAKE_CASAOS_RC-} ]] || exit "$FAKE_CASAOS_RC"
+if [[ $1 == app-management && $2 == install ]]; then
+  d=$FAKE_ROOT/var/lib/casaos/apps/cerebro; mkdir -p "$d"; cp "${*: -1}" "$d/docker-compose.yml"
+fi
+exit 0

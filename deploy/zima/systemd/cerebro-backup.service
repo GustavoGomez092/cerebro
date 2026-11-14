@@ -1,0 +1,9 @@
+[Unit]
+Description=Cerebro database backup (nightly dump, weekly full dump)
+Requires=docker.service
+After=docker.service
+RequiresMountsFor=/DATA/Backup
+
+[Service]
+Type=oneshot
+ExecStart=/DATA/AppData/cerebro/zima/backup.sh

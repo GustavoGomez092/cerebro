@@ -1,0 +1,7 @@
+#!/bin/bash
+# Sends SIGTERM to every process whose command line contains $FAKE_TERM_PATTERN (the deploy script and its
+# subshells), like an owner pressing Ctrl-C. Not pkill: on macOS it skips its own ancestors.
+ps -A -o pid=,command= | while read -r pid cmd; do
+  if [[ $cmd == *"$FAKE_TERM_PATTERN"* ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+done
+exit 0

@@ -5,13 +5,35 @@ import { createApp } from "./http/app";
 import { EmbedGate, newWorkerState, startEmbedWorker } from "./worker";
 import { newSummariserState, startSummariser } from "./summarise/loop";
 
-/** Validates config, connects, migrates and pins the embedding model. Throws before touching the DB on bad config. */
-export async function buildServer(env: Record<string, string | undefined>) {
+/** Retries `fn` with capped exponential backoff until `waitMs` has elapsed, then rethrows the last error. */
+async function retryWithBackoff<T>(fn: () => Promise<T>, waitMs: number, onRetry: (e: Error, delayMs: number) => void): Promise<T> {
+  const deadline = Date.now() + waitMs;
+  for (let delay = 500; ; delay = Math.min(delay * 2, 5000)) {
+    try {
+      return await fn();
+    } catch (e) {
+      const left = deadline - Date.now();
+      if (left <= 0) throw e;
+      onRetry(e as Error, Math.min(delay, left));
+      await Bun.sleep(Math.min(delay, left));
+    }
+  }
+}
+
+/**
+ * Validates config, connects, migrates and pins the embedding model. Throws before touching the DB on bad config.
+ * After a host reboot the db may start later than the server, so connect+migrate is retried for up to `dbWaitMs`.
+ */
+export async function buildServer(env: Record<string, string | undefined>, opts: { dbWaitMs?: number } = {}) {
   const config = loadConfig(env);
   if (!config.embedUrl) throw new Error("EMBED_URL is required (Ollama base URL for embeddings)");
   const embedder = ollamaEmbedder(config.embedUrl, config.embedModel, config.embedDims);
   const sql = connect(config.databaseUrl);
-  const applied = await migrate(sql);
+  const applied = await retryWithBackoff(
+    () => migrate(sql),
+    opts.dbWaitMs ?? 120_000,
+    (e, delayMs) => console.log(JSON.stringify({ level: "warn", msg: "database not ready, retrying", error: e.name, delayMs })),
+  );
   if (applied.length) console.log(JSON.stringify({ level: "info", msg: "migrations applied", applied }));
   await checkEmbedSettings(sql, config.embedModel, config.embedDims);
   const gate = new EmbedGate();
