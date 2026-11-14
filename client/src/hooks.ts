@@ -4,7 +4,7 @@ import { buildBrief } from "./brief";
 import { captureTranscript, type CaptureResult } from "./capture";
 import { syncConfigFile } from "./config";
 import { folderIdentity, type FolderIdentity } from "./identity";
-import { checkInstance } from "./instance";
+import { verifyServer } from "./instance";
 import { logError } from "./log";
 import { claudeCodeSource } from "./sources/claude-code";
 import { ensureCliLink } from "./schedule";
@@ -174,11 +174,11 @@ async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: stri
   return context(brief);
 }
 
-/** True when the configured server is the pinned instance; until then no request carries the token. */
+/** True when the configured server is the pinned instance and nothing is blocked; until then no request carries the token. */
 async function verifyInstance(store: Store, api: ApiClient, left: Left): Promise<boolean> {
-  if (store.get("blocked") === "instance_mismatch" || left() < MIN_CALL_MS) return false;
+  if (store.get("blocked") || left() < MIN_CALL_MS) return false;
   try {
-    return (await checkInstance(store, api, { timeoutMs: left() })) === "ok";
+    return (await verifyServer(store, api, { timeoutMs: left() })) === "ok";
   } catch (e) {
     logError("SessionStart health", e);
     return false;

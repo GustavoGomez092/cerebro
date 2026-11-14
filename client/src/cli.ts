@@ -36,7 +36,7 @@ const hook: Command = {
         const config = loadClientConfig();
         out = await handleHook(event, input, {
           store,
-          api: config ? new ApiClient(config) : null,
+          api: config ? new ApiClient(config, store) : null,
           machine: store.get("machine") ?? null,
           env: process.env,
         });
@@ -61,7 +61,7 @@ const flushCommand: Command = {
       if (args[0] === "--end" && args[1] && args[2]) opts.end = { sessionId: args[1], endedAt: args[2] };
       const store = new Store();
       try {
-        const api = new ApiClient(config);
+        const api = new ApiClient(config, store);
         const r = await flush(store, api, opts);
         if (r.outcome === "error") logError("flush", "flush ended with an unexpected error");
         await learnMachineName(store, api);
@@ -137,7 +137,7 @@ const status: Command = {
     const store = new Store();
     try {
       if (config && args.includes("--retry")) {
-        const r = await retryAfterBlock(store, new ApiClient(config));
+        const r = await retryAfterBlock(store, new ApiClient(config, store));
         await Bun.write(Bun.stdout, `retry: ${r.outcome}\n`);
       }
       await Bun.write(Bun.stdout, statusText(store, config));
@@ -210,7 +210,7 @@ const importCommand: Command = {
     if (!config) return;
     const store = new Store();
     try {
-      const api = new ApiClient(config);
+      const api = new ApiClient(config, store);
       await learnMachineName(store, api);
       await say(await importFolder(store, api, cwd, store.get("machine") ?? ""));
     } finally {
@@ -224,7 +224,7 @@ async function runSync(): Promise<void> {
   const config = loadClientConfig();
   const store = new Store();
   try {
-    const api = config ? new ApiClient(config) : null;
+    const api = config ? new ApiClient(config, store) : null;
     if (api) await learnMachineName(store, api);
     await say(await syncAllSources(store, api, store.get("machine") ?? ""));
   } finally {

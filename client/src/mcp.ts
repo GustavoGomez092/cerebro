@@ -6,6 +6,7 @@ import { z } from "zod";
 import { ApiClient, ApiError } from "./api";
 import { loadClientConfig } from "./config";
 import { folderIdentity } from "./identity";
+import { verifyServer, type Verification } from "./instance";
 import { logError } from "./log";
 import { spawnDetached } from "./spawn";
 import { Store } from "./store";
@@ -22,6 +23,21 @@ export interface McpDeps {
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): ToolResult => ({ content: [{ type: "text", text }], isError: true });
+
+const HEALTH_TIMEOUT_MS = 3000;
+
+/** Why a tool sent nothing, for each failed instance check. */
+function unverifiedText(v: Exclude<Verification, "ok">, blocked: string | undefined): string {
+  if (v === "mismatch" || blocked === "instance_mismatch") {
+    return "Nothing was sent: the server at the configured URL is not the Cerebro instance this Mac was set up with. " +
+      "Check the server URL; if the server was reinstalled, run `~/.cerebro/bin/cerebro reset-instance`.";
+  }
+  if (v === "blocked") {
+    return `Nothing was sent: Cerebro is blocked (${blocked}) because the server refused this Mac's token. ` +
+      "Fix the token in the plugin's settings, then run `~/.cerebro/bin/cerebro status --retry`.";
+  }
+  return "The Cerebro server is unreachable right now (or did not identify itself); nothing was sent. Try again later.";
+}
 
 function errorText(e: unknown): string {
   if (e instanceof ApiError) {
@@ -53,7 +69,14 @@ export function createMcpServer(deps: McpDeps): McpServer {
     id: string, description: string, shape: S, fn: (a: z.infer<z.ZodObject<S>>) => Promise<string>,
   ) => {
     const handler = async (args: z.infer<z.ZodObject<S>>): Promise<ToolResult> => {
-      try { return ok(await fn(args)); } catch (e) { return fail(errorText(e)); }
+      try {
+        // Every tool talks to the server with the token, so each one first checks it is the pinned instance.
+        const v = await verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS });
+        if (v !== "ok") return fail(unverifiedText(v, store.get("blocked")));
+        return ok(await fn(args));
+      } catch (e) {
+        return fail(errorText(e));
+      }
     };
     server.registerTool(id, { description, inputSchema: shape }, handler as never);
   };
@@ -181,11 +204,12 @@ export function createMcpServer(deps: McpDeps): McpServer {
 export async function startMcpServer(): Promise<void> {
   const config = loadClientConfig();
   if (!config) throw new Error("Cerebro is not configured: set the server URL and token");
-  const api = new ApiClient(config);
   const store = new Store();
+  const api = new ApiClient(config, store);
   let machine = store.get("machine");
   if (!machine) {
     try {
+      if ((await verifyServer(store, api, { timeoutMs: 5000 })) !== "ok") throw new Error("server not verified; machine name unknown");
       machine = (await api.status({ timeoutMs: 5000 })).machine || undefined;
       if (machine) store.set("machine", machine);
     } catch (e) {

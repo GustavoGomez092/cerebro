@@ -104,7 +104,7 @@ test("sync records every agent's sessions for a bound folder and nothing for an 
   const b = agentHistory(home, unbound.root, unbound.remote);
 
   const store = newStore();
-  const out = await syncAllSources(store, h.api, "test-mac", { home });
+  const out = await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   for (const id of ["claude-code-subagent", "codex", "gemini-cli", "generic"]) expect(out.bySource[id]?.files, id).toBe(1);
 
   const rows = await serverSessions(Object.values(a.ids));
@@ -121,11 +121,11 @@ test("binding a folder later picks up history that sync skipped earlier", async 
   const later = repo("later");
   const c = agentHistory(home, later.root, later.remote);
   const store = newStore();
-  await syncAllSources(store, h.api, "test-mac", { home });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   expect(await serverSessions(Object.values(c.ids))).toEqual([]);
 
   await bind(later.remote, "Later");
-  await syncAllSources(store, h.api, "test-mac", { home });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   const rows = await serverSessions(Object.values(c.ids));
   expect(rows.map((r) => r.agent).sort()).toEqual(["claude-code-subagent", "codex", "gemini-cli", "my-agent"]);
   store.close();
@@ -137,11 +137,11 @@ test("sync twice uploads nothing new; a growing codex file uploads only the new 
   await bind(r.remote, "Twice");
   const t = agentHistory(home, r.root, r.remote);
   const store = newStore();
-  await syncAllSources(store, h.api, "test-mac", { home });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   const before = await eventCount(t.ids.codex!);
   expect(before).toBe(10);
 
-  const again = await syncAllSources(store, h.api, "test-mac", { home });
+  const again = await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   for (const s of Object.values(again.bySource)) expect(s.events).toBe(0);
   expect(await eventCount(t.ids.codex!)).toBe(before);
 
@@ -149,7 +149,7 @@ test("sync twice uploads nothing new; a growing codex file uploads only the new 
     timestamp: "2026-01-05T11:00:00.000Z", type: "response_item",
     payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "one more answer" }] },
   }) + "\n");
-  const grown = await syncAllSources(store, h.api, "test-mac", { home });
+  const grown = await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   expect(grown.bySource.codex).toMatchObject({ events: 1 });
   expect(await eventCount(t.ids.codex!)).toBe(before + 1);
 
@@ -157,13 +157,13 @@ test("sync twice uploads nothing new; a growing codex file uploads only the new 
   expect(store.getCursor(t.codexPath)?.done).toBe(false);
   const old = (Date.now() - 60 * 60_000) / 1000;
   utimesSync(t.codexPath, old, old);
-  await syncAllSources(store, h.api, "test-mac", { home });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home });
   expect(store.getCursor(t.codexPath)?.done).toBe(true);
   appendFileSync(t.codexPath, JSON.stringify({
     timestamp: "2026-01-05T12:00:00.000Z", type: "response_item",
     payload: { type: "message", role: "user", content: [{ type: "input_text", text: "resumed" }] },
   }) + "\n");
-  expect((await syncAllSources(store, h.api, "test-mac", { home })).bySource.codex).toMatchObject({ events: 1 });
+  expect((await syncAllSources(store, h.clientFor(store), "test-mac", { home })).bySource.codex).toMatchObject({ events: 1 });
   expect(await eventCount(t.ids.codex!)).toBe(before + 2);
   store.close();
 });
@@ -171,7 +171,7 @@ test("sync twice uploads nothing new; a growing codex file uploads only the new 
 test("a held sync lock returns no work", async () => {
   const store = newStore();
   expect(store.tryLock("sync", 60_000)).toBe(true);
-  expect(await syncAllSources(store, h.api, "test-mac", { home: tmp() })).toEqual({ bySource: {} });
+  expect(await syncAllSources(store, h.clientFor(store), "test-mac", { home: tmp() })).toEqual({ bySource: {} });
   store.close();
 });
 
@@ -184,12 +184,12 @@ test("a new inbox file under a finished file's name is judged by its own folder,
     fixture("generic.jsonl").replace("run-0001", id).replace("/Users/dev/projects/demo", root).replace("https://github.com/example/demo.git", `https://${remote}.git`));
   const store = newStore();
   const first = drop(bound.root, bound.remote, `first-${crypto.randomUUID()}`);
-  await syncAllSources(store, h.api, "test-mac", { home, sources: [genericSource] });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [genericSource] });
   expect(existsSync(first)).toBe(false); // recorded and moved to done/
 
   const secondId = `second-${crypto.randomUUID()}`;
   drop(unbound.root, unbound.remote, secondId);
-  const out = await syncAllSources(store, h.api, "test-mac", { home, sources: [genericSource] });
+  const out = await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [genericSource] });
   expect(out.bySource.generic).toMatchObject({ files: 0, events: 0, skipped: 1 });
   expect(await serverSessions([`my-agent:${secondId}`])).toEqual([]);
   expect(existsSync(first)).toBe(true); // left in the inbox for when its folder opts in
@@ -205,13 +205,13 @@ test("the 50-resolve cap never starves a folder: the oldest-checked identities g
     fixture("generic.jsonl").replace("run-0001", `s${i}`).replace("/Users/dev/projects/demo", `/nonexistent/starve/${i}`)
       .replace("https://github.com/example/demo.git", `https://${remote}.git`)));
   const asked: string[] = [];
-  const counting = new Proxy(h.api, {
+  const store = newStore();
+  const counting = new Proxy(h.clientFor(store), {
     get(target, prop, recv) {
       if (prop !== "resolve") return Reflect.get(target, prop, recv);
       return (...args: Parameters<typeof target.resolve>) => { asked.push(args[0]); return target.resolve(...args); };
     },
   });
-  const store = newStore();
   await syncAllSources(store, counting, "test-mac", { home, sources: [genericSource] });
   expect(new Set(asked).size).toBe(50);
   const missed = remotes.filter((r) => !asked.includes(r));
@@ -230,14 +230,14 @@ test("a folder the server refuses to resolve (4xx) is put to the back of the que
   const refused = `github.com/acme/refused-${tag}`;
   write(join(home, ".cerebro", "inbox", "refused.jsonl"), fixture("generic.jsonl").replace("/Users/dev/projects/demo", "/nonexistent/refused")
     .replace("https://github.com/example/demo.git", `https://${refused}.git`));
-  const failing = new Proxy(h.api, {
+  const store = newStore();
+  const failing = new Proxy(h.clientFor(store), {
     get(target, prop, recv) {
       if (prop !== "resolve") return Reflect.get(target, prop, recv);
       return (...args: Parameters<typeof target.resolve>) =>
         args[0] === refused ? Promise.reject(new ApiError(400, "invalid_request", "bad identity")) : target.resolve(...args);
     },
   });
-  const store = newStore();
   await syncAllSources(store, failing, "test-mac", { home, sources: [genericSource] });
   const cached = store.cachedBinding(refused, "");
   expect(cached?.binding ?? null).toBeNull();
@@ -253,7 +253,7 @@ test("sync checks the pinned instance first and never sends the token to another
   const store = newStore();
   store.set("instanceId", crypto.randomUUID());
   const authed: string[] = [];
-  const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
     if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
     return h.fetch(req);
@@ -264,6 +264,27 @@ test("sync checks the pinned instance first and never sends the token to another
   store.close();
 });
 
+test("sync sends no token while uploads are blocked by a revoked or refused token", async () => {
+  for (const reason of ["token_revoked", "unauthorized"]) {
+    const home = tmp();
+    const r = repo(`blocked-${reason}`);
+    await bind(r.remote, `Blocked-${reason}`);
+    agentHistory(home, r.root, r.remote);
+    const store = newStore();
+    store.set("instanceId", h.instanceId);
+    store.set("blocked", reason);
+    const authed: string[] = [];
+    const spy = h.clientFor(store, (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = new Request(input, init);
+      if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+      return h.fetch(req);
+    }) as typeof fetch);
+    await syncAllSources(store, spy, "test-mac", { home });
+    expect({ reason, authed }).toEqual({ reason, authed: [] });
+    store.close();
+  }
+});
+
 test("a finished file remembers its size and time, so later syncs tell discover to skip it", async () => {
   const home = tmp();
   const r = repo("unchanged");
@@ -272,7 +293,7 @@ test("a finished file remembers its size and time, so later syncs tell discover 
   const old = (Date.now() - 60 * 60_000) / 1000;
   utimesSync(t.codexPath, old, old);
   const store = newStore();
-  await syncAllSources(store, h.api, "test-mac", { home, sources: [codexSource] });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [codexSource] });
   expect(store.getCursor(t.codexPath)?.done).toBe(true);
 
   const verdicts: boolean[] = [];
@@ -284,9 +305,9 @@ test("a finished file remembers its size and time, so later syncs tell discover 
       return codexSource.discover(roots);
     },
   };
-  await syncAllSources(store, h.api, "test-mac", { home, sources: [spy] });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [spy] });
   appendFileSync(t.codexPath, "\n");
-  await syncAllSources(store, h.api, "test-mac", { home, sources: [spy] });
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [spy] });
   expect(verdicts).toEqual([true, false]);
   store.close();
 });

@@ -7,7 +7,7 @@ import { ApiClient, ApiError } from "../src/api";
 import { loadClientConfig, saveClientConfig } from "../src/config";
 import { cerebroHome } from "../src/paths";
 import { logError, logInfo } from "../src/log";
-import { liveServer, TEST_URL, type LiveServer } from "./harness";
+import { liveServer, TEST_URL, type LiveServer, trustedState } from "./harness";
 
 let h: LiveServer;
 beforeAll(async () => { h = await liveServer(); });
@@ -29,7 +29,7 @@ function withHome<T>(fn: (home: string) => T): T {
 test("health needs no token and returns the instance id", async () => {
   const seen: (string | null)[] = [];
   const spy = (async (i: any, init?: any) => { seen.push(new Headers(init?.headers).get("authorization")); return h.fetch(i, init); }) as typeof fetch;
-  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, spy);
+  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, trustedState(), spy);
   expect(await api.health()).toMatchObject({ ok: true, instanceId: h.instanceId });
   expect(seen).toEqual([null]);
 });
@@ -47,7 +47,7 @@ test("authenticated calls round-trip against the real server", async () => {
 test("server error envelopes become ApiError with status and code", async () => {
   const { token } = await createToken(h.sql, "doomed");
   await revokeToken(h.sql, "doomed");
-  const revoked = new ApiClient({ serverUrl: TEST_URL, token }, h.fetch);
+  const revoked = new ApiClient({ serverUrl: TEST_URL, token }, trustedState(), h.fetch);
   const e1 = await revoked.status().catch((e) => e);
   expect(e1).toBeInstanceOf(ApiError);
   expect(e1).toMatchObject({ status: 401, code: "token_revoked" });
@@ -58,11 +58,11 @@ test("server error envelopes become ApiError with status and code", async () => 
 
 test("network failures and timeouts are ApiError codes", async () => {
   const cfg = { serverUrl: TEST_URL, token: "t" };
-  const e1 = await new ApiClient(cfg, (async () => { throw new TypeError("fetch failed"); }) as any).status().catch((e) => e);
+  const e1 = await new ApiClient(cfg, trustedState(), (async () => { throw new TypeError("fetch failed"); }) as any).status().catch((e) => e);
   expect(e1).toBeInstanceOf(ApiError);
   expect(e1.code).toBe("network");
   const hang = ((_: any, init?: any) => new Promise((_, rej) => init?.signal?.addEventListener("abort", () => rej(init.signal.reason)))) as any;
-  const e2 = await new ApiClient(cfg, hang).status({ timeoutMs: 50 }).catch((e) => e);
+  const e2 = await new ApiClient(cfg, trustedState(), hang).status({ timeoutMs: 50 }).catch((e) => e);
   expect(e2).toBeInstanceOf(ApiError);
   expect(e2.code).toBe("timeout");
 });

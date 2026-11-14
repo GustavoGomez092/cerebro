@@ -92,7 +92,7 @@ test("status reports a blocked uploader and --retry clears it", async () => {
   expect(before).toContain("token was revoked");
   expect(before).not.toContain(h.token);
 
-  const r = await retryAfterBlock(store, h.api);
+  const r = await retryAfterBlock(store, h.clientFor(store));
   expect(r.outcome).not.toBe("blocked");
   expect(store.get("blocked")).toBeUndefined();
   expect(store.get("backoffUntil")).toBeUndefined();

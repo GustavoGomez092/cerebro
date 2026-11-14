@@ -1,7 +1,7 @@
 import type { IngestEvent, IngestRejection, IngestSession } from "@cerebro/shared";
 import { ApiError, type ApiClient } from "./api";
 import { sweepOpenCursors } from "./capture";
-import { checkInstance } from "./instance";
+import { verifyServer } from "./instance";
 import type { BlockedReason, Store } from "./store";
 
 export type FlushOutcome = "done" | "nothing" | "locked" | "backoff" | "unreachable" | "blocked" | "instance_mismatch" | "error";
@@ -21,6 +21,8 @@ export interface FlushOptions {
 
 const LOCK_TTL_MS = 10 * 60_000;
 const HEALTH_TIMEOUT_MS = 3000;
+/** A run longer than this re-checks the instance before its next request (the check is good for 60 s). */
+const REVERIFY_AFTER_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const BACKOFF_START_MS = 30_000;
 const BACKOFF_MAX_MS = 30 * 60_000;
@@ -63,10 +65,16 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
 
     sweepOpenCursors(store);
 
-    // Preflight on an unauthenticated route, so an impostor never sees the token or any data.
-    const instance = await checkInstance(store, api, { timeoutMs: HEALTH_TIMEOUT_MS });
-    if (instance === "unreachable") return fail();
-    if (instance === "mismatch") return finish("instance_mismatch");
+    // Preflight on an unauthenticated route, so an impostor never sees the token or any data; long runs
+    // re-check before a request once the last check is getting old.
+    const unverified = async (reuseMs = 0): Promise<FlushResult | null> => {
+      const v = await verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS, reuseMs });
+      if (v === "ok") return null;
+      if (v === "unreachable") return fail();
+      return finish(v === "mismatch" ? "instance_mismatch" : "blocked");
+    };
+    const refused = await unverified();
+    if (refused) return refused;
 
     const configuredEvents = opts.maxEvents ?? 2000;
     const configuredBytes = opts.maxBytes ?? 8 * 1024 * 1024;
@@ -104,6 +112,8 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
         continue;
       }
 
+      const stale = await unverified(REVERIFY_AFTER_MS);
+      if (stale) return stale;
       let res;
       try {
         res = await api.ingest({ sessions, events }, { timeoutMs: REQUEST_TIMEOUT_MS });
@@ -151,6 +161,8 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
     const stillUnsent = new Set(store.unsentSessions(10_000).map((s) => s.id));
     for (const pe of store.pendingEnds()) {
       if (stillUnsent.has(pe.sessionId)) continue;
+      const stale = await unverified(REVERIFY_AFTER_MS);
+      if (stale) return stale;
       try {
         await api.endSession(pe.sessionId, pe.endedAt, { timeoutMs: REQUEST_TIMEOUT_MS });
       } catch (e) {

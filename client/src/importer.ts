@@ -5,6 +5,7 @@ import type { ApiClient } from "./api";
 import { captureTranscript } from "./capture";
 import { flush } from "./flush";
 import { folderIdentity, type FolderIdentity } from "./identity";
+import { verifyServer } from "./instance";
 import { logError, logInfo } from "./log";
 import { allSources } from "./sources";
 import type { HistorySource, SourceFile } from "./sources/types";
@@ -20,6 +21,9 @@ export interface ImportResult {
 }
 
 const LOCK_TTL_MS = 60 * 60 * 1000;
+const HEALTH_TIMEOUT_MS = 3000;
+/** An import longer than this re-checks the instance before its next lookup (the check is good for 60 s). */
+const REVERIFY_AFTER_MS = 30_000;
 /** A transcript touched this recently may still be live, so its cursor stays open. */
 const LIVE_WINDOW_MS = 10 * 60 * 1000;
 
@@ -49,6 +53,12 @@ export async function importFolder(
   if (!store.tryLock(lockName, LOCK_TTL_MS)) return out;
 
   try {
+    // Nothing (the token included) goes to a server that is not the pinned instance, or while blocked.
+    const first = await verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS });
+    if (first !== "ok") {
+      logInfo("import skipped: server not verified", { result: first });
+      return out;
+    }
     const root = real(ident.root);
     const home = opts.home ?? homedir();
     /** Set when a discover or resolve call failed, so a later import retries the missed history. */
@@ -59,7 +69,10 @@ export async function importFolder(
     const identityFor = (subpath: string): Promise<FolderIdentity | null> => {
       let p = subfolders.get(subpath);
       if (!p) {
-        p = api.resolve(ident.repo, subpath).then(
+        p = verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS, reuseMs: REVERIFY_AFTER_MS }).then((v) => {
+          if (v !== "ok") throw new Error(`server not verified (${v})`);
+          return api.resolve(ident.repo, subpath);
+        }).then(
           (r) => { store.cacheBinding(ident.repo, subpath, r.binding); return { ...ident, subpath }; },
           (e) => { incomplete = true; logError(`import resolve ${subpath}`, e); return null; },
         );

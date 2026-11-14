@@ -2,10 +2,10 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApiClient } from "../src/api";
+import { ApiClient, ApiError, verificationRecord, VERIFIED_KEY } from "../src/api";
 import { checkInstance } from "../src/instance";
 import { Store } from "../src/store";
-import { liveServer, TEST_URL, type LiveServer } from "./harness";
+import { liveServer, TEST_URL, type LiveServer, trustedState } from "./harness";
 
 let h: LiveServer;
 const dirs: string[] = [];
@@ -24,7 +24,7 @@ function store(): Store {
 /** Records whether any request carried the token. */
 function spyApi(fetchFn: typeof fetch = h.fetch) {
   const seen = { authed: 0, requests: 0 };
-  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, trustedState(), (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
     seen.requests++;
     if (req.headers.get("authorization")) seen.authed++;
@@ -69,4 +69,64 @@ test("down, unhealthy or instance-less servers are unreachable and pin nothing",
     expect(s.get("blocked")).toBeUndefined();
     s.close();
   }
+});
+
+/** An ApiClient gated by `s`, counting requests and those that carried the token. */
+function gatedSpy(s: Store, fetchFn: typeof fetch = h.fetch) {
+  const seen = { authed: 0, requests: 0 };
+  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, s, (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    seen.requests++;
+    if (req.headers.get("authorization")) seen.authed++;
+    return fetchFn(req);
+  }) as typeof fetch);
+  const refused = async () => {
+    const e = await api.status().catch((x) => x);
+    return e instanceof ApiError && e.code === "instance_unverified";
+  };
+  return { api, seen, refused };
+}
+
+test("the token goes out only after a fresh check of the pinned instance at this URL, and never while blocked", async () => {
+  const s = store();
+  const { api, seen, refused } = gatedSpy(s);
+  expect(await refused()).toBe(true); // never checked
+  expect(seen.requests).toBe(0);
+
+  expect(await checkInstance(s, api, { timeoutMs: 1000 })).toBe("ok");
+  expect((await api.status()).machine).toBe("test-mac");
+  expect(seen.authed).toBe(1);
+
+  s.set(VERIFIED_KEY, verificationRecord(TEST_URL, h.instanceId, Date.now() - 61_000));
+  expect(await refused()).toBe(true); // stale
+  s.set(VERIFIED_KEY, verificationRecord("http://elsewhere.test", h.instanceId));
+  expect(await refused()).toBe(true); // checked another server
+  s.set(VERIFIED_KEY, verificationRecord(TEST_URL, "not-the-pinned-one"));
+  expect(await refused()).toBe(true); // not the pinned instance
+  for (const reason of ["instance_mismatch", "token_revoked", "unauthorized"]) {
+    s.set(VERIFIED_KEY, verificationRecord(TEST_URL, h.instanceId));
+    s.set("blocked", reason);
+    expect(await refused()).toBe(true);
+  }
+  expect(seen.authed).toBe(1);
+  expect((await api.health()).instanceId).toBe(h.instanceId); // health needs no token and stays open
+  s.close();
+});
+
+test("a mismatch or an unreachable server withdraws an earlier verification", async () => {
+  const s = store();
+  const { api, refused } = gatedSpy(s);
+  expect(await checkInstance(s, api, { timeoutMs: 1000 })).toBe("ok");
+  expect(await refused()).toBe(false);
+
+  const down = gatedSpy(s, (() => { throw new TypeError("connection refused"); }) as unknown as typeof fetch);
+  expect(await checkInstance(s, down.api, { timeoutMs: 1000 })).toBe("unreachable");
+  expect(await refused()).toBe(true);
+
+  expect(await checkInstance(s, api, { timeoutMs: 1000 })).toBe("ok");
+  s.set("instanceId", crypto.randomUUID());
+  expect(await checkInstance(s, api, { timeoutMs: 1000 })).toBe("mismatch");
+  s.set("blocked", null);
+  expect(await refused()).toBe(true);
+  s.close();
 });

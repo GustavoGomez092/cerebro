@@ -39,14 +39,55 @@ export interface BindingInput {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+/** The local state the client consults before an authenticated call (the Store satisfies it). */
+export interface StateReader { get(key: string): string | undefined }
+
+/** State key holding the last successful instance check (see `verificationRecord`). */
+export const VERIFIED_KEY = "instanceVerified";
+
+/** How long one successful instance check lets authenticated calls go out. */
+export const VERIFIED_FOR_MS = 60_000;
+
+/** What `checkInstance` stores after `/health` named the pinned instance at `serverUrl`. */
+export function verificationRecord(serverUrl: string, instanceId: string, at = Date.now()): string {
+  return JSON.stringify({ serverUrl, instanceId, at });
+}
+
+/** When the pinned instance was last verified at `serverUrl` (ms since epoch), or null if it was not. */
+export function verifiedAt(state: StateReader, serverUrl: string): number | null {
+  let v: { serverUrl?: unknown; instanceId?: unknown; at?: unknown } | null = null;
+  try { v = JSON.parse(state.get(VERIFIED_KEY) ?? "null"); } catch { return null; }
+  if (!v || v.serverUrl !== serverUrl || typeof v.at !== "number") return null;
+  const pinned = state.get("instanceId");
+  return pinned !== undefined && v.instanceId === pinned ? v.at : null;
+}
+
+/** Why an authenticated call to `serverUrl` may not go out now, or null when it may. */
+export function callRefusal(state: StateReader, serverUrl: string, now = Date.now()): string | null {
+  const blocked = state.get("blocked");
+  if (blocked) return `uploads are blocked (${blocked}); nothing was sent`;
+  const at = verifiedAt(state, serverUrl);
+  if (at === null || now - at > VERIFIED_FOR_MS || at > now + VERIFIED_FOR_MS) {
+    return "the server has not been verified as this Mac's Cerebro instance; nothing was sent";
+  }
+  return null;
+}
+
 export class ApiClient {
-  constructor(private cfg: ClientConfig, private fetchFn: typeof fetch = fetch) {}
+  constructor(private cfg: ClientConfig, private state: StateReader, private fetchFn: typeof fetch = fetch) {}
+
+  get serverUrl(): string { return this.cfg.serverUrl; }
 
   private async call<T>(method: string, path: string, opts: { body?: unknown; query?: object; auth?: boolean } & CallOpts = {}): Promise<T> {
     const url = new URL(this.cfg.serverUrl.replace(/\/+$/, "") + path);
     for (const [k, v] of Object.entries(opts.query ?? {})) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     const headers: Record<string, string> = {};
-    if (opts.auth !== false) headers.Authorization = `Bearer ${this.cfg.token}`;
+    if (opts.auth !== false) {
+      // The token only goes to a server that just proved to be the pinned instance (see checkInstance).
+      const refusal = callRefusal(this.state, this.cfg.serverUrl);
+      if (refusal) throw new ApiError(0, "instance_unverified", refusal);
+      headers.Authorization = `Bearer ${this.cfg.token}`;
+    }
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     let res: Response;
     try {

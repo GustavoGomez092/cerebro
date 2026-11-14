@@ -59,6 +59,11 @@ function transcript(home: string, cwd: string, opts: { entrypoint?: string; ageM
   utimesSync(path, t, t);
   return { sid, path };
 }
+/** Imports `root` with a fresh store and a client gated by it. */
+function importFolderFresh(root: string, machine: string, opts: { home: string }) {
+  const store = newStore();
+  return importFolder(store, h.clientFor(store), root, machine, opts);
+}
 function newStore(): Store {
   const d = tmp();
   process.env.CEREBRO_HOME = d;
@@ -82,7 +87,7 @@ test("imports only this folder's past sessions, marked imported", async () => {
   const elsewhere = transcript(home, other.root);
 
   const store = newStore();
-  const r = await importFolder(store, h.api, root, "mac", { home });
+  const r = await importFolder(store, h.clientFor(store), root, "mac", { home });
   expect(r).toMatchObject({ sessions: 1, events: 2, skipped: 1, bySource: { "claude-code": 1 } });
   const s = await serverSession(a.sid);
   expect(s.imported).toBe(true);
@@ -102,7 +107,7 @@ test("monorepo subfolder sessions go to their own binding", async () => {
   const s = transcript(home, join(root, "packages", "a"));
 
   const store = newStore();
-  const r = await importFolder(store, h.api, root, "mac", { home });
+  const r = await importFolder(store, h.clientFor(store), root, "mac", { home });
   expect(r.sessions).toBe(2);
   expect((await serverSession(t.sid)).binding_id).toBe(top.id);
   expect((await serverSession(s.sid)).binding_id).toBe(sub.id);
@@ -114,8 +119,8 @@ test("running the import twice uploads nothing new", async () => {
   await bind(remote, "", "Twice");
   transcript(home, root);
   const store = newStore();
-  expect((await importFolder(store, h.api, root, "mac", { home })).sessions).toBe(1);
-  const again = await importFolder(store, h.api, root, "mac", { home });
+  expect((await importFolder(store, h.clientFor(store), root, "mac", { home })).sessions).toBe(1);
+  const again = await importFolder(store, h.clientFor(store), root, "mac", { home });
   expect(again).toMatchObject({ sessions: 0, events: 0 });
   expect(store.pendingCount()).toBe(0);
 });
@@ -126,10 +131,10 @@ test("a live transcript keeps its cursor open for further capture", async () => 
   await bind(remote, "", "Live");
   const t = transcript(home, root, { ageMs: 30_000 });
   const store = newStore();
-  expect((await importFolder(store, h.api, root, "mac", { home })).sessions).toBe(1);
+  expect((await importFolder(store, h.clientFor(store), root, "mac", { home })).sessions).toBe(1);
   expect(store.getCursor(t.path)?.done).toBe(false);
   appendFileSync(t.path, entry(t.sid, root, "cli", 5));
-  const again = await importFolder(store, h.api, root, "mac", { home });
+  const again = await importFolder(store, h.clientFor(store), root, "mac", { home });
   expect(again.events).toBe(1);
 });
 
@@ -137,7 +142,7 @@ test("an unbound folder imports nothing", async () => {
   const home = tmp();
   const { root } = repo("unbound");
   transcript(home, root);
-  const r = await importFolder(newStore(), h.api, root, "mac", { home });
+  const r = await importFolderFresh(root, "mac", { home });
   expect(r).toMatchObject({ sessions: 0, events: 0, skipped: 1 });
 });
 
@@ -149,8 +154,9 @@ test("a failed resolve leaves the imported marker unset and the next run finishe
   transcript(home, root);
   transcript(home, join(root, "packages", "a"));
 
+  const store = newStore();
   let failed = false;
-  const flaky = new Proxy(h.api, {
+  const flaky = new Proxy(h.clientFor(store), {
     get(target, prop, recv) {
       if (prop !== "resolve") return Reflect.get(target, prop, recv);
       return (...args: Parameters<typeof target.resolve>) => {
@@ -159,12 +165,11 @@ test("a failed resolve leaves the imported marker unset and the next run finishe
       };
     },
   });
-  const store = newStore();
   const first = await importFolder(store, flaky, root, "mac", { home });
   expect(first.sessions).toBe(1);
   expect(store.get(`imported:${remote}|`)).toBeUndefined();
 
-  const second = await importFolder(store, h.api, root, "mac", { home });
+  const second = await importFolder(store, h.clientFor(store), root, "mac", { home });
   expect(second.sessions).toBe(1);
   expect(store.get(`imported:${remote}|`)).toBeTruthy();
 });
@@ -175,7 +180,7 @@ test("a child directory named like '..foo' is still inside the folder", async ()
   mkdirSync(join(root, "..foo"));
   await bind(remote, "", "DotsTop");
   const t = transcript(home, join(root, "..foo"));
-  const r = await importFolder(newStore(), h.api, root, "mac", { home });
+  const r = await importFolderFresh(root, "mac", { home });
   expect(r.sessions).toBe(1);
   expect((await serverSession(t.sid)).imported).toBe(true);
 });
@@ -187,5 +192,45 @@ test("a held import lock returns zeros", async () => {
   transcript(home, root);
   const store = newStore();
   expect(store.tryLock(`import:${remote}|`, 60_000)).toBe(true);
-  expect(await importFolder(store, h.api, root, "mac", { home })).toEqual({ sessions: 0, events: 0, skipped: 0, bySource: {} });
+  expect(await importFolder(store, h.clientFor(store), root, "mac", { home })).toEqual({ sessions: 0, events: 0, skipped: 0, bySource: {} });
+});
+
+/** Wraps the live server's fetch, noting the path of every request that carried the token. */
+function authSpy() {
+  const authed: string[] = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+    return h.fetch(req);
+  }) as typeof fetch;
+  return { authed, fetchFn };
+}
+
+test("import never sends the token to a server that is not the pinned instance", async () => {
+  const home = tmp();
+  const { root, remote } = repo("impostor");
+  await bind(remote, "", "Impostor");
+  transcript(home, root);
+  const store = newStore();
+  store.set("instanceId", crypto.randomUUID()); // pinned to another instance than the one answering
+  const { authed, fetchFn } = authSpy();
+  const r = await importFolder(store, h.clientFor(store, fetchFn), root, "mac", { home });
+  expect(authed).toEqual([]);
+  expect(r.sessions).toBe(0);
+  expect(store.get(`imported:${remote}|`)).toBeUndefined();
+});
+
+test("import sends nothing while uploads are blocked (revoked or refused token)", async () => {
+  for (const reason of ["token_revoked", "unauthorized"]) {
+    const home = tmp();
+    const { root, remote } = repo(`blocked-${reason}`);
+    await bind(remote, "", `Blocked-${reason}`);
+    transcript(home, root);
+    const store = newStore();
+    store.set("instanceId", h.instanceId);
+    store.set("blocked", reason);
+    const { authed, fetchFn } = authSpy();
+    await importFolder(store, h.clientFor(store, fetchFn), root, "mac", { home });
+    expect({ reason, authed }).toEqual({ reason, authed: [] });
+  }
 });

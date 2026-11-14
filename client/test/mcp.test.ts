@@ -38,10 +38,11 @@ function repo(name: string) {
 }
 
 /** An MCP client wired in-process to a server for `cwd`; spawned commands are recorded, not run. */
-async function connect(cwd: string) {
+async function connect(cwd: string, opts: { fetchFn?: typeof fetch; prepare?: (store: Store) => void } = {}) {
   const store = new Store(join(tmp(), "cerebro.db"));
+  opts.prepare?.(store);
   const spawned: string[][] = [];
-  const server = createMcpServer({ api: h.api, store, cwd, machine: "mac", spawn: (a) => { spawned.push(a); } });
+  const server = createMcpServer({ api: h.clientFor(store, opts.fetchFn), store, cwd, machine: "mac", spawn: (a) => { spawned.push(a); } });
   const [ct, st] = InMemoryTransport.createLinkedPair();
   await server.connect(st);
   const client = new Client({ name: "test", version: "0" });
@@ -90,9 +91,13 @@ test("search from a project-bound folder never sees another project", async () =
 test("recall calls always carry the folder's repo/subpath and never scope open, even when unbound", async () => {
   const a = repo("lonely");
   const seen: string[] = [];
-  const spy = ((i: any, init?: any) => { seen.push(`${init?.method ?? "GET"} ${new Request(i).url} ${init?.body ?? ""}`); return h.fetch(i, init); }) as typeof fetch;
-  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, spy);
+  const spy = ((i: any, init?: any) => {
+    const url = new Request(i).url;
+    if (new URL(url).pathname !== "/health") seen.push(`${init?.method ?? "GET"} ${url} ${init?.body ?? ""}`); // each tool checks the instance first
+    return h.fetch(i, init);
+  }) as typeof fetch;
   const store = new Store(join(tmp(), "cerebro.db"));
+  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, spy);
   const server = createMcpServer({ api, store, cwd: join(a.root, "pkg"), machine: "mac", spawn: () => {} });
   const [ct, st] = InMemoryTransport.createLinkedPair();
   await server.connect(st);
@@ -205,3 +210,85 @@ test("whole_repo false at the repo root says it binds the whole repo", async () 
   const r = await call("cerebro_bind", { client: "Root Client", project: "P", whole_repo: false });
   expect(r.text).toContain("whole repo");
 });
+
+/** Wraps the live server's fetch, noting the path of every request that carried the token. */
+function authSpy() {
+  const authed: string[] = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+    return h.fetch(req);
+  }) as typeof fetch;
+  return { authed, fetchFn };
+}
+
+const EVERY_TOOL: [string, Record<string, unknown>][] = [
+  ["cerebro_search", { query: "anything" }],
+  ["cerebro_sessions", {}],
+  ["cerebro_read", { session_id: "00000000-0000-4000-b000-000000000000" }],
+  ["cerebro_folder", {}],
+  ["cerebro_bind", { client: "Never Sent" }],
+  ["cerebro_decline", {}],
+  ["cerebro_adopt", {}],
+];
+
+test("every tool refuses with a clear error, sending no token, when the server is not the pinned instance", async () => {
+  const a = repo("impostor");
+  const { authed, fetchFn } = authSpy();
+  const { call, spawned } = await connect(a.root, { fetchFn, prepare: (s) => s.set("instanceId", crypto.randomUUID()) });
+  for (const [tool, args] of EVERY_TOOL) {
+    const r = await call(tool, args);
+    expect({ tool, isError: r.isError }).toEqual({ tool, isError: true });
+    expect(r.text).toContain("not the Cerebro instance this Mac was set up with");
+  }
+  expect(authed).toEqual([]);
+  expect(spawned).toEqual([]);
+});
+
+test("every tool refuses, sending no token, while uploads are blocked by a revoked or refused token", async () => {
+  for (const reason of ["token_revoked", "unauthorized"]) {
+    const a = repo(`blocked-${reason}`);
+    const { authed, fetchFn } = authSpy();
+    const { call } = await connect(a.root, { fetchFn, prepare: (s) => { s.set("instanceId", h.instanceId); s.set("blocked", reason); } });
+    for (const [tool, args] of EVERY_TOOL) {
+      const r = await call(tool, args);
+      expect({ reason, tool, isError: r.isError }).toEqual({ reason, tool, isError: true });
+      expect(r.text).toContain("~/.cerebro/bin/cerebro status --retry");
+    }
+    expect({ reason, authed }).toEqual({ reason, authed: [] });
+  }
+});
+
+test("the MCP server's startup never sends the token to a server that is not the pinned instance", async () => {
+  const authed: string[] = [];
+  const impostor = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    fetch(req) {
+      if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+      if (new URL(req.url).pathname === "/health") return Response.json({ ok: true, apiVersion: 1, instanceId: "impostor" });
+      return Response.json({ machine: "stolen" });
+    },
+  });
+  try {
+    const home = tmp();
+    const pinned = new Store(join(home, "cerebro.db"));
+    pinned.set("instanceId", "the-real-instance");
+    pinned.close();
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(CEREBRO_|CLAUDE_PLUGIN_OPTION_|CLAUDE_CODE_)/.test(k)) env[k] = v;
+    const p = Bun.spawn(["bun", join(import.meta.dir, "../src/cli.ts"), "mcp"], {
+      stdin: "pipe", stdout: "pipe", stderr: "ignore",
+      env: { ...env, CEREBRO_HOME: home, CLAUDE_PROJECT_DIR: home, CLAUDE_PLUGIN_OPTION_SERVER_URL: `http://127.0.0.1:${impostor.port}`, CLAUDE_PLUGIN_OPTION_TOKEN: "SECRET" },
+    });
+    // The server answers `initialize` only once its startup (machine lookup) is over.
+    p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } }) + "\n");
+    p.stdin.flush();
+    const first = await p.stdout.getReader().read();
+    expect(new TextDecoder().decode(first.value)).toContain('"id":1');
+    p.stdin.end();
+    await p.exited;
+    expect(authed).toEqual([]);
+  } finally {
+    impostor.stop(true);
+  }
+}, 15_000);

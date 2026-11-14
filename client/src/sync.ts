@@ -5,7 +5,7 @@ import { ApiError, type ApiClient } from "./api";
 import { captureTranscript } from "./capture";
 import { flush } from "./flush";
 import { folderIdentity, type FolderIdentity } from "./identity";
-import { checkInstance } from "./instance";
+import { verifyServer } from "./instance";
 import { logError, logInfo } from "./log";
 import { allSources } from "./sources";
 import { genericSource, moveToDone } from "./sources/generic";
@@ -25,6 +25,7 @@ const LOCK_TTL_MS = 30 * 60_000;
 const HEALTH_TIMEOUT_MS = 1500;
 const RESOLVE_TIMEOUT_MS = 1500;
 const MAX_RESOLVES = 50;
+const REVERIFY_AFTER_MS = 30_000;
 /** A file touched this recently may still be written to, so its cursor stays open for sweeps. */
 const LIVE_WINDOW_MS = 10 * 60_000;
 
@@ -67,8 +68,8 @@ export async function syncAllSources(
     for (const s of sources) out.bySource[s.id] = { files: 0, events: 0, skipped: 0 };
 
     let online = false;
-    if (api && !store.get("blocked")) {
-      try { online = (await checkInstance(store, api, { timeoutMs: HEALTH_TIMEOUT_MS })) === "ok"; } catch (e) { logError("sync health", e); }
+    if (api) {
+      try { online = (await verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS })) === "ok"; } catch (e) { logError("sync health", e); }
     }
 
     // Many sessions share a folder; work out each folder's identity (three git calls) once per run.
@@ -186,6 +187,10 @@ async function refreshBindings(
   const order = [...due.values()].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(0, limit);
   let asked = 0;
   for (const { ident } of order) {
+    // Fifty lookups can outlast one instance check (good for 60 s): re-check when it is getting old.
+    if ((await verifyServer(store, api, { timeoutMs: HEALTH_TIMEOUT_MS, reuseMs: REVERIFY_AFTER_MS })) !== "ok") {
+      return { asked, reachable: false };
+    }
     asked++;
     try {
       const { binding } = await api.resolve(ident.repo, ident.subpath, { timeoutMs: RESOLVE_TIMEOUT_MS });

@@ -11,7 +11,7 @@ import { ApiClient } from "../src/api";
 import { buildBrief, TOOLS_LINE } from "../src/brief";
 import { handleHook, type HookInput } from "../src/hooks";
 import { Store } from "../src/store";
-import { liveServer, TEST_URL, type LiveServer } from "./harness";
+import { liveServer, TEST_URL, type LiveServer, trustedState } from "./harness";
 
 const CLI = join(import.meta.dir, "../src/cli.ts");
 const UNKNOWN_FOLDER =
@@ -84,7 +84,7 @@ function setup(): Env {
   return {
     store, dir, repo, sid, transcript, calls,
     input: (extra = {}) => ({ session_id: sid, transcript_path: transcript, cwd: dir, hook_event_name: "SessionStart", ...extra }),
-    deps: (api = h.api) => ({ store, api, machine: "test-mac", env: {}, spawn: (args: string[]) => { calls.push(args); } }),
+    deps: (api = h.clientFor(store)) => ({ store, api, machine: "test-mac", env: {}, spawn: (args: string[]) => { calls.push(args); } }),
   };
 }
 
@@ -98,7 +98,7 @@ const contextOf = (out: string): string => {
 };
 
 /** An API whose server never answers (requests only end when their timeout aborts them). */
-const hangingApi = () => new ApiClient({ serverUrl: TEST_URL, token: h.token }, ((_: unknown, init?: RequestInit) =>
+const hangingApi = () => new ApiClient({ serverUrl: TEST_URL, token: h.token }, trustedState(), ((_: unknown, init?: RequestInit) =>
   new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)))) as typeof fetch);
 
 test("unknown folder: SessionStart asks Claude to run the cerebro skill", async () => {
@@ -235,7 +235,7 @@ test("headless runs (CEREBRO_HEADLESS, sdk entrypoint, unattended): SessionStart
     const e = setup();
     await bind(e.repo);
     let fetched = 0;
-    const counting = new ApiClient({ serverUrl: TEST_URL, token: h.token }, ((i: RequestInfo | URL, init?: RequestInit) => { fetched++; return h.fetch(i, init); }) as typeof fetch);
+    const counting = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, ((i: RequestInfo | URL, init?: RequestInit) => { fetched++; return h.fetch(i, init); }) as typeof fetch);
     expect(await handleHook("SessionStart", e.input(), { ...e.deps(counting), env })).toBe("");
     expect({ env, fetched, calls: e.calls, cursor: e.store.getCursor(e.transcript) }).toEqual({ env, fetched: 0, calls: [], cursor: undefined });
     e.store.close();
@@ -295,7 +295,7 @@ test("server down: SessionStart answers from the cache within 2 s and never thro
   expect(ctx).toContain("Acme / App");
   expect(ctx).toContain("2026-11-02");
 
-  const refusing = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (() => { throw new TypeError("connection refused"); }) as unknown as typeof fetch);
+  const refusing = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, (() => { throw new TypeError("connection refused"); }) as unknown as typeof fetch);
   expect(contextOf(await handleHook("SessionStart", e.input(), e.deps(refusing)))).toContain("Acme / App");
 
   // Offline and never seen: say nothing rather than asking about a folder we cannot set up.
@@ -311,7 +311,7 @@ test("a server that is not the pinned instance never sees the token, and the bri
   await handleHook("SessionStart", e.input(), e.deps());
   e.store.set("instanceId", crypto.randomUUID());
   const authed: string[] = [];
-  const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
     if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
     return h.fetch(req);
@@ -324,10 +324,30 @@ test("a server that is not the pinned instance never sees the token, and the bri
   e.store.close();
 });
 
+test("a revoked or refused token is not sent again by SessionStart; the brief comes from the cache", async () => {
+  for (const reason of ["token_revoked", "unauthorized"] as const) {
+    const e = setup();
+    await bind(e.repo);
+    await handleHook("SessionStart", e.input(), e.deps()); // online: fills the caches
+    e.store.set("blocked", reason);
+    const authed: string[] = [];
+    const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = new Request(input, init);
+      if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+      return h.fetch(req);
+    }) as typeof fetch);
+    const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps(spy)));
+    expect({ reason, authed }).toEqual({ reason, authed: [] });
+    expect(ctx).toContain("Acme / App");
+    e.store.close();
+  }
+});
+
 test("problem lines name the CLI by its stable path, which works without cerebro on PATH", async () => {
   for (const reason of ["token_revoked", "unauthorized"] as const) {
     const e = setup();
     await bind(e.repo);
+    await handleHook("SessionStart", e.input(), e.deps()); // online: caches the binding a blocked start falls back to
     e.store.set("blocked", reason);
     const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps()));
     expect(ctx, reason).toContain("run `~/.cerebro/bin/cerebro status --retry`");
@@ -365,7 +385,7 @@ test("Stop captures then schedules a flush; SessionEnd does no network I/O", asy
   expect(e.store.pendingCount()).toBe(3);
 
   let fetched = 0;
-  const noNetwork = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (() => { fetched++; throw new Error("no network in SessionEnd"); }) as unknown as typeof fetch);
+  const noNetwork = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, (() => { fetched++; throw new Error("no network in SessionEnd"); }) as unknown as typeof fetch);
   appendFileSync(e.transcript, line(e.sid, e.dir, "assistant", "bye"));
   e.calls.length = 0;
   const t0 = Date.now();
@@ -487,7 +507,7 @@ test("end to end: hooks over HTTP, and the detached flush uploads the session", 
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
   try {
     const url = `http://127.0.0.1:${server.port}`;
-    const api = new ApiClient({ serverUrl: url, token });
+    const api = new ApiClient({ serverUrl: url, token }, trustedState(url));
     const c = await api.createClient("E2E");
     const { dir, repo } = gitRepo();
     await api.putBinding({ repo, subpath: "", status: "active", clientId: c.id, projectId: null });

@@ -52,21 +52,21 @@ const serverCount = async (sid: string) => Number((await h.sql`select count(*)::
 
 test("uploads queued sessions and events, then the queue is empty", async () => {
   const { store, sid } = seeded(5);
-  const r = await flush(store, h.api);
+  const r = await flush(store, h.clientFor(store));
   expect(r).toMatchObject({ outcome: "done", sent: 5, duplicates: 0, quarantined: 0 });
   expect(store.pendingCount()).toBe(0);
   expect(store.unsentSessions(10)).toEqual([]);
   expect(await serverCount(sid)).toBe(5);
   expect(store.get("lastFlushAt")).toBeTruthy();
   expect(store.get("instanceId")).toBe(h.instanceId);
-  expect((await flush(store, h.api)).outcome).toBe("nothing");
+  expect((await flush(store, h.clientFor(store))).outcome).toBe("nothing");
 });
 
 test("replaying after a crash mid-flush uploads nothing twice", async () => {
   const { store, sid, evs } = seeded(4);
-  await flush(store, h.api);
+  await flush(store, h.clientFor(store));
   store.enqueueEvents(evs);
-  const r = await flush(store, h.api);
+  const r = await flush(store, h.clientFor(store));
   expect(r.duplicates).toBe(4);
   expect(r.sent).toBe(0);
   expect(await serverCount(sid)).toBe(4);
@@ -82,7 +82,7 @@ test("an impostor server never receives the token or data", async () => {
     seen.push({ method: req.method, path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
     return Response.json({ ok: true, instanceId: "instance-B", apiVersion: 1 });
   }) as typeof fetch;
-  const api = new ApiClient({ serverUrl: TEST_URL, token: "secret" }, fake);
+  const api = new ApiClient({ serverUrl: TEST_URL, token: "secret" }, store, fake);
   const r = await flush(store, api);
   expect(r.outcome).toBe("instance_mismatch");
   expect(seen).toEqual([{ method: "GET", path: "/health", auth: null }]);
@@ -94,7 +94,7 @@ test("an impostor server never receives the token or data", async () => {
 
 test("unreachable server backs off and keeps everything", async () => {
   const { store } = seeded(3);
-  const api = new ApiClient({ serverUrl: TEST_URL, token: "t" }, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
+  const api = new ApiClient({ serverUrl: TEST_URL, token: "t" }, store, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
   const t = 1_000_000;
   const r = await flush(store, api, { now: () => t });
   expect(r.outcome).toBe("unreachable");
@@ -118,7 +118,7 @@ test("413 halves the batch until it fits", async () => {
     }
     return h.fetch(req);
   }) as typeof fetch;
-  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped);
+  const api = new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped);
   const r = await flush(store, api);
   expect(r.outcome).toBe("done");
   expect(store.pendingCount()).toBe(0);
@@ -133,7 +133,7 @@ test("a single event over the byte limit is quarantined as too_large, not retrie
   store.upsertSession(session(sid));
   const small = events(sid, 2, "ok").map((e) => ({ ...e, key: `${e.key}:ok`, seq: e.seq + 10 }));
   store.enqueueEvents([...events(sid, 1, "x".repeat(2000)), ...small]);
-  const r = await flush(store, h.api, { maxBytes: 64 * 1024 + 1000 });
+  const r = await flush(store, h.clientFor(store), { maxBytes: 64 * 1024 + 1000 });
   expect(r.quarantined).toBe(1);
   expect(store.quarantineCount()).toBe(1);
   expect(store.pendingCount()).toBe(0);
@@ -147,7 +147,7 @@ test("rejected items are quarantined and the rest is acknowledged", async () => 
   const evs = events(sid, 3);
   evs[1] = { ...evs[1], ts: "0000-01-01T00:00:00Z" };
   store.enqueueEvents(evs);
-  const r = await flush(store, h.api);
+  const r = await flush(store, h.clientFor(store));
   expect(r.quarantined).toBe(1);
   expect(store.quarantineCount()).toBe(1);
   expect(store.pendingCount()).toBe(0);
@@ -161,7 +161,7 @@ test("a session with an unknown binding is dropped: events quarantined, cursor a
   store.enqueueEvents(events(sid, 2));
   store.cacheBinding("github.com/acme/flush", "", { id: "x", repo: "github.com/acme/flush", subpath: "", status: "active", clientId: null, projectId: null });
   store.setCursor("/t/a.jsonl", { source: "claude-code", sessionId: sid, offset: 0, line: 0, state: null, bindingId: "x", cwd: "/w", repo: "github.com/acme/flush", subpath: "" });
-  const r = await flush(store, h.api);
+  const r = await flush(store, h.clientFor(store));
   expect(r.quarantined).toBe(2);
   expect(store.pendingCount()).toBe(0);
   expect(store.openCursors()).toEqual([]);
@@ -173,7 +173,7 @@ test("a revoked token stops uploading until retried", async () => {
   const { store } = seeded(2);
   const { token } = await createToken(h.sql, "doomed-flush");
   await revokeToken(h.sql, "doomed-flush");
-  const api = new ApiClient({ serverUrl: TEST_URL, token }, h.fetch);
+  const api = new ApiClient({ serverUrl: TEST_URL, token }, store, h.fetch);
   const r = await flush(store, api);
   expect(r.outcome).toBe("blocked");
   expect(store.get("blocked")).toBe("token_revoked");
@@ -183,7 +183,7 @@ test("a revoked token stops uploading until retried", async () => {
 
 test("concurrent flushes never send the same batch twice", async () => {
   const { store, sid } = seeded(6);
-  const [a, b] = await Promise.all([flush(store, h.api), flush(store, h.api)]);
+  const [a, b] = await Promise.all([flush(store, h.clientFor(store)), flush(store, h.clientFor(store))]);
   expect([a.outcome, b.outcome].sort()).toEqual(["done", "locked"]);
   expect(await serverCount(sid)).toBe(6);
 });
@@ -191,7 +191,7 @@ test("concurrent flushes never send the same batch twice", async () => {
 test("end option closes the session after its events are uploaded", async () => {
   const { store, sid } = seeded(2);
   const endedAt = "2026-10-20T05:00:00.000Z";
-  await flush(store, h.api, { end: { sessionId: sid, endedAt } });
+  await flush(store, h.clientFor(store), { end: { sessionId: sid, endedAt } });
   const [row] = await h.sql`select ended_at from sessions where id = ${sid}`;
   expect(new Date(row.ended_at).toISOString()).toBe(endedAt);
 });
@@ -200,7 +200,7 @@ test("a store failure returns an outcome, releases the lock and does not throw",
   const store = newStore();
   const broken = Object.create(store) as Store;
   broken.unsentSessions = () => { throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }); };
-  const r = await flush(broken, h.api);
+  const r = await flush(broken, h.clientFor(broken));
   expect(r.outcome).toBe("error");
   expect(store.tryLock("flush", 1000)).toBe(true);
   store.unlock("flush");
@@ -209,7 +209,7 @@ test("a store failure returns an outcome, releases the lock and does not throw",
 test("stops starting new requests once the deadline passes; what is not sent stays queued", async () => {
   const { store, sid } = seeded(6);
   let t = 0;
-  const r = await flush(store, h.api, { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600) });
+  const r = await flush(store, h.clientFor(store), { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600) });
   const pending = store.pendingCount();
   expect(pending).toBeGreaterThan(0);
   expect(r.sent).toBe(6 - pending);
@@ -225,37 +225,37 @@ const serverEnded = async (sid: string) => {
 test("a session end survives a locked flush and is sent by the next plain flush", async () => {
   const { store, sid } = seeded(2);
   expect(store.tryLock("flush", 60_000)).toBe(true);
-  expect((await flush(store, h.api, { end: { sessionId: sid, endedAt } })).outcome).toBe("locked");
+  expect((await flush(store, h.clientFor(store), { end: { sessionId: sid, endedAt } })).outcome).toBe("locked");
   store.unlock("flush");
   expect(store.pendingEnds()).toEqual([{ sessionId: sid, endedAt }]);
-  await flush(store, h.api);
+  await flush(store, h.clientFor(store));
   expect(await serverEnded(sid)).toBe(endedAt);
   expect(store.pendingEnds()).toEqual([]);
 });
 
 test("a session end survives an unreachable server", async () => {
   const { store, sid } = seeded(2);
-  const down = new ApiClient({ serverUrl: TEST_URL, token: "t" }, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
+  const down = new ApiClient({ serverUrl: TEST_URL, token: "t" }, store, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
   expect((await flush(store, down, { end: { sessionId: sid, endedAt } })).outcome).toBe("unreachable");
   expect(store.pendingEnds().length).toBe(1);
-  await flush(store, h.api, { now: () => Date.now() + 3_600_000 });
+  await flush(store, h.clientFor(store), { now: () => Date.now() + 3_600_000 });
   expect(await serverEnded(sid)).toBe(endedAt);
   expect(store.pendingEnds()).toEqual([]);
 });
 
 test("a session end survives a deadline that stops the run before anything uploads", async () => {
   const { store, sid } = seeded(2);
-  await flush(store, h.api, { deadlineMs: 0, end: { sessionId: sid, endedAt } });
+  await flush(store, h.clientFor(store), { deadlineMs: 0, end: { sessionId: sid, endedAt } });
   expect(await serverEnded(sid)).toBeNull();
   expect(store.pendingEnds().length).toBe(1);
-  await flush(store, h.api);
+  await flush(store, h.clientFor(store));
   expect(await serverEnded(sid)).toBe(endedAt);
 });
 
 test("a session end is sent once the session row is up, even with events still queued", async () => {
   const { store, sid } = seeded(6);
   let t = 0;
-  await flush(store, h.api, { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600), end: { sessionId: sid, endedAt } });
+  await flush(store, h.clientFor(store), { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600), end: { sessionId: sid, endedAt } });
   expect(store.pendingCount()).toBeGreaterThan(0);
   expect(await serverEnded(sid)).toBe(endedAt);
   expect(store.pendingEnds()).toEqual([]);
@@ -264,7 +264,7 @@ test("a session end is sent once the session row is up, even with events still q
 test("an end the server answers 404 for is dropped", async () => {
   const store = newStore();
   store.addPendingEnd("ghost-session", endedAt);
-  await flush(store, h.api);
+  await flush(store, h.clientFor(store));
   expect(store.pendingEnds()).toEqual([]);
 });
 
@@ -278,7 +278,7 @@ test("a batch the server rejects with 422 is split until the poison event is qua
     }
     return h.fetch(req);
   }) as typeof fetch;
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(r.outcome).toBe("done");
   expect(r.quarantined).toBe(1);
   expect(store.pendingCount()).toBe(0);
@@ -297,7 +297,7 @@ test("many consecutive 413s from a small proxy limit never quarantine events tha
     }
     return h.fetch(req);
   }) as typeof fetch;
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped), { maxBytes: 1_200_000 });
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped), { maxBytes: 1_200_000 });
   expect(r.quarantined).toBe(0);
   expect(store.pendingCount()).toBe(0);
   expect(await serverCount(sid)).toBe(40);
@@ -317,7 +317,7 @@ test("a single event bigger than the proxy limit is quarantined as too_large aft
     }
     return h.fetch(req);
   }) as typeof fetch;
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(r.quarantined).toBe(1);
   expect(store.pendingCount()).toBe(0);
   expect(await serverCount(sid)).toBe(4);
@@ -331,7 +331,7 @@ const refusing = (status: number, error: string) => (async (input: RequestInfo |
 
 test("a proxy 429 backs off and quarantines nothing", async () => {
   const { store } = seeded(5);
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(429, "rate_limited")));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, refusing(429, "rate_limited")));
   expect(["backoff", "unreachable"]).toContain(r.outcome);
   expect(store.quarantineCount()).toBe(0);
   expect(store.pendingCount()).toBe(5);
@@ -340,7 +340,7 @@ test("a proxy 429 backs off and quarantines nothing", async () => {
 
 test("a 403 on every request quarantines nothing and records the error", async () => {
   const { store } = seeded(5);
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(403, "forbidden")));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, refusing(403, "forbidden")));
   expect(r.outcome).toBe("unreachable");
   expect(store.quarantineCount()).toBe(0);
   expect(store.pendingCount()).toBe(5);
@@ -359,7 +359,7 @@ test("a poison event does not take its session row down with it", async () => {
     }
     return h.fetch(req);
   }) as typeof fetch;
-  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(store.quarantineCount()).toBe(1);
   expect(store.get(`sessionRejected:${sid}`)).toBeUndefined();
   expect(store.unsentSessions(10)).toEqual([]);
@@ -376,14 +376,14 @@ test("a session row the server refuses on its own is retired and the reason reco
     if (new URL(req.url).pathname === "/v1/ingest") return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
     return h.fetch(req);
   }) as typeof fetch;
-  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(store.get(`sessionRejected:${sid}`)).toBe("invalid_data");
   expect(store.unsentSessions(10)).toEqual([]);
 });
 
 test("a 408 backs off and quarantines nothing", async () => {
   const { store } = seeded(3);
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(408, "request_timeout")));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, refusing(408, "request_timeout")));
   expect(r.outcome).toBe("unreachable");
   expect(store.quarantineCount()).toBe(0);
   expect(store.pendingCount()).toBe(3);
@@ -399,7 +399,7 @@ test("a 403 on an end keeps it pending and backs off", async () => {
     if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "forbidden", message: "no" }, { status: 403 });
     return h.fetch(req);
   }) as typeof fetch;
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(r.outcome).toBe("unreachable");
   expect(store.pendingEnds().length).toBe(1);
   expect(store.get(`endRejected:${a}`)).toBeUndefined();
@@ -414,7 +414,7 @@ test("an end the server rejects as invalid data is dropped and the next end is s
     if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "invalid_ended_at", message: "bad" }, { status: 422 });
     return h.fetch(req);
   }) as typeof fetch;
-  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(store.pendingEnds()).toEqual([]);
   expect(store.get(`endRejected:${a}`)).toContain("invalid_ended_at");
   expect(await serverEnded(b)).toBe(endedAt);
@@ -430,7 +430,7 @@ test("a 429 on an end keeps it for later", async () => {
     if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "rate_limited", message: "slow" }, { status: 429 });
     return h.fetch(req);
   }) as typeof fetch;
-  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, store, wrapped));
   expect(store.pendingEnds().length).toBe(1);
 });
 
@@ -438,6 +438,6 @@ test("an unexpected failure records lastError", async () => {
   const store = newStore();
   const broken = Object.create(store) as Store;
   broken.unsentSessions = () => { throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }); };
-  await flush(broken, h.api);
+  await flush(broken, h.clientFor(broken));
   expect(store.get("lastError")).toContain("SQLITE_BUSY");
 });
