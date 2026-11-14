@@ -8,13 +8,16 @@ export { STATE_SCHEMA };
 
 /** Summaries a rebuild reads: the scope's newest, folded oldest first. */
 const REBUILD_WINDOW = 40;
-/** Summaries per model call, and their serialised size per call (one larger summary goes alone). */
+/** Summaries per model call at most. */
 const BATCH_SIZE = 10;
-const BATCH_CHARS = 40_000;
+/** Model input per call (system prompt + prompt), as for transcripts. */
+const MAX_INPUT_CHARS = 60_000;
+/** Room always left for summaries in a call; a current state leaving less is shortened for that call. */
+const MIN_SUMMARY_ROOM = 8000;
+/** The prompt's wording varies a little with the number of summaries. */
+const ENVELOPE_SLACK = 64;
 /** Cap on the rendered markdown `text`. */
 const TEXT_MAX = 6000;
-/** Allowance per call for the system prompt and the current state, for the up-front rebuild estimate. */
-const CALL_OVERHEAD_CHARS = 8000;
 const RETRY_LATER_MS = 30 * 60_000;
 /** Compare-and-set attempts before giving up on a scope that keeps changing underneath. */
 const MAX_ATTEMPTS = 3;
@@ -71,7 +74,8 @@ async function touchRows(sql: SQL, keys: string[], dirty: boolean): Promise<void
   const onConflict = dirty
     ? "do update set dirty = true, dirty_gen = project_states.dirty_gen + 1"
     : "do nothing";
-  for (const key of new Set(keys)) {
+  // Sorted, so two transactions marking overlapping scopes lock rows in the same order.
+  for (const key of [...new Set(keys)].sort()) {
     const sc = parseScope(key);
     if (!sc) continue;
     const owner = sc.projectId
@@ -92,6 +96,21 @@ async function touchRows(sql: SQL, keys: string[], dirty: boolean): Promise<void
  */
 export async function markScopesDirty(sql: SQL, keys: string[]): Promise<void> {
   await touchRows(sql, keys, true);
+}
+
+/**
+ * For scopes whose set of summaries changed (summaries moved in or out): marks them dirty and empties
+ * `source_summary_ids` with a version bump, so the next update rebuilds and one in flight loses its
+ * compare-and-set. The old `doc`/`text` stay readable until then.
+ */
+export async function invalidateStates(sql: SQL, keys: string[]): Promise<void> {
+  const sorted = [...new Set(keys)].sort();
+  await touchRows(sql, sorted, true);
+  if (sorted.length) {
+    await sql`
+      update project_states set source_summary_ids = '{}', version = version + 1
+      where scope = any(${sql.array(sorted, "text")})`;
+  }
 }
 
 const emptyDoc = (): StateDoc => ({
@@ -188,22 +207,114 @@ function summaryInput(r: SummaryRow): Record<string, unknown> {
   return out;
 }
 
-/** Splits summaries (oldest first) into model calls of ≤ 10 summaries and ≤ 40 000 serialised characters. */
-function batches(rows: SummaryRow[]): { rows: SummaryRow[]; inputs: Record<string, unknown>[]; chars: number }[] {
-  const out: { rows: SummaryRow[]; inputs: Record<string, unknown>[]; chars: number }[] = [];
-  for (const r of rows) {
-    const input = summaryInput(r);
-    const size = JSON.stringify(input).length;
-    const cur = out[out.length - 1];
-    if (cur && cur.rows.length < BATCH_SIZE && cur.chars + size <= BATCH_CHARS) {
-      cur.rows.push(r);
-      cur.inputs.push(input);
-      cur.chars += size;
-    } else {
-      out.push({ rows: [r], inputs: [input], chars: size });
+const jsonLength = (v: unknown) => JSON.stringify(v).length;
+
+/**
+ * Shortens a summary's input to `room` serialised characters: `changes` goes first, then items from the
+ * end of the longest list, then the overview (or text) and the title are cut. The dates are kept.
+ */
+function fitSummary(input: Record<string, unknown>, room: number): Record<string, unknown> {
+  if (jsonLength(input) <= room) return input;
+  const out: Record<string, unknown> = { ...input };
+  delete out.changes;
+  const lists = SUMMARY_LISTS.filter((k) => Array.isArray(out[k]));
+  for (const k of lists) out[k] = [...(out[k] as string[])];
+  while (jsonLength(out) > room) {
+    let longest: string | null = null;
+    let longestChars = 0;
+    for (const k of lists) {
+      const v = out[k] as string[];
+      const n = jsonLength(v);
+      if (v.length && n > longestChars) [longest, longestChars] = [k, n];
     }
+    if (!longest) break;
+    (out[longest] as string[]).pop();
+  }
+  for (const k of ["overview", "text", "title"]) {
+    const over = jsonLength(out) - room;
+    if (over <= 0) break;
+    const s = out[k];
+    if (typeof s === "string") out[k] = storable(s.slice(0, Math.max(0, s.length - over)));
   }
   return out;
+}
+
+const requestChars = (req: { systemPrompt: string; prompt: string }) => req.systemPrompt.length + req.prompt.length;
+
+/** Input characters of a call carrying `doc` and no summaries yet. */
+const baseChars = (sc: Scope, doc: StateDoc) => requestChars(stateRequest(doc, [], scopeLabel(sc))) + ENVELOPE_SLACK;
+
+/**
+ * The current state as sent to the model. Within the schema's caps it always leaves room for summaries,
+ * unless its JSON is inflated by escaping; then it is shortened for the call, least important items
+ * first (oldest resolved, facts, decisions, open threads), then the overview and status are halved.
+ */
+function fitState(sc: Scope, doc: StateDoc): StateDoc {
+  const limit = MAX_INPUT_CHARS - MIN_SUMMARY_ROOM;
+  if (baseChars(sc, doc) <= limit) return doc;
+  const d: StateDoc = {
+    ...doc, decisions: [...doc.decisions], open_threads: [...doc.open_threads],
+    resolved_recently: [...doc.resolved_recently], facts: [...doc.facts],
+  };
+  const order = ["resolved_recently", "facts", "decisions", "open_threads"] as const;
+  while (baseChars(sc, d) > limit) {
+    const k = order.find((key) => d[key].length);
+    if (k) d[k].shift();
+    else if (d.overview || d.current_status) {
+      d.overview = d.overview.slice(0, d.overview.length >> 1);
+      d.current_status = d.current_status.slice(0, d.current_status.length >> 1);
+    } else break;
+  }
+  return d;
+}
+
+/**
+ * The next call's summaries from `rows` (oldest first): at most 10, within the room a call whose
+ * state-only input is `baseLen` characters leaves under MAX_INPUT_CHARS. A first summary too big to fit
+ * alone is shortened (fitSummary), so every call carries at least one.
+ */
+function nextBatch(baseLen: number, rows: SummaryRow[]): { inputs: Record<string, unknown>[]; chars: number } {
+  const room = MAX_INPUT_CHARS - baseLen;
+  const inputs: Record<string, unknown>[] = [];
+  let chars = 0;
+  for (const r of rows) {
+    if (inputs.length >= BATCH_SIZE) break;
+    let input = summaryInput(r);
+    let size = jsonLength(input) + 1;
+    if (chars + size > room) {
+      if (inputs.length) break;
+      input = fitSummary(input, room - 1);
+      size = jsonLength(input) + 1;
+    }
+    inputs.push(input);
+    chars += size;
+  }
+  return { inputs, chars };
+}
+
+const fill = (n: number) => "x".repeat(n);
+const MAX_DOC: StateDoc = {
+  overview: fill(1500),
+  current_status: fill(800),
+  decisions: Array.from({ length: 30 }, () => ({ text: fill(300), date: fill(40) })),
+  open_threads: Array.from({ length: 30 }, () => ({ text: fill(300), since: fill(40) })),
+  resolved_recently: Array.from({ length: 15 }, () => ({ text: fill(300), date: fill(40) })),
+  facts: Array.from({ length: 40 }, () => fill(300)),
+};
+
+/**
+ * Tokens a rebuild over `rows` may spend: its calls planned as if every call carried a state at the
+ * schema's caps (the most a well-formed state leaves no less room than), each call at its real size.
+ */
+function rebuildEstimate(sc: Scope, rows: SummaryRow[]): number {
+  const base = Math.min(baseChars(sc, MAX_DOC), MAX_INPUT_CHARS - MIN_SUMMARY_ROOM);
+  let tokens = 0;
+  for (let i = 0; i < rows.length;) {
+    const b = nextBatch(base, rows.slice(i));
+    tokens += estimateTokens(base + b.chars);
+    i += b.inputs.length;
+  }
+  return tokens;
 }
 
 const SUMMARY_COLS = "id::text as id, ts_from, ts_to, title, body, text";
@@ -257,13 +368,24 @@ const overBudget = (resumesAt: Date | null): StateResult => ({
   status: "deferred", reason: "budget", until: resumesAt ?? new Date(Date.now() + RETRY_LATER_MS),
 });
 
-/** One model call folding `inputs` into `current`; a StateResult when it could not. */
-async function fold(
-  sql: SQL, deps: StateDeps, sc: Scope, current: StateDoc, inputs: Record<string, unknown>[], ctx: CallContext,
-): Promise<StateDoc | StateResult> {
-  const req = stateRequest(current, inputs, scopeLabel(sc));
+interface Folded {
+  doc: StateDoc;
+  /** How many of the pending summaries this call folded in. */
+  count: number;
+}
+
+/**
+ * One model call folding the next batch of `pending` (oldest first) into `current`, sized to stay within
+ * MAX_INPUT_CHARS; a StateResult when it could not.
+ */
+async function foldNext(
+  sql: SQL, deps: StateDeps, sc: Scope, current: StateDoc, pending: SummaryRow[], ctx: CallContext,
+): Promise<Folded | StateResult> {
+  const shown = fitState(sc, current);
+  const batch = nextBatch(baseChars(sc, shown), pending);
+  const req = stateRequest(shown, batch.inputs, scopeLabel(sc));
   const budget = await budgetState(sql, deps.budget);
-  if (!canSpend(budget, estimateTokens(req.systemPrompt.length + req.prompt.length))) return overBudget(budget.resumesAt);
+  if (!canSpend(budget, estimateTokens(requestChars(req)))) return overBudget(budget.resumesAt);
 
   const run = await deps.run({ ...req, schema: STATE_SCHEMA });
   if (!run.ok) {
@@ -275,21 +397,23 @@ async function fold(
   }
   ctx.credentialExpiresAt = run.credentialExpiresAt;
   await record(sql, run.tokens, "state");
-  return parseState(run.output) ?? { status: "failed", reason: "bad_output" };
+  const doc = parseState(run.output);
+  return doc ? { doc, count: batch.inputs.length } : { status: "failed", reason: "bad_output" };
 }
 
-const isResult = (v: StateDoc | StateResult): v is StateResult => "status" in v;
+const isResult = (v: Folded | StateResult): v is StateResult => "status" in v;
 const failedScope: StateResult = { status: "failed", reason: "failed" };
 
 /**
  * Folds new summaries into a scope's state: the given ids plus any of the scope's newest 40 not yet
- * folded (so a summary whose update was lost is picked up), oldest first, ≤ 10 per model call.
+ * folded (so a summary whose update was lost is picked up), oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS
+ * per model call.
  * Each call's result replaces `doc` and `text`, bumps `version` and appends to `source_summary_ids`,
  * committed only if no other update landed meanwhile (else the update starts over from the new state).
  * `dirty` is cleared when everything is folded and no new mark arrived while it ran.
  *
- * A scope with no state yet, or whose state was built from summaries that have since left it (re-bind,
- * adopt, session move), is rebuilt instead.
+ * A scope with no state yet, one invalidated because summaries moved in or out (re-bind, adopt, session
+ * move: invalidateStates), or whose sources have otherwise left it, is rebuilt instead.
  */
 export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint[], deps: StateDeps): Promise<StateResult> {
   const sc = parseScope(scope);
@@ -318,22 +442,23 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
 
     let doc = st.doc;
     let version = st.version;
-    const parts = batches(rows);
-    for (const [i, part] of parts.entries()) {
-      const out = await fold(sql, deps, sc, doc, part.inputs, ctx);
+    for (let i = 0; i < rows.length;) {
+      const out = await foldNext(sql, deps, sc, doc, rows.slice(i), ctx);
       if (isResult(out)) return done(ctx, out);
-      const last = i === parts.length - 1;
+      const foldedIds = rows.slice(i, i + out.count).map((r) => r.id);
+      i += out.count;
+      const last = i >= rows.length;
       const [u] = await sql`
         update project_states set
-          doc = ${JSON.stringify(out)}::text::jsonb, text = ${renderState(out)}, version = version + 1,
-          source_summary_ids = source_summary_ids || ${part.rows.map((r) => r.id)}::bigint[],
+          doc = ${JSON.stringify(out.doc)}::text::jsonb, text = ${renderState(out.doc)}, version = version + 1,
+          source_summary_ids = source_summary_ids || ${foldedIds}::bigint[],
           dirty = case when ${last} and dirty_gen = ${st.dirtyGen}::bigint then false else dirty end,
           updated_at = now()
         where scope = ${sc.key} and version = ${version}
         returning version`;
-      if (!u) continue attempts; // another update landed first: start over from it
+      if (!u) continue attempts; // another update (or a re-bind's invalidation) landed first: start over
       version = u.version;
-      doc = out;
+      doc = out.doc;
     }
     return done(ctx, { status: "updated" });
   }
@@ -341,10 +466,14 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
 }
 
 /**
- * Rebuilds a scope's state from scratch out of its newest 40 summaries (oldest first, ≤ 10 per call),
- * for a dirty scope or one with no state. Nothing is spent unless the budget covers the whole rebuild.
- * The result is committed only if no update landed meanwhile (else it starts over); `dirty` is cleared
- * only if no new mark arrived while it ran. A scope with no summaries gets an empty state, without a call.
+ * Rebuilds a scope's state from scratch out of its newest 40 summaries (oldest first, ≤ 10 and
+ * ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. Nothing is spent unless the
+ * budget covers the whole rebuild (rebuildEstimate, capped at the budget's limit so a large rebuild can
+ * still start once the window is clear). Nothing is committed part-way: a rebuild deferred mid-way by a
+ * usage limit, login or timeout is redone from scratch later, since a partial state built from the
+ * oldest summaries would replace a newer brief. The result is committed only if no update landed
+ * meanwhile (else it starts over); `dirty` is cleared only if no new mark arrived while it ran.
+ * A scope with no summaries gets an empty state, without a call.
  */
 export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Promise<StateResult> {
   const sc = parseScope(scope);
@@ -354,17 +483,17 @@ export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Pr
     const st = await loadState(sql, sc);
     if (!st) return failedScope;
     const rows = (await newestSummaries(sql, sc, REBUILD_WINDOW)).reverse();
-    const parts = batches(rows);
-    if (parts.length) {
+    if (rows.length) {
       const budget = await budgetState(sql, deps.budget);
-      const estimate = parts.reduce((n, p) => n + estimateTokens(p.chars + CALL_OVERHEAD_CHARS), 0);
+      const estimate = Math.min(rebuildEstimate(sc, rows), budget.limit);
       if (!canSpend(budget, estimate)) return done(ctx, overBudget(budget.resumesAt));
     }
     let doc = emptyDoc();
-    for (const part of parts) {
-      const out = await fold(sql, deps, sc, doc, part.inputs, ctx);
+    for (let i = 0; i < rows.length;) {
+      const out = await foldNext(sql, deps, sc, doc, rows.slice(i), ctx);
       if (isResult(out)) return done(ctx, out);
-      doc = out;
+      doc = out.doc;
+      i += out.count;
     }
     const [u] = await sql`
       update project_states set

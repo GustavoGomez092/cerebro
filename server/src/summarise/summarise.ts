@@ -196,12 +196,16 @@ export async function summariseJob(
     let stored: { id: unknown; scope: string } | "inactive" | null;
     try {
       stored = await sql.begin(async (tx) => {
-        // Share-locked so a concurrent re-bind, adopt or session move (which re-scopes summaries) waits
-        // for this insert, or this insert waits for it and reads the new scope.
-        const [b] = await tx`
-          select b.id, b.client_id, b.project_id from sessions s join bindings b on b.id = s.binding_id
-          where s.id = ${sessionId} and b.status = 'active'
-          for share`;
+        // A re-bind, adopt or session move re-scopes existing summaries, so it must not interleave with
+        // this insert. Lock the session row first: a move or adopt in flight finishes first, and this then
+        // reads the session's new binding (not the old one, which would discard a paid-for summary).
+        // Then lock that binding: a re-bind in flight finishes first and this reads its new scope; one
+        // starting later waits for this insert and moves the new summary with the rest.
+        const [s] = await tx`select binding_id from sessions where id = ${sessionId} for share`;
+        const [b] = s
+          ? await tx`
+              select id, client_id, project_id from bindings where id = ${s.binding_id} and status = 'active' for share`
+          : [];
         if (!b) return "inactive" as const;
         const [row] = await tx`
           insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq,

@@ -5,9 +5,16 @@ export {};
 // "ok" answers in the shape of the --json-schema it is given: a summary object for SUMMARY_SCHEMA, a project
 // state for STATE_SCHEMA (the fenced current state with the fenced new summaries folded in: decisions, facts
 // and open threads added; threads named in a summary's resolved_threads moved to resolved_recently).
+// "maxstate" answers a STATE_SCHEMA object with every field at its cap, filled with FAKE_CLAUDE_FILL (default "x").
+// With FAKE_CLAUDE_RECORD=<file>, each call appends {"chars": <system prompt + stdin length>} as a JSON line.
+import { appendFileSync } from "node:fs";
 const mode = process.env.FAKE_CLAUDE_MODE ?? "ok";
 const stdin = await Bun.stdin.text();
 const argv = process.argv.slice(2);
+if (process.env.FAKE_CLAUDE_RECORD) {
+  const sys = argv[argv.indexOf("--system-prompt") + 1] ?? "";
+  appendFileSync(process.env.FAKE_CLAUDE_RECORD, `${JSON.stringify({ chars: sys.length + stdin.length })}\n`);
+}
 
 const envelope = (over: Record<string, unknown>) => ({
   type: "result",
@@ -94,6 +101,20 @@ const stateFor = (prompt: string) => {
 const summaryFor = (prompt: string) =>
   wantsState ? stateFor(prompt) : wantsSummary ? fullSummary(prompt) : { summary: `fake summary: ${prompt.trim()}` };
 
+/** STATE_SCHEMA object with every string and list at its cap. */
+const maxState = () => {
+  const fill = (n: number) => (process.env.FAKE_CLAUDE_FILL ?? "x").repeat(n).slice(0, n);
+  const dated = (n: number, key: string) => Array.from({ length: n }, () => ({ text: fill(300), [key]: fill(40) }));
+  return {
+    overview: fill(1500),
+    current_status: fill(800),
+    decisions: dated(30, "date"),
+    open_threads: dated(30, "since"),
+    resolved_recently: dated(15, "date"),
+    facts: Array.from({ length: 40 }, () => fill(300)),
+  };
+};
+
 /** STATE_SCHEMA-shaped but oversized, secret-laden and with extra keys. */
 const hostileState = () => ({
   overview: `Leaked sk-ant-api03-${"A".repeat(40)} nul\u0000 lone\uD800 ` + "O".repeat(50_000),
@@ -123,6 +144,9 @@ const emit = (obj: unknown) => console.log(JSON.stringify(obj));
 switch (mode) {
   case "ok":
     emit(envelope({ result: JSON.stringify(summaryFor(stdin)) }));
+    break;
+  case "maxstate":
+    emit(envelope({ result: JSON.stringify(maxState()) }));
     break;
   case "structured":
     emit(envelope({ result: "", structured_output: summaryFor(stdin) }));

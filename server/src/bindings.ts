@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { normalizeIdentity, pathIdentityMachine, type Binding } from "@cerebro/shared";
 import type { Machine } from "./auth";
-import { markScopesDirty, scopeKey } from "./summarise/state";
+import { invalidateStates, scopeKey } from "./summarise/state";
 
 export type BindingErrorCode = "invalid" | "conflict" | "not_found" | "forbidden" | "rebind_required";
 
@@ -34,15 +34,17 @@ async function record(sql: SQL, bindingId: string, machine: Machine | undefined,
 
 /**
  * Re-binding moves history: puts summaries in their binding's current scope (a declined binding has
- * none) and flags the project state of every scope they left or joined for a rebuild. `which` picks
- * the summaries: all of a binding's, or those of sessions that moved to `to`.
+ * none) and invalidates the project state of every scope they left or joined, so each is rebuilt
+ * rather than folded into. `which` picks the summaries: all of a binding's, or those of sessions that
+ * moved to `to`. Rows are locked in id order so concurrent moves cannot deadlock.
  */
 async function rescopeSummaries(
   tx: SQL, to: Binding, which: { bindingId: string } | { sessionIds: string[] },
 ): Promise<void> {
   const moved: { client_id: string | null; project_id: string | null }[] = "bindingId" in which
     ? await tx`
-        with old as (select id, client_id, project_id from summaries where binding_id = ${which.bindingId} for update)
+        with old as (
+          select id, client_id, project_id from summaries where binding_id = ${which.bindingId} order by id for update)
         update summaries s set client_id = ${to.clientId}, project_id = ${to.projectId}
         from old where s.id = old.id
         returning old.client_id, old.project_id`
@@ -50,7 +52,7 @@ async function rescopeSummaries(
       ? await tx`
           with old as (
             select id, client_id, project_id from summaries
-            where session_id = any(${tx.array(which.sessionIds, "text")}) for update)
+            where session_id = any(${tx.array(which.sessionIds, "text")}) order by id for update)
           update summaries s set binding_id = ${to.id}, client_id = ${to.clientId}, project_id = ${to.projectId}
           from old where s.id = old.id
           returning old.client_id, old.project_id`
@@ -58,7 +60,7 @@ async function rescopeSummaries(
   const target = to.status === "active" && to.clientId ? scopeKey(to.clientId, to.projectId) : null;
   const left = moved.map((m) => (m.client_id ? scopeKey(m.client_id, m.project_id) : null));
   if (!left.some((k) => k !== target)) return;
-  await markScopesDirty(tx, [...left, target].filter((k): k is string => k !== null));
+  await invalidateStates(tx, [...left, target].filter((k): k is string => k !== null));
 }
 
 export interface BindingInput {

@@ -1,7 +1,13 @@
 import { test, expect } from "bun:test";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { authedApp } from "./helpers";
-import { boundFolder, ingest, sess } from "./fixtures";
+import { boundFolder, ev, ingest, sess } from "./fixtures";
 import { adoptSessions, moveSession } from "../src/bindings";
+import { endSession } from "../src/ingest";
+import { claimSummaryJob } from "../src/summarise/jobs";
+import { summariseJob } from "../src/summarise/summarise";
 import { record } from "../src/summarise/budget";
 import { runClaude, type ClaudeInput } from "../src/summarise/claude";
 import {
@@ -22,12 +28,22 @@ let seqBase = 0;
 async function addSummary(
   t: any,
   b: { id: string; clientId: string; projectId: string | null },
-  o: { title: string; day: number; facts?: string[]; open?: string[]; resolved?: string[]; decisions?: string[]; sessionId?: string },
+  o: {
+    title: string; day: number; facts?: string[]; open?: string[]; resolved?: string[]; decisions?: string[];
+    sessionId?: string; big?: boolean;
+  },
 ): Promise<bigint> {
-  const body = {
-    title: o.title, period: `2026-11-${o.day}`, overview: `Overview of ${o.title}`,
-    decisions: o.decisions ?? [], changes: [], facts: o.facts ?? [], open_threads: o.open ?? [], resolved_threads: o.resolved ?? [],
-  };
+  const full = (n: number, what: string) => Array.from({ length: n }, (_, i) => `${o.title} ${what} ${i} `.padEnd(300, "y"));
+  const body = o.big
+    ? {
+      title: o.title, period: `2026-11-${o.day}`, overview: `Overview of ${o.title} `.padEnd(1200, "o"),
+      decisions: full(20, "decision"), changes: full(20, "change"), facts: full(30, "fact"),
+      open_threads: full(20, "open"), resolved_threads: full(20, "resolved"),
+    }
+    : {
+      title: o.title, period: `2026-11-${o.day}`, overview: `Overview of ${o.title}`,
+      decisions: o.decisions ?? [], changes: [], facts: o.facts ?? [], open_threads: o.open ?? [], resolved_threads: o.resolved ?? [],
+    };
   const from = new Date(Date.UTC(2026, 10, o.day, 9)).toISOString();
   const to = new Date(Date.UTC(2026, 10, o.day, 11)).toISOString();
   const first = (seqBase += 10);
@@ -405,5 +421,159 @@ test("a rebuild uses the scope's last 40 summaries, oldest first, ten per call",
     const flat = dates.flat();
     expect(flat).toHaveLength(40);
     expect([...flat].sort()).toEqual(flat);
+  } finally { await t.drop(); }
+});
+
+test("a scope receiving re-bound summaries is rebuilt, not folded into", async () => {
+  const t = await authedApp();
+  try {
+    const { binding: old } = await boundFolder(t, { client: "Acme", repo: "github.com/acme/old" });
+    const { client: B, binding: own } = await boundFolder(t, { client: "Beta", repo: "github.com/beta/own" });
+    const scopeB = scopeKey(B.id, null);
+    const o1 = await addSummary(t, old, { title: "Old one", day: 1, facts: ["old fact one"] });
+    const o2 = await addSummary(t, old, { title: "Old two", day: 2, facts: ["old fact two"] });
+    const n1 = await addSummary(t, own, { title: "New one", day: 10, facts: ["new fact one"] });
+    const n2 = await addSummary(t, own, { title: "Newest work", day: 11, facts: ["new fact two"] });
+    expect((await updateState(t.sql, scopeB, [n1, n2], deps())).status).toBe("updated");
+    const before = await stateRow(t, scopeB);
+
+    await t.call("PUT", "/v1/bindings", { repo: "github.com/acme/old", subpath: "", status: "active", clientId: B.id, rebind: true });
+    const invalidated = await stateRow(t, scopeB);
+    expect(invalidated.version).toBe(before.version + 1); // an in-flight update loses its compare-and-set
+    expect(ids(invalidated)).toEqual([]);
+    expect(invalidated.dirty).toBe(true);
+
+    expect((await updateState(t.sql, scopeB, [], deps())).status).toBe("updated");
+    const updated = await stateRow(t, scopeB);
+    expect(updated.doc.current_status).toBe("Latest: Newest work"); // older work did not become current
+    expect(ids(updated)).toEqual([o1, o2, n1, n2]);
+    expect(updated.dirty).toBe(false);
+    expect((await rebuildState(t.sql, scopeB, deps())).status).toBe("updated");
+    const rebuilt = await stateRow(t, scopeB);
+    expect(updated.doc).toEqual(rebuilt.doc);
+    expect(updated.text).toBe(rebuilt.text);
+
+    // A re-bind landing while an update waits on claude: the update starts over and rebuilds.
+    const { client: C, binding: third } = await boundFolder(t, { client: "Gamma", repo: "github.com/gamma/x" });
+    const g1 = await addSummary(t, third, { title: "Gamma work", day: 5, facts: ["gamma fact"] });
+    const n3 = await addSummary(t, own, { title: "Latest", day: 12, facts: ["new fact three"] });
+    let rebound = false;
+    const rebinding = async (input: ClaudeInput) => {
+      if (!rebound) {
+        rebound = true;
+        await t.call("PUT", "/v1/bindings", { repo: "github.com/gamma/x", subpath: "", status: "active", clientId: B.id, rebind: true });
+      }
+      return fakeRun("ok")(input);
+    };
+    expect((await updateState(t.sql, scopeB, [n3], { run: rebinding, budget: BUDGET })).status).toBe("updated");
+    const after = await stateRow(t, scopeB);
+    expect(ids(after)).toEqual([o1, o2, n1, n2, g1, n3]);
+    expect(after.doc.facts).toContain("gamma fact");
+    expect(after.doc.current_status).toBe("Latest: Latest");
+    expect(scopeKey(C.id, null)).not.toBe(scopeB);
+  } finally { await t.drop(); }
+});
+
+test("every state call stays within 60 000 input characters", async () => {
+  const t = await authedApp();
+  const rec = join(tmpdir(), `cerebro-state-calls-${crypto.randomUUID()}.jsonl`);
+  const calls = () => readFileSync(rec, "utf8").trim().split("\n").map((l) => JSON.parse(l).chars as number);
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const all: bigint[] = [];
+    for (let i = 1; i <= 6; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: i, big: true }));
+
+    // Maximal state back from every call, maximal summaries in: each call still fits.
+    const prompts: string[] = [];
+    const maxRun = (fill = "x") => async (input: ClaudeInput) => {
+      prompts.push(input.prompt);
+      return fakeRun("maxstate", { FAKE_CLAUDE_RECORD: rec, FAKE_CLAUDE_FILL: fill })(input);
+    };
+    expect((await rebuildState(t.sql, scope, { run: maxRun(), budget: BUDGET })).status).toBe("updated");
+    expect(calls().length).toBeGreaterThanOrEqual(6);
+    for (const n of calls()) expect(n).toBeLessThanOrEqual(60_000);
+    expect(ids(await stateRow(t, scope))).toEqual(all);
+    // A summary too big to fit next to the state loses `changes` first, but keeps its title and dates.
+    const sent = prompts.slice(1).flatMap((p) => JSON.parse(p.split(/<state-[0-9a-f]{8}>\n/)[1].split(/\n<\/state-/)[0]).new_summaries);
+    expect(sent.length).toBeGreaterThan(0);
+    for (const s of sent) {
+      expect(s.changes).toBeUndefined();
+      expect(s.title).toMatch(/^Big \d$/);
+      expect(s.to).toMatch(/^2026-11-0\dT/);
+    }
+
+    rmSync(rec);
+    const more = await addSummary(t, binding, { title: "Big 7", day: 7, big: true });
+    expect((await updateState(t.sql, scope, [more], { run: maxRun(), budget: BUDGET })).status).toBe("updated");
+    expect(calls()).toHaveLength(1);
+    expect(calls()[0]).toBeLessThanOrEqual(60_000);
+
+    // A state whose JSON doubles when escaped (all quotes) is shortened for the call rather than overflowing it.
+    rmSync(rec);
+    expect((await rebuildState(t.sql, scope, { run: maxRun('"'), budget: BUDGET })).status).toBe("updated");
+    for (const n of calls()) expect(n).toBeLessThanOrEqual(60_000);
+    expect(ids(await stateRow(t, scope))).toEqual([...all, more]);
+  } finally {
+    if (existsSync(rec)) rmSync(rec);
+    await t.drop();
+  }
+});
+
+test("a dirty mark arriving during an update keeps the scope dirty", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const s1 = await addSummary(t, binding, { title: "One", day: 1 });
+    expect((await updateState(t.sql, scope, [s1], deps())).status).toBe("updated");
+    const s2 = await addSummary(t, binding, { title: "Two", day: 2 });
+    let marked = false;
+    const marking = async (input: ClaudeInput) => {
+      if (!marked) { marked = true; await markScopesDirty(t.sql, [scope]); }
+      return fakeRun("ok")(input);
+    };
+    expect((await updateState(t.sql, scope, [s2], { run: marking, budget: BUDGET })).status).toBe("updated");
+    let st = await stateRow(t, scope);
+    expect(ids(st)).toEqual([s1, s2]);
+    expect(st.dirty).toBe(true);
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    st = await stateRow(t, scope);
+    expect(st.dirty).toBe(false);
+  } finally { await t.drop(); }
+});
+
+test("a session move racing the summary store keeps the summary, in the new scope", async () => {
+  const t = await authedApp();
+  try {
+    const { binding: root } = await boundFolder(t, { client: "Acme" });
+    const { client: B, binding: target } = await boundFolder(t, { client: "Beta", repo: "github.com/beta/x" });
+    const events = Array.from({ length: 4 }, (_, i) => ev("s1", i + 1, i % 2 ? "assistant" : "user", `message ${i + 1}`));
+    await ingest(t, { sessions: [sess("s1", root.id)], events });
+    await endSession(t.sql, "s1", new Date().toISOString());
+    const job = (await claimSummaryJob(t.sql))!;
+
+    // A move is mid-transaction (session row updated, not committed) when the store reaches the session.
+    const conn = await t.sql.reserve();
+    let waited = false;
+    try {
+      await conn.unsafe("begin");
+      await conn`update sessions set binding_id = ${target.id} where id = 's1'`;
+      const run = summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET });
+      for (let i = 0; i < 400 && !waited; i++) {
+        const [w] = await t.sql`
+          select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`;
+        waited = w.n > 0;
+        if (!waited) await Bun.sleep(25);
+      }
+      await conn.unsafe("commit");
+      expect(waited).toBe(true);
+      expect((await run).status).toBe("done");
+    } finally {
+      conn.release();
+    }
+    const rows = await t.sql`select binding_id, client_id, project_id from summaries where session_id = 's1'`;
+    expect(rows).toEqual([{ binding_id: target.id, client_id: B.id, project_id: null }]);
+    expect((await stateRow(t, scopeKey(B.id, null))).dirty).toBe(true);
   } finally { await t.drop(); }
 });
