@@ -133,8 +133,11 @@ export function createMcpServer(deps: McpDeps): McpServer {
         repo: scope.repo, subpath, status: "active", clientId: client.id, projectId: project?.id ?? null, rebind: a.rebind,
       });
       store.cacheBinding(scope.repo, subpath, binding);
+      // Capture looks up this folder's own subpath; the server resolves it to the wider binding.
+      if (scope.subpath !== subpath) store.cacheBinding(scope.repo, scope.subpath, binding);
       spawn(["import", "--cwd", deps.cwd]);
       let text = `Bound ${subpath || "the repo root"} to ${name(client.name, project?.name ?? null)}. Importing past conversations in the background.`;
+      if (a.whole_repo === false && !scope.subpath) text += " This folder is the repo root, so this binds the whole repo.";
       if (subpath) text += await adoptHint(subpath);
       return text;
     });

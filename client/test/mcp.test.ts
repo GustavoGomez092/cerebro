@@ -105,7 +105,7 @@ test("recall calls always carry the folder's repo/subpath and never scope open, 
   for (const r of seen) {
     expect(decodeURIComponent(r)).toContain(a.remote);
     expect(r).toContain("pkg");
-    expect(r).not.toContain("open");
+    expect(r).not.toContain("scope=open");
   }
 });
 
@@ -185,4 +185,23 @@ test("server errors come back as tool errors, not crashes", async () => {
   const c = repo("nobind");
   const c2 = await connect(c.root);
   expect((await c2.call("cerebro_adopt")).isError).toBe(true);
+});
+
+test("bind and decline from a subfolder are visible to capture under the folder's own subpath", async () => {
+  const a = repo("subcache");
+  const { call, store } = await connect(join(a.root, "pkg"));
+  expect((await call("cerebro_bind", { client: "Sub Client", project: "P" })).isError).toBe(false);
+  expect(store.cachedBinding(a.remote, "")?.binding?.status).toBe("active");
+  expect(store.cachedBinding(a.remote, "pkg")?.binding?.status).toBe("active");
+  const b = repo("subdecl");
+  const d = await connect(join(b.root, "pkg"));
+  expect((await d.call("cerebro_decline")).isError).toBe(false);
+  expect(d.store.cachedBinding(b.remote, "pkg")?.binding?.status).toBe("declined");
+});
+
+test("whole_repo false at the repo root says it binds the whole repo", async () => {
+  const a = repo("rootnote");
+  const { call } = await connect(a.root);
+  const r = await call("cerebro_bind", { client: "Root Client", project: "P", whole_repo: false });
+  expect(r.text).toContain("whole repo");
 });
