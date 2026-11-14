@@ -137,7 +137,7 @@ describe("deploy.sh", () => {
     for (const d of ["data/db", "data/ollama", "data/claude", "src/deploy/compose.yml"]) expect(existsSync(s.app(d))).toBe(true);
 
     // Model pulled with a one-off container (cerebro-net is internal), then the stack, migrate, server, registration.
-    const order = ["docker build", "ollama pull", "--wait db ollama", "pg_dump", "migrate", `compose-up-server cerebro-server:${s.sha()}`, "token create check", "casaos-cli app-management install -f"];
+    const order = ["docker build", "ollama pull", "up -d --wait --wait-timeout 300 db ollama", "pg_dump", "migrate", `compose-up-server cerebro-server:${s.sha()}`, "token create check", "casaos-cli app-management install -f"];
     const at = order.map((k) => calls.indexOf(k));
     expect(at.every((i) => i >= 0), `${order} in\n${calls}`).toBe(true);
     expect([...at].sort((a, b) => a - b)).toEqual(at);
@@ -479,6 +479,115 @@ describe("deploy.sh", () => {
     expect(r.code, show(r)).toBe(0);
     expect(readFileSync(stored, "utf8")).toContain("en_us: Private memory\n");
     expect(s.calls()).toContain("systemctl restart zimaos-app-management");
+  });
+
+  test("the db carries postgres.conf's sha256 as a label, so a changed conf recreates it on deploy", () => {
+    const s = sandbox();
+    const sha256 = (f: string) => new Bun.CryptoHasher("sha256").update(readFileSync(join(s.repo, f))).digest("hex");
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    const label = (h: string) => `cerebro.postgres-conf-sha256: "${h}"`;
+    const before = sha256("deploy/postgres.conf");
+    const compose = readFileSync(s.app("docker-compose.yml"), "utf8");
+    expect(compose).toContain(label(before));
+    expect(compose.indexOf(label(before))).toBeLessThan(compose.indexOf("  ollama:")); // on the db service
+
+    s.commit("deploy/postgres.conf", readFileSync(join(s.repo, "deploy/postgres.conf"), "utf8") + "work_mem = 4MB\n");
+    const after = sha256("deploy/postgres.conf");
+    expect(after).not.toBe(before);
+    s.clearCalls();
+    const r = s.run("deploy.sh");
+    expect(r.code, show(r)).toBe(0);
+    expect(readFileSync(s.app("docker-compose.yml"), "utf8")).toContain(label(after));
+    // db and ollama come up from the new definitions (compose recreates db when its labels change).
+    expect(s.calls()).toMatch(/docker compose -f \S+docker-compose\.next\.yml up -d --wait --wait-timeout \d+ db ollama/);
+  });
+
+  test("db/ollama failing to come up puts the last good definitions back and stops before migrating", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    const live = s.running();
+    s.commit("README.md", "b\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh", [], { FAKE_UP_DEPS_RC: "1" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("db/ollama did not come up healthy");
+    expect(r.err).toContain("restarted them from the last good compose");
+    const calls = s.calls();
+    const failed = calls.indexOf("docker-compose.next.yml up -d --wait");
+    const restore = calls.indexOf(`docker compose -f ${s.app("docker-compose.yml")} up -d db ollama`);
+    expect(failed).toBeGreaterThan(-1);
+    expect(restore).toBeGreaterThan(failed);
+    expect(calls).not.toContain("migrate");
+    expect(calls).not.toContain("compose-up-server");
+    expect(existsSync(s.app("docker-compose.next.yml"))).toBe(false);
+    expect(s.running()).toBe(live);
+    expect(s.locked()).toBe(false);
+  });
+
+  test("db/ollama failing on the first deploy says there is nothing to go back to", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"], { FAKE_UP_DEPS_RC: "1" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("db/ollama did not come up healthy");
+    expect(r.err).toContain("no earlier release");
+    expect(s.calls()).not.toContain("migrate");
+    expect(s.locked()).toBe(false);
+  });
+
+  test("a failed ZimaOS registration is a warning with the manual route; the release stays live and old images are pruned", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"], { FAKE_CASAOS_RC: "1" });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out + r.err).toMatch(/warning: could not register the ZimaOS app/);
+    expect(r.out + r.err).toContain("ssh zima sudo casaos-cli app-management install -f /DATA/AppData/cerebro/docker-compose.yml");
+    expect(r.out).toContain("is live");
+    expect(s.calls()).toContain("docker builder prune");
+    expect(s.locked()).toBe(false);
+  });
+
+  test("a migration that fails part-way keeps its pre-deploy dump as the recovery point across retries", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    s.commit("server/migrations/002_more.sql", "alter table t add y int;\n");
+    s.commit("server/migrations/003_again.sql", "alter table t add z int;\n");
+    const sha = s.sha();
+    // migrate applies 002, then fails on 003.
+    const failing = { FAKE_MIGRATE_RC: "1", FAKE_MIGRATE_OUT: "migrated: 002_more.sql\nerror in 003_again.sql" };
+    let r = s.run("deploy.sh", [], { ...failing, FAKE_DUMP_CONTENT: "PGDMP-before" });
+    expect(r.code, show(r)).toBe(1);
+    const dump = dumpFor(s, sha);
+    expect(readFileSync(s.app("state/pre-deploy/pending"), "utf8").trim()).toBe(dump);
+    const afterFirstFailure = dumpFiles(s); // the first deploy's dump and this one
+
+    for (const n of [1, 2, 3]) {
+      s.commit("README.md", `retry ${n}\n`);
+      s.clearCalls();
+      r = s.run("deploy.sh", [], { ...failing, FAKE_DUMP_CONTENT: "PGDMP-after" });
+      expect(r.code, show(r)).toBe(1);
+      expect(s.calls()).not.toContain("pg_dump"); // the schema is partly migrated: a dump now is no recovery point
+      expect(r.err).toContain(`/DATA/AppData/cerebro/state/pre-deploy/${dump}`);
+    }
+    expect(dumpFiles(s)).toEqual(afterFirstFailure); // no new dumps, none pruned
+    expect(readFileSync(s.app(`state/pre-deploy/${dump}`), "utf8")).toBe("PGDMP-before");
+
+    // The fixed release migrates: the marked dump becomes the applied recovery point and the marker is cleared.
+    s.commit("README.md", "fixed\n");
+    s.clearCalls();
+    r = s.run("deploy.sh", [], { FAKE_MIGRATE_OUT: "migrated: 003_again.sql" });
+    expect(r.code, show(r)).toBe(0);
+    expect(s.calls()).not.toContain("pg_dump");
+    expect(existsSync(s.app("state/pre-deploy/pending"))).toBe(false);
+    expect(readFileSync(s.app("state/pre-deploy/applied"), "utf8").trim()).toBe(dump);
+    expect(readFileSync(s.app("state/schema-migrations"), "utf8").trim()).toBe("001_init.sql\n002_more.sql\n003_again.sql");
+  }, 30_000);
+
+  test("a lock whose owner line cannot be written is removed and the deploy stops", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"], { FAKE_TEE_FAIL: "deploy.lock/owner" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("could not record the deploy lock's owner");
+    expect(s.locked()).toBe(false);
+    expect(s.calls()).not.toContain("docker build");
   });
 
   test("a bge-m3 digest mismatch stops the deploy before migrating", () => {

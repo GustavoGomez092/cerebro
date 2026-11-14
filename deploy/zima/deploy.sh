@@ -35,6 +35,11 @@ OLLAMA_CPUS=${OLLAMA_CPUS:-4}
 OLLAMA_IMAGE=$(sed -n 's/^ *image: *\(ollama\/ollama[^ ]*\) *$/\1/p' deploy/compose.yml)
 [[ -n $OLLAMA_IMAGE ]] || die "no ollama/ollama image in deploy/compose.yml"
 HEALTH_TIMEOUT=${CEREBRO_HEALTH_TIMEOUT:-60}
+DEPS_TIMEOUT=${CEREBRO_DEPS_TIMEOUT:-300} # db first boot / recovery after a crash, ollama start
+# The db's label: a changed postgres.conf (a single-file bind mount compose can't see) recreates the db.
+if command -v sha256sum >/dev/null; then CONF_SHA256=$(sha256sum deploy/postgres.conf); else CONF_SHA256=$(shasum -a 256 deploy/postgres.conf); fi
+CONF_SHA256=${CONF_SHA256%% *}
+[[ ${#CONF_SHA256} == 64 ]] || die "could not hash deploy/postgres.conf"
 
 [[ -z $(git status --porcelain) ]] || die "working tree is dirty; commit first (the image tag is the commit)"
 bun test || die "bun test failed; not deploying"
@@ -55,7 +60,10 @@ render_compose() {
   local c tag=$1 conf=$SRC/deploy/postgres.conf:
   # shellcheck disable=SC2016 # literal compose variables, not expansions
   local v_data='${CEREBRO_DATA}' v_secrets='${CEREBRO_SECRETS}' v_tag='${CEREBRO_TAG}' v_cpus='${OLLAMA_CPUS:-4}' rel='./postgres.conf:'
+  # shellcheck disable=SC2016
+  local v_conf='${POSTGRES_CONF_SHA256:-unset}'
   c=$(cat deploy/compose.yml)
+  c=${c//"$v_conf"/$CONF_SHA256}
   c=${c//"$v_data"/$DATA}
   c=${c//"$v_secrets"/$SECRETS}
   c=${c//"$v_tag"/$tag}
@@ -139,9 +147,10 @@ first_run_setup() {
   chown root:root "$secrets/db.env" "$secrets/server.env"
 }
 
-# Dumps the database (embeddings excluded, like the nightlies) to DIR/NAME, root 600, never overwriting one.
-# Keeps the newest 3 by name (<UTC ts>-<sha>.dump), plus this one and the one named in DIR/applied (the
-# newest dump taken before a migration that was applied: the recovery point for the current schema).
+# Dumps the database (embeddings excluded, like the nightlies) to DIR/NAME, root 600, never overwriting one, and
+# names it in DIR/pending (the recovery point while its migrations are not all applied).
+# Keeps the newest 3 by name (<UTC ts>-<sha>.dump), plus this one and the ones named in DIR/applied (the
+# newest dump taken before a migration that was applied: the recovery point for the current schema) and DIR/pending.
 pre_deploy_dump() {
   local dir=$1 name=$2 tmp keep old
   umask 077
@@ -156,6 +165,7 @@ pre_deploy_dump() {
   fi
   chmod 600 "$tmp"
   mv "$tmp" "$dir/$name"
+  printf '%s\n' "$name" | secret_write "$dir/pending"
   keep=$(cat "$dir/applied" 2>/dev/null || true)
   for old in $(find "$dir" -maxdepth 1 -name '*.dump' | sort -r | tail -n +4); do
     case ${old##*/} in "$name" | "$keep") ;; *) rm -f "$old" ;; esac
@@ -195,14 +205,19 @@ create_check_token() {
 say "deploying $IMAGE to $ZIMA_HOST"
 # One deploy at a time (the owner has several Macs): an atomic mkdir on the server, before any change, in one
 # connection that also reports a held lock's owner (exit 3). ssh's own failures (255: ban, unreachable) are
-# told apart, and nothing retries: another connection while banned only extends the ban.
+# told apart, and nothing retries: another connection while banned only extends the ban. A lock whose owner line
+# can't be written (exit 5) is removed at once: release_lock only removes a lock that names this run.
 rc=0
 held=$(zssh "sudo mkdir -p $STATE || exit 4
-if sudo mkdir $LOCK 2>/dev/null; then printf '%s\n' '$OWNER' | sudo tee $LOCK/owner >/dev/null; exit 0; fi
+if sudo mkdir $LOCK 2>/dev/null; then
+  printf '%s\n' '$OWNER' | sudo tee $LOCK/owner >/dev/null && exit 0
+  sudo rm -rf $LOCK; exit 5
+fi
 sudo cat $LOCK/owner 2>/dev/null; exit 3") || rc=$?
 case $rc in
   0) ;;
   3) die "another deploy holds $LOCK (${held:-owner unknown}); if it is stale: ssh zima sudo rm -rf $LOCK" ;;
+  5) die "could not record the deploy lock's owner in $LOCK/owner (disk full?); removed the lock, nothing changed" ;;
   255) die "cannot reach zima (ssh ban? wait ~90 s before one more try; retrying sooner extends the ban)" ;;
   *) die "could not take the deploy lock (exit $rc)" ;;
 esac
@@ -236,13 +251,30 @@ digest=$(zssh "sudo sha256sum $BGE_MANIFEST" | cut -d' ' -f1) || die "bge-m3 is 
   die "bge-m3 digest ${digest:0:12} does not match BGE_M3_DIGEST ${BGE_M3_DIGEST:0:12} in deploy/.env; the running server is unchanged"
 
 render_compose "$SHA" | zssh "sudo tee $NEXT >/dev/null"
-zssh "sudo docker compose -f $NEXT up -d --wait db ollama"
+# A failed `up` may have stopped or recreated db/ollama from the new definitions: bring them back from the last good
+# compose (the server keeps running against them), then stop before anything else changes.
+if ! zssh "sudo docker compose -f $NEXT up -d --wait --wait-timeout $DEPS_TIMEOUT db ollama"; then
+  trap '' INT TERM
+  msg="db/ollama did not come up healthy from the new definitions within ${DEPS_TIMEOUT}s; nothing was migrated"
+  logs="ssh zima sudo docker logs --tail 50 cerebro-db (or cerebro-ollama)"
+  zssh "sudo rm -f $NEXT" || true
+  if ! zssh "sudo test -f $COMPOSE"; then die "$msg; there is no earlier release to go back to; see: $logs"; fi
+  zssh "sudo docker compose -f $COMPOSE up -d db ollama" ||
+    die "$msg; restarting them from the last good compose ($COMPOSE) failed too; see: $logs"
+  die "$msg; restarted them from the last good compose ($COMPOSE); see: $logs"
+fi
 
 # A recovery point before the schema changes (rollback brings back the old code, not the old schema). The
 # comparison is with the list the schema was last migrated to, so a retry after a rolled-back migration
-# doesn't take a post-migration "recovery point" or push the real one out.
+# doesn't take a post-migration "recovery point" or push the real one out. While an earlier migrate hasn't
+# finished (DIR/pending names its dump), the schema may be partly migrated: that dump stays the recovery point
+# and no new one is taken (none is pruned either: pruning only runs with a new dump).
 schema=$(zssh "sudo cat $STATE/schema-migrations 2>/dev/null" || true)
-if [[ $MIGRATIONS != "$schema" ]]; then
+pending=$(zssh "sudo cat $DUMPS/pending 2>/dev/null" || true)
+if [[ -n $pending ]]; then
+  DUMP=$DUMPS/$pending
+  say "an earlier migrate did not finish; keeping its pre-deploy dump $DUMP as the recovery point"
+elif [[ $MIGRATIONS != "$schema" ]]; then
   name="$(date -u +%Y%m%dT%H%M%SZ)-$SHA.dump"
   DUMP=$DUMPS/$name
   say "the schema is behind this release's migrations; taking a pre-deploy dump"
@@ -257,10 +289,13 @@ mig_out=$(zssh "sudo docker compose -f $NEXT run --rm --no-deps server bun serve
 trap 'die "interrupted; the schema is migrated but the running server is unchanged"' INT TERM
 printf '%s\n' "$mig_out"
 MIGRATED=$(sed -n 's/^migrated: //p' <<<"$mig_out")
-printf '%s\n' "$MIGRATIONS" | zssh "sudo tee $STATE/schema-migrations >/dev/null"
-if [[ -n $MIGRATED && -n $DUMP ]]; then
+# The dump taken before these migrations (now, or by the run whose migrate failed) becomes the recovery point for
+# the current schema before the marker goes: an interrupt in between leaves the marker, and the next run redoes this.
+if [[ -n $DUMP ]]; then
   printf '%s\n' "${DUMP##*/}" | zssh "sudo tee $DUMPS/applied >/dev/null"
 fi
+printf '%s\n' "$MIGRATIONS" | zssh "sudo tee $STATE/schema-migrations >/dev/null"
+zssh "sudo rm -f $DUMPS/pending"
 
 # :prev = the last release that passed the gate (not whatever runs: a failed rollback may have left a
 # never-gated image up).
@@ -303,8 +338,13 @@ if zssh "sudo test -f $CASA_COMPOSE"; then
     say "dashboard metadata changed; restarted zimaos-app-management"
   fi
 else
-  zssh "sudo casaos-cli app-management install -f $COMPOSE"
-  say "registered the ZimaOS app"
+  # The release is already live: a failed registration only means no dashboard tile yet.
+  if zssh "sudo casaos-cli app-management install -f $COMPOSE"; then
+    say "registered the ZimaOS app"
+  else
+    say "warning: could not register the ZimaOS app ($IMAGE is live and serving); register it later with" \
+      "ssh zima sudo casaos-cli app-management install -f $COMPOSE (or re-run the deploy)"
+  fi
 fi
 
 # Old server images: keep this release, :prev and whatever ZimaOS's stored compose references.

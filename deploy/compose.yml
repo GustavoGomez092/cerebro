@@ -14,6 +14,10 @@ services:
       POSTGRES_USER: cerebro
       POSTGRES_DB: cerebro
     env_file: ${CEREBRO_SECRETS}/db.env # POSTGRES_PASSWORD
+    labels:
+      # postgres.conf is a single-file bind mount, which compose doesn't watch: deploy.sh renders the file's sha256
+      # here, so a changed conf changes the service definition and `up` recreates the db with it.
+      cerebro.postgres-conf-sha256: "${POSTGRES_CONF_SHA256:-unset}"
     volumes:
       - ${CEREBRO_DATA}/db:/var/lib/postgresql/data
       - ./postgres.conf:/etc/postgresql/postgres.conf:ro

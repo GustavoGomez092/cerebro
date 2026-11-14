@@ -30,7 +30,9 @@ case $1 in
       esac
     done
     case $sub in
-      up) if [[ " $* " == *" server "* ]]; then
+      up) # FAKE_UP_DEPS_RC: db/ollama of the release being deployed (the .next compose) fail to come up.
+          if [[ " $* " != *" server "* && $file == *.next.yml && -n ${FAKE_UP_DEPS_RC-} ]]; then exit "$FAKE_UP_DEPS_RC"; fi
+          if [[ " $* " == *" server "* ]]; then
             img=$(sed -n 's/^ *image: *\(cerebro-server:.*\)$/\1/p' "$file")
             echo "compose-up-server $img" >> "$FAKE_LOG"
             if [[ $img == cerebro-server:prev ]]; then rc=${FAKE_UP_PREV_RC:-0}; else rc=${FAKE_UP_RC:-0}; fi

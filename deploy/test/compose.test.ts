@@ -70,6 +70,7 @@ describe("compose config", () => {
     expect(Number(db.shm_size)).toBe(1024 ** 3);
     expect(Number(db.mem_limit)).toBe(2 * 1024 ** 3);
     expect(db.command).toEqual(["postgres", "-c", "config_file=/etc/postgresql/postgres.conf"]);
+    expect(db.labels["cerebro.postgres-conf-sha256"]).toBe("unset"); // deploy.sh renders the conf's hash here
     expect(Number(ollama.mem_limit)).toBe(3 * 1024 ** 3);
     expect(Number(ollama.cpus)).toBe(4);
     expect(ollama.environment).toMatchObject({ OLLAMA_NUM_PARALLEL: "1", OLLAMA_MAX_LOADED_MODELS: "1", OLLAMA_KEEP_ALIVE: "-1" });
