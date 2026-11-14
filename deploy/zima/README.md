@@ -141,8 +141,10 @@ From a terminal on the Mac (`<dump>` = e.g. `/DATA/Backup/cerebro/nightly/2026-1
    ```sh
    ssh zima sudo docker exec cerebro-db dropdb -U cerebro --force cerebro
    ssh zima sudo docker exec cerebro-db createdb -U cerebro cerebro
-   ssh zima "sudo docker exec -i cerebro-db pg_restore -U cerebro -d cerebro --exit-on-error < <dump>"
+   ssh zima "sudo cat <dump> | sudo docker exec -i cerebro-db pg_restore -U cerebro -d cerebro --exit-on-error"
    ```
+   (`sudo cat` because dumps under `/DATA/Backup/cerebro` are root-only; a plain `< <dump>` redirect runs as
+   your ssh user and fails with "Permission denied".)
    If `pg_restore` stops with an error, fix the cause and repeat step 2 from `dropdb` (never start the server on
    a partial restore).
 3. Start the server (it applies any newer migrations at start-up): `ssh zima sudo docker start cerebro-server`
