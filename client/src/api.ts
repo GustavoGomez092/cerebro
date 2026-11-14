@@ -1,5 +1,6 @@
 import type {
-  Binding, Client, EventView, IngestBatch, IngestResult, Project, SearchRequest, SearchResponse, SessionView,
+  Binding, Client, EventView, HistoryRequest, IngestBatch, IngestResult, Project, SearchRequest, SearchResponse, SessionView,
+  StateResponse, SummaryView,
 } from "@cerebro/shared";
 import type { ClientConfig } from "./config";
 
@@ -27,6 +28,7 @@ export interface ScopeQuery {
   projectId?: string;
 }
 export interface SessionsQuery extends ScopeQuery { from?: string; to?: string; limit?: number; before?: string }
+export interface SummariesQuery extends ScopeQuery { from?: string; to?: string; limit?: number; before?: string }
 export interface EventsQuery extends ScopeQuery { afterSeq?: number; limit?: number; full?: boolean }
 export interface BindingInput {
   repo: string;
@@ -74,7 +76,7 @@ export function callRefusal(state: StateReader, serverUrl: string, now = Date.no
 }
 
 export class ApiClient {
-  constructor(private cfg: ClientConfig, private state: StateReader, private fetchFn: typeof fetch = fetch) {}
+  constructor(private cfg: ClientConfig, private local: StateReader, private fetchFn: typeof fetch = fetch) {}
 
   get serverUrl(): string { return this.cfg.serverUrl; }
 
@@ -84,7 +86,7 @@ export class ApiClient {
     const headers: Record<string, string> = {};
     if (opts.auth !== false) {
       // The token only goes to a server that just proved to be the pinned instance (see checkInstance).
-      const refusal = callRefusal(this.state, this.cfg.serverUrl);
+      const refusal = callRefusal(this.local, this.cfg.serverUrl);
       if (refusal) throw new ApiError(0, "instance_unverified", refusal);
       headers.Authorization = `Bearer ${this.cfg.token}`;
     }
@@ -142,6 +144,15 @@ export class ApiClient {
   search(req: SearchRequest, o: CallOpts = {}) { return this.call<SearchResponse>("POST", "/v1/search", { body: req, ...o }); }
   sessions(q: SessionsQuery = {}, o: CallOpts = {}) {
     return this.call<{ sessions: SessionView[]; next: string | null }>("GET", "/v1/sessions", { query: q, ...o });
+  }
+  /** The scope's running project state; `state` is null until the summariser has built one. */
+  state(q: ScopeQuery, o: CallOpts = {}) { return this.call<StateResponse>("GET", "/v1/state", { query: q, ...o }); }
+  summaries(q: SummariesQuery = {}, o: CallOpts = {}) {
+    return this.call<{ summaries: SummaryView[]; next: string | null }>("GET", "/v1/summaries", { query: q, ...o });
+  }
+  /** Saves a folder's initial history (one per period; re-sending replaces it). 404 unknown_binding, 409 binding_declined. */
+  saveHistory(body: HistoryRequest, o: CallOpts = {}) {
+    return this.call<{ summary: SummaryView }>("POST", "/v1/summaries", { body, ...o });
   }
   events(sessionId: string, q: EventsQuery = {}, o: CallOpts = {}) {
     const { full, ...rest } = q;

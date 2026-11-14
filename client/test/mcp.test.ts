@@ -241,6 +241,9 @@ const EVERY_TOOL: [string, Record<string, unknown>][] = [
   ["cerebro_bind", { client: "Never Sent" }],
   ["cerebro_decline", {}],
   ["cerebro_adopt", {}],
+  ["cerebro_state", {}],
+  ["cerebro_summaries", {}],
+  ["cerebro_save_history", { title: "t", text: "x", from: "2026-01-01", to: "2026-02-01" }],
 ];
 
 test("every tool refuses with a clear error, sending no token, when the server is not the pinned instance", async () => {
@@ -303,3 +306,121 @@ test("the MCP server's startup never sends the token to a server that is not the
     impostor.stop(true);
   }
 }, 15_000);
+
+// ---- summaries, state and the initial history ----
+
+const GH_SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+
+test("cerebro_save_history stores a history summary for this folder", async () => {
+  const a = repo("histo");
+  const b = await bindRepo(a.remote, "", "Histo");
+  const bodies: string[] = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.method === "POST" && new URL(req.url).pathname === "/v1/summaries") bodies.push(await req.clone().text());
+    return h.fetch(req);
+  }) as typeof fetch;
+  const { call } = await connect(a.root, { fetchFn });
+  const text = `Histo is a ledger app. It started in 2025-12.\nDeploy token was ${GH_SECRET} (rotated).`;
+  const r = await call("cerebro_save_history", { title: "Histo: the first year", text, from: "2025-11-14", to: "2026-11-14" });
+  expect(r.isError).toBe(false);
+  expect(r.text).toContain("Saved");
+  // redacted before it left this Mac
+  expect(bodies.length).toBe(1);
+  expect(bodies[0]).not.toContain(GH_SECRET);
+  expect(bodies[0]).toContain("[REDACTED:github-token]");
+  const rows = await h.sql`select kind, session_id, title, text, ts_from, ts_to from summaries where binding_id = ${b.id}`;
+  expect(rows.length).toBe(1);
+  expect(rows[0].kind).toBe("history");
+  expect(rows[0].session_id).toBeNull();
+  expect(rows[0].title).toBe("Histo: the first year");
+  expect(rows[0].text).not.toContain(GH_SECRET);
+  expect(rows[0].ts_from.toISOString()).toBe("2025-11-14T00:00:00.000Z");
+  expect(rows[0].ts_to.toISOString()).toBe("2026-11-14T23:59:59.999Z");
+
+  // the same period again replaces it
+  expect((await call("cerebro_save_history", { title: "Histo v2", text: "updated", from: "2025-11-14", to: "2026-11-14" })).isError).toBe(false);
+  const again = await h.sql`select title from summaries where binding_id = ${b.id}`;
+  expect(again.map((x: any) => x.title)).toEqual(["Histo v2"]);
+});
+
+test("cerebro_save_history checks its limits before sending and explains unbound or declined folders", async () => {
+  const a = repo("histlimits");
+  await bindRepo(a.remote, "", "Limits");
+  const { authed, fetchFn } = authSpy();
+  const { call } = await connect(a.root, { fetchFn });
+  const bad: [Record<string, unknown>, string][] = [
+    [{ title: "t".repeat(201), text: "ok", from: "2026-01-01", to: "2026-02-01" }, "200"],
+    [{ title: "ok", text: "x".repeat(20_001), from: "2026-01-01", to: "2026-02-01" }, "20000"],
+    [{ title: "  ", text: "ok", from: "2026-01-01", to: "2026-02-01" }, "title"],
+    [{ title: "ok", text: "ok", from: "last spring", to: "2026-02-01" }, "from"],
+    [{ title: "ok", text: "ok", from: "2026-03-01", to: "2026-02-01" }, "after"],
+  ];
+  for (const [args, says] of bad) {
+    const r = await call("cerebro_save_history", args);
+    expect({ args, isError: r.isError }).toEqual({ args, isError: true });
+    expect(r.text).toContain(says);
+  }
+  expect(authed.filter((p) => p === "/v1/summaries")).toEqual([]);
+
+  const u = repo("histunbound");
+  const un = await connect(u.root);
+  const r404 = await un.call("cerebro_save_history", { title: "t", text: "x", from: "2026-01-01", to: "2026-02-01" });
+  expect(r404.isError).toBe(true);
+  expect(r404.text).toContain("not bound");
+  expect(r404.text).toContain("cerebro_bind");
+
+  const d = repo("histdeclined");
+  await h.api.putBinding({ repo: d.remote, subpath: "", status: "declined", clientId: null, projectId: null });
+  const dc = await connect(d.root);
+  const r409 = await dc.call("cerebro_save_history", { title: "t", text: "x", from: "2026-01-01", to: "2026-02-01" });
+  expect(r409.isError).toBe(true);
+  expect(r409.text).toContain("declined");
+});
+
+test("cerebro_search lists summary hits first, marked [summary], and never prints null", async () => {
+  const a = repo("sumsearch");
+  const b = await bindRepo(a.remote, "", "SumSearch");
+  await seed(a.remote, "", b.id, ["the quuxifier rollout went badly"]);
+  await h.api.saveHistory({ repo: a.remote, subpath: "", title: "Quuxifier history", text: "the quuxifier was introduced in March", tsFrom: "2026-01-01T00:00:00.000Z", tsTo: "2026-06-30T00:00:00.000Z" });
+  const { call } = await connect(a.root);
+  const r = await call("cerebro_search", { query: "quuxifier" });
+  expect(r.isError).toBe(false);
+  const lines = r.text.split("\n");
+  expect(lines[0]).toStartWith("[summary]");
+  expect(lines[0]).toContain("Quuxifier history");
+  expect(lines[0]).toContain("2026-01-01");
+  expect(lines[0]).toContain("2026-06-30");
+  expect(lines[0]).toContain("SumSearch");
+  expect(lines.some((l) => !l.startsWith("[summary]") && l.includes("seq 1-1"))).toBe(true);
+  expect(r.text).not.toContain("null");
+});
+
+test("cerebro_state and cerebro_summaries show this folder's state and dated summaries", async () => {
+  const a = repo("stateful");
+  const b = await bindRepo(a.remote, "", "Stateful");
+  const none = await connect(a.root);
+  const empty = await none.call("cerebro_state");
+  expect(empty.isError).toBe(false);
+  expect(empty.text).toContain("No project state yet");
+  expect((await none.call("cerebro_summaries")).text).toContain("No summaries");
+
+  await h.sql`
+    insert into project_states (scope, client_id, project_id, doc, text, version)
+    values (${`project:${b.projectId}`}, ${b.clientId}, ${b.projectId}, '{"current_status":"shipping"}'::jsonb,
+            ${"## Status\nThe frobnicator ships Friday.\u0007"}, 4)`;
+  await h.api.saveHistory({ repo: a.remote, subpath: "", title: "Stateful origins", text: "began as a fork of blorp", tsFrom: "2025-12-01T00:00:00.000Z", tsTo: "2026-11-01T00:00:00.000Z" });
+  const { call } = await connect(a.root);
+  const s = await call("cerebro_state");
+  expect(s.isError).toBe(false);
+  expect(s.text).toContain("The frobnicator ships Friday.");
+  expect(s.text).toContain("version 4");
+  expect(s.text).not.toContain("\u0007");
+  const l = await call("cerebro_summaries", { from: "2025-01-01", limit: 5 });
+  expect(l.isError).toBe(false);
+  expect(l.text).toContain("Stateful origins");
+  expect(l.text).toContain("history");
+  expect(l.text).toContain("began as a fork of blorp");
+  expect(l.text).toContain("2025-12-01");
+  expect(l.text).not.toContain("null");
+});

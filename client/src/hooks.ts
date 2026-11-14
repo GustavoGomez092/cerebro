@@ -1,6 +1,6 @@
 import type { Binding, SessionView } from "@cerebro/shared";
 import type { ApiClient } from "./api";
-import { buildBrief } from "./brief";
+import { buildBrief, type BriefState } from "./brief";
 import { captureTranscript, type CaptureResult } from "./capture";
 import { syncConfigFile } from "./config";
 import { folderIdentity, type FolderIdentity } from "./identity";
@@ -162,13 +162,17 @@ async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: stri
   if (binding === null) return live ? context(UNKNOWN_FOLDER_CONTEXT) : "";
   if (binding.status === "declined") return "";
 
-  const recent = await recentSessions(store, api, binding, ident, online, left);
+  const [recent, state] = await Promise.all([
+    recentSessions(store, api, binding, ident, online, left),
+    projectState(store, api, binding, ident, online, left),
+  ]);
   const scopeName = await scopeNameFor(store, api, binding, recent, online, left);
   const blocked = store.get("blocked") as BlockedReason | undefined;
   const brief = buildBrief(
     binding, scopeName, recent,
     { pending: store.pendingCount(), quarantined: store.quarantineCount() },
     blocked && PROBLEMS[blocked] ? [PROBLEMS[blocked]] : [],
+    state,
   );
   if (!store.get(`imported:${ident.repo}|${ident.subpath}`)) spawn(["import", "--cwd", cwd]);
   return context(brief);
@@ -233,6 +237,32 @@ async function recentSessions(
     return Array.isArray(cached) ? cached : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * The folder's project state for the brief: live from the server, else the copy cached for this same
+ * client/project (a re-bound folder never shows its old scope's state), else null.
+ */
+async function projectState(
+  store: Store, api: ApiClient, binding: Binding, ident: FolderIdentity, online: boolean, left: Left,
+): Promise<BriefState | null> {
+  const key = `projectState:${ident.repo}|${ident.subpath}`;
+  if (online && left() >= MIN_CALL_MS) {
+    try {
+      const { state } = await api.state({ repo: ident.repo, subpath: ident.subpath }, { timeoutMs: left() });      const brief = state ? { doc: state.doc, updatedAt: state.updatedAt } : null;
+      store.set(key, JSON.stringify({ clientId: binding.clientId, projectId: binding.projectId, state: brief }));
+      return brief;
+    } catch (e) {
+      logError("SessionStart state", e);
+    }
+  }
+  try {
+    const c = JSON.parse(store.get(key) ?? "null");
+    const same = c && c.clientId === binding.clientId && c.projectId === binding.projectId;
+    return same && c.state && typeof c.state === "object" ? c.state : null;
+  } catch {
+    return null;
   }
 }
 
