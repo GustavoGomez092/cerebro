@@ -24,7 +24,9 @@ Tests create and drop their own throwaway databases on the dev Postgres
 |----------------|----------|-------------------------------------------------|
 | `DATABASE_URL` | required | Postgres connection URL                         |
 | `PORT`         | `8790`   | HTTP port                                       |
-| `EMBED_URL`    | required to run | Ollama base URL for embeddings           |
+| `EMBED_URL`    | required to run | Ollama base URL for embeddings; with `EMBED_PRIMARY_URL`, the fallback |
+| `EMBED_PRIMARY_URL` | unset | Ollama tried first (e.g. a Mac mini's GPU, `http://192.168.4.42:11434`); on failure the call is retried on `EMBED_URL` and the primary is skipped for 60 s. Unset: `EMBED_URL` alone. See deploy/zima/README.md |
+| `EMBED_MODEL_DIGEST` | unset | Expected model digest on the primary (12-hex `ollama list` ID or the full sha256); the primary is not used while it differs |
 | `EMBED_MODEL`  | `bge-m3` | Ollama embedding model                          |
 | `EMBED_DIMS`   | `1024`   | Embedding size; must match the schema's vector size |
 | `SUMMARISER_ENABLED` | `true` | `false`, `0`, `no` or `off` (any case) turns the summary loop off; `true`, `1`, `yes`, `on` keep it on; any other value stops the server at startup |
