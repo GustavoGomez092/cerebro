@@ -1,0 +1,75 @@
+name: cerebro
+
+services:
+  db:
+    container_name: cerebro-db
+    image: pgvector/pgvector:0.8.1-pg17@sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
+    command: postgres -c config_file=/etc/postgresql/postgres.conf
+    shm_size: 1g
+    mem_limit: 2g
+    environment:
+      POSTGRES_USER: cerebro
+      POSTGRES_DB: cerebro
+    env_file: ${CEREBRO_SECRETS}/db.env # POSTGRES_PASSWORD
+    volumes:
+      - ${CEREBRO_DATA}/db:/var/lib/postgresql/data
+      - ./postgres.conf:/etc/postgresql/postgres.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cerebro -d cerebro"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    networks: [cerebro-net]
+
+  ollama:
+    container_name: cerebro-ollama
+    image: ollama/ollama:0.12.6@sha256:a61a8fd395dbb931cc8cb1b5da7a2510746575c87113fdc45b647ee59ef7f808
+    cpus: ${OLLAMA_CPUS:-4}
+    mem_limit: 3g
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "-1"
+    volumes:
+      - ${CEREBRO_DATA}/ollama:/root/.ollama
+    restart: unless-stopped
+    networks: [cerebro-net]
+
+  server:
+    container_name: cerebro-server
+    image: cerebro-server:${CEREBRO_TAG}
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    env_file: ${CEREBRO_SECRETS}/server.env # DATABASE_URL
+    environment:
+      EMBED_URL: http://cerebro-ollama:11434
+    ports:
+      - "127.0.0.1:8790:8790"
+    cpus: 2
+    mem_limit: 1g
+    volumes:
+      - ${CEREBRO_DATA}/claude:/data/claude
+    restart: unless-stopped
+    networks: [cerebro-net, default] # default only publishes the port
+
+networks:
+  cerebro-net:
+    driver: bridge
+    internal: true
+
+# ZimaOS app metadata; plain `docker compose` ignores x- extensions.
+x-casaos:
+  main: server
+  title:
+    en_us: Cerebro
+  tagline:
+    en_us: Private memory server
+  icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/postgresql.png
+  category: Utilities
+  port_map: "80"
+  hostname: cerebro.home.lab
+  index: /health
