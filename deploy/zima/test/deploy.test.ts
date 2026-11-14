@@ -179,6 +179,34 @@ describe("deploy.sh", () => {
     expect(s.calls()).not.toContain("pg_dump");
   });
 
+  test("deploy installs root-owned copies of the ops scripts and units where the backup unit runs them", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"]);
+    expect(r.code, show(r)).toBe(0);
+    const zima = s.app("zima");
+    for (const f of ["backup.sh", "restore-test.sh", "exclude-from-zima-backup.sh"]) {
+      expect(readFileSync(join(zima, f), "utf8")).toBe(readFileSync(s.script(f), "utf8"));
+      expect(mode(join(zima, f))).toBe(0o700);
+    }
+    for (const f of ["cerebro-backup.service", "cerebro-backup.timer"]) {
+      expect(readFileSync(join(zima, "systemd", f), "utf8")).toBe(readFileSync(s.script(`systemd/${f}`), "utf8"));
+      expect(mode(join(zima, "systemd", f))).toBe(0o644);
+    }
+    expect(mode(zima)).toBe(0o755);
+    expect(s.calls()).toContain(`chown -R root:root ${zima}`);
+    // The unit's ExecStart is a file deploy put there (the repo itself is synced to src/, not zima/).
+    const exec = /^ExecStart=(\S+)/m.exec(readFileSync(join(zima, "systemd/cerebro-backup.service"), "utf8"))?.[1] ?? "<none>";
+    expect(exec).toStartWith("/DATA/");
+    const target = join(s.root, exec.slice(1));
+    expect(existsSync(target), exec).toBe(true);
+    expect(mode(target) & 0o100).toBe(0o100);
+
+    // A later deploy refreshes them.
+    s.commit("deploy/zima/backup.sh", readFileSync(s.script("backup.sh"), "utf8") + "# changed\n");
+    expect(s.run("deploy.sh").code).toBe(0);
+    expect(readFileSync(join(zima, "backup.sh"), "utf8")).toEndWith("# changed\n");
+  });
+
   test("a failing health gate rolls back to :prev", () => {
     const s = sandbox();
     expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);

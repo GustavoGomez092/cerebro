@@ -6,7 +6,8 @@
 # cerebro-server:<sha7> → bge-m3 present with the digest pinned in deploy/.env → db + ollama up → pre-deploy
 # dump when the migration list differs from the schema's → migrate in a one-off container → tag the last
 # release that passed the gate as :prev → start the new server → health gate (/health ok + db within 60 s); a failed start, failed gate or an
-# interrupt rolls back to :prev and exits 1 → check token, ZimaOS registration, old image cleanup.
+# interrupt rolls back to :prev and exits 1 → backup scripts + units into /DATA/AppData/cerebro/zima (root),
+# check token, ZimaOS registration, old image cleanup.
 #
 # Rollback runs :prev on the schema the new release migrated, so migrations must stay backward-compatible
 # (expand/contract; see README "Deploying to the Zima server").
@@ -161,6 +162,22 @@ pre_deploy_dump() {
   done
 }
 
+# Installs root-owned copies of the host-side ops files from the synced repo SRC/deploy/zima into DST (the backup
+# unit runs DST/backup.sh: src/ is owned by the ssh user, so root never runs code from it). Each file is replaced
+# with a rename, so a backup that is running keeps reading its old copy.
+install_ops() {
+  local src=$1/deploy/zima dst=$2 f
+  umask 022
+  mkdir -p "$dst/systemd"
+  for f in backup.sh restore-test.sh exclude-from-zima-backup.sh systemd/cerebro-backup.service systemd/cerebro-backup.timer; do
+    cp "$src/$f" "$dst/$f.new"
+    case $f in *.sh) chmod 700 "$dst/$f.new" ;; *) chmod 644 "$dst/$f.new" ;; esac
+    mv -f "$dst/$f.new" "$dst/$f"
+  done
+  chmod 755 "$dst" "$dst/systemd"
+  chown -R root:root "$dst"
+}
+
 # Creates the `check` machine token for check.sh in FILE (root 600). The token is never printed.
 create_check_token() {
   local out tok
@@ -265,6 +282,9 @@ trap 'die "interrupted after $IMAGE went live; re-run the deploy to finish regis
 zssh "sudo mv $NEXT $COMPOSE"
 printf '%s\n' "$instance" | zssh "sudo tee $STATE/instance-id >/dev/null"
 printf '%s %s\n' "$SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | zssh "sudo tee $STATE/deployed >/dev/null"
+
+zfn install_ops "$SRC" "$APP/zima" ||
+  say "warning: could not install the backup scripts into $APP/zima; backups run from there (re-run the deploy)"
 
 if ! zssh "sudo test -s $SECRETS/check.token"; then
   zfn create_check_token "$SECRETS/check.token" ||
