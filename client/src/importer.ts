@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ApiClient } from "./api";
@@ -87,6 +87,26 @@ export async function importFolder(
     /** Set when a discover or resolve call failed, so a later import retries the missed history. */
     let incomplete = false;
     const subfolders = new Map<string, Promise<FolderIdentity | null>>();
+    const subpaths = new Map<string, string | null>();
+
+    /**
+     * The subpath a session in `cwd` (at `rel` under the import root) is recorded under, worked out as live
+     * capture does, or null when that folder has an identity of its own (a nested repo, another folder).
+     * A folder that no longer exists keeps its place under a git root.
+     */
+    const subpathOf = (cwd: string, rel: string): string | null => {
+      if (!subpaths.has(cwd)) {
+        let sub: string | null;
+        if (existsSync(cwd)) {
+          const own = folderIdentity(cwd, machine);
+          sub = own.repo === ident.repo ? own.subpath : null;
+        } else {
+          sub = ident.isGit ? rel : null;
+        }
+        subpaths.set(cwd, sub);
+      }
+      return subpaths.get(cwd)!;
+    };
 
     /** The folder identity (with its binding cached) for a subpath, resolved once per subpath. */
     const identityFor = (subpath: string): Promise<FolderIdentity | null> => {
@@ -116,7 +136,9 @@ export async function importFolder(
           const rel = within(root, real(fileCwd));
           if (rel === null) continue;
 
-          const entryIdent = await identityFor(ident.isGit ? rel : "");
+          const subpath = subpathOf(fileCwd, rel);
+          if (subpath === null) continue;
+          const entryIdent = await identityFor(subpath);
           if (!entryIdent) continue;
 
           const r = captureTranscript(

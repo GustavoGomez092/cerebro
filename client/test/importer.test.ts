@@ -3,6 +3,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flush } from "../src/flush";
+import { folderIdentity } from "../src/identity";
 import { handleHook, type HookEvent, type HookInput } from "../src/hooks";
 import { importFolder } from "../src/importer";
 import { Store } from "../src/store";
@@ -235,6 +236,25 @@ test("import sends nothing while uploads are blocked (revoked or refused token)"
     await importFolder(store, h.clientFor(store, fetchFn), root, "mac", { home });
     expect({ reason, authed }).toEqual({ reason, authed: [] });
   }
+});
+
+test("a nested repo's sessions are not filed under a bound non-git parent folder", async () => {
+  const home = tmp();
+  const parent = join(tmp(), "Projects");
+  const nested = join(parent, "acme-app");
+  mkdirSync(nested, { recursive: true });
+  git(nested, "init", "-q");
+  const nestedRemote = `github.com/acme/nested-${uid().slice(-6)}`;
+  git(nested, "remote", "add", "origin", `https://${nestedRemote}.git`);
+  const parentBinding = await bind(folderIdentity(parent, "test-mac").repo, "", "Parent");
+  await bind(nestedRemote, "", "Nested");
+  const own = transcript(home, parent);
+  const inner = transcript(home, nested);
+
+  const r = await importFolderFresh(parent, "test-mac", { home });
+  expect(r.sessions).toBe(1);
+  expect((await serverSession(own.sid))?.binding_id).toBe(parentBinding.id);
+  expect(await serverSession(inner.sid)).toBeUndefined();
 });
 
 /** Runs one hook for `t` in `cwd` as Claude Code would, against a client gated by `store`. */
