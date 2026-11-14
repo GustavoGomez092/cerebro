@@ -6,7 +6,8 @@
 # Overrides: CEREBRO_DB_CONTAINER/_USER/_NAME, CEREBRO_BACKUP_ROOT (as backup.sh);
 #   CEREBRO_RESTORE_TOLERANCE_ROWS 10 and CEREBRO_RESTORE_TOLERANCE_PCT 5: allowed difference per table
 #     (rows written to / removed from production since the dump);
-#   CEREBRO_REQUEUE_CMD: shell command run with SCRATCH_DB exported (default: the cerebro-server container).
+#   CEREBRO_REQUEUE_CMD: shell command run with SCRATCH_DB exported (default: the cerebro-server container);
+#   CEREBRO_SCRATCH_DB: scratch database name (tests; must differ from the production database).
 set -euo pipefail
 umask 077
 
@@ -27,9 +28,28 @@ if [ -z "$latest" ]; then
   exit 1
 fi
 dump="$ROOT/nightly/$latest"
-SCRATCH_DB="cerebro_restoretest_$$"
+SCRATCH_DB=${CEREBRO_SCRATCH_DB:-cerebro_restoretest_$(date +%s)_$$}
 export SCRATCH_DB
-trap 'docker exec "$DB_CONTAINER" dropdb -U "$DB_USER" --if-exists --force "$SCRATCH_DB" >/dev/null 2>&1 || true' EXIT
+if [ "$SCRATCH_DB" = "$DB_NAME" ]; then
+  log "refusing: scratch database name equals the production database ($DB_NAME)"
+  exit 1
+fi
+
+# Sweep scratch databases a killed earlier run left behind (name carries its start time).
+now=$(date +%s)
+for old in $(psql_in postgres "select datname from pg_database where datname ~ '^cerebro_restoretest_[0-9]+_[0-9]+\$'"); do
+  stamp=${old#cerebro_restoretest_}
+  stamp=${stamp%%_*}
+  if [ $((now - stamp)) -gt 86400 ]; then
+    log "dropping leftover scratch database $old"
+    docker exec "$DB_CONTAINER" dropdb -U "$DB_USER" --if-exists --force "$old" || log "could not drop leftover $old"
+  fi
+done
+
+cleanup() {
+  docker exec "$DB_CONTAINER" dropdb -U "$DB_USER" --if-exists --force "$SCRATCH_DB" >/dev/null || log "could not drop scratch database $SCRATCH_DB"
+}
+trap cleanup EXIT
 
 start=$(date +%s)
 log "restoring $dump into $SCRATCH_DB"
@@ -60,8 +80,8 @@ done
 if [ -n "${CEREBRO_REQUEUE_CMD:-}" ]; then
   out=$(bash -c "$CEREBRO_REQUEUE_CMD")
 else
-  base=$(docker exec "$SERVER_CONTAINER" printenv DATABASE_URL)
-  out=$(docker exec -e "DATABASE_URL=${base%/*}/$SCRATCH_DB" "$SERVER_CONTAINER" bun --no-install server/src/cli.ts requeue-missing-embeddings)
+  # The URL carries the password: rewrite it inside the container so it never appears in host process args.
+  out=$(docker exec "$SERVER_CONTAINER" sh -c 'DATABASE_URL="${DATABASE_URL%/*}/$1" exec bun --no-install server/src/cli.ts requeue-missing-embeddings' _ "$SCRATCH_DB")
 fi
 echo "$out"
 chunks=$(psql_in "$SCRATCH_DB" "select count(*) from chunks")

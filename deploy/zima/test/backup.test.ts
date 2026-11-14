@@ -23,6 +23,9 @@ const DB = `${PROJECT}-db`;
 const root = mkdtempSync(join(tmpdir(), "cerebro-backup-"));
 const composeFile = join(root, "compose.yml");
 const PW = "testpw";
+const SERVER = `${PROJECT}-server`;
+const SHIM_LOG = join(root, "shim.log");
+const REAL_DOCKER = Bun.which("docker") ?? "docker";
 let dbUrl = "";
 
 const psql = (sql: string, db = "cerebro") => run(["docker", "exec", DB, "psql", "-U", "cerebro", "-d", db, "-tAc", sql]);
@@ -38,6 +41,16 @@ const dumps = (dir: string) => (existsSync(dir) ? readdirSync(dir).filter((f) =>
 
 beforeAll(async () => {
   if (!dockerUp) return;
+  mkdirSync(join(root, "bin"));
+  writeFileSync(join(root, "bin", "bun"), `#!/bin/sh
+n=$(psql "$DATABASE_URL" -tAc "with q as (insert into embed_queue (chunk_id, priority) select id, 1 from chunks c where not exists (select 1 from chunk_embeddings e where e.chunk_id = c.id) on conflict do nothing returning 1) select count(*) from q")
+echo "queued $n chunk(s) for embedding"
+`, { mode: 0o755 });
+  mkdirSync(join(root, "shim"));
+  writeFileSync(join(root, "shim", "docker"), `#!/bin/sh
+printf '%s\\n' "$*" >> "${SHIM_LOG}"
+exec "${REAL_DOCKER}" "$@"
+`, { mode: 0o755 });
   writeFileSync(composeFile, `name: ${PROJECT}
 services:
   db:
@@ -46,6 +59,13 @@ services:
     environment: { POSTGRES_USER: cerebro, POSTGRES_DB: cerebro, POSTGRES_PASSWORD: ${PW} }
     ports: ["127.0.0.1::5432"]
     healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U cerebro -d cerebro"], interval: 2s, timeout: 3s, retries: 40 }
+  server: # stand-in for cerebro-server: same DATABASE_URL shape, and a fake bun that queues like requeue-missing-embeddings
+    container_name: ${SERVER}
+    image: ${IMAGE}
+    entrypoint: ["sleep", "infinity"]
+    environment: { DATABASE_URL: "postgres://cerebro:${PW}@db:5432/cerebro" }
+    volumes: ["${root}/bin/bun:/usr/local/bin/bun:ro"]
+    depends_on: { db: { condition: service_healthy } }
 `);
   expect(run(["docker", "compose", "-f", composeFile, "up", "-d", "--wait"]).code).toBe(0);
   const port = run(["docker", "port", DB, "5432/tcp"]).out.trim().split("\n")[0].split(":").pop();
@@ -137,6 +157,27 @@ describe("backup.sh", () => {
     expect(readdirSync(join(target, "nightly")).some((f) => f.includes("tmp"))).toBe(false);
   }, 60_000);
 
+  dockerTest("first run with no earlier dump still checks the database size against free space", () => {
+    const target = join(root, "t4b");
+    const r = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-02", CEREBRO_BACKUP_DOW: "1", CEREBRO_BACKUP_AVAIL_KB: "1" });
+    expect(r.code).toBe(1);
+    expect(r.out + r.err).toMatch(/not enough free space/i);
+    expect(dumps(join(target, "nightly"))).toEqual([]);
+  }, 60_000);
+
+  dockerTest("an empty weekly directory does not fail the run, and stale tmp files are removed", () => {
+    const target = join(root, "t4c");
+    mkdirSync(join(target, "weekly"), { recursive: true });
+    mkdirSync(join(target, "nightly"), { recursive: true });
+    writeFileSync(join(target, "weekly", ".2026-01-04.dump.tmp"), "partial");
+    writeFileSync(join(target, "nightly", ".2026-01-05.dump.tmp"), "partial");
+    const r = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-11", CEREBRO_BACKUP_DOW: "3" });
+    expect(r.err).toBe("");
+    expect(r.code).toBe(0);
+    expect(readdirSync(join(target, "weekly"))).toEqual([]);
+    expect(readdirSync(join(target, "nightly"))).toEqual(["2026-11-11.dump"]);
+  }, 60_000);
+
   dockerTest("backup skips with a logged reason when the drive is not mounted", () => {
     const target = join(root, "t5");
     const notMounted = join(root, "plain-dir");
@@ -152,15 +193,22 @@ describe("restore-test.sh", () => {
   // Local stand-in for `docker exec cerebro-server bun … requeue-missing-embeddings` on the scratch database.
   const requeue = () => `DATABASE_URL="${dbUrl.replace(/\/cerebro$/, "")}/$SCRATCH_DB" bun server/src/cli.ts requeue-missing-embeddings`;
   const restoreTest = (target: string) => run(["bash", join(ZIMA, "restore-test.sh")], senv(target, { CEREBRO_REQUEUE_CMD: requeue() }));
+  // The default requeue path (docker exec into the server container), with docker wrapped to record host-side args.
+  const restoreTestViaServer = (target: string, extra: Record<string, string> = {}) =>
+    run(["bash", join(ZIMA, "restore-test.sh")], senv(target, { CEREBRO_SERVER_CONTAINER: SERVER, PATH: `${join(root, "shim")}:${process.env.PATH}`, SHIM_LOG, REAL_DOCKER, ...extra }));
   const scratchDbs = () => psql("select datname from pg_database where datname like 'cerebro_restoretest%'").out.trim();
 
   dockerTest("restore-test rebuilds embeddings via requeue", () => {
     const target = join(root, "t6");
     expect(backup(target, { CEREBRO_BACKUP_DATE: "2026-11-12", CEREBRO_BACKUP_DOW: "4" }).code).toBe(0);
-    const r = restoreTest(target);
+    const r = restoreTestViaServer(target);
     expect(r.err).toBe("");
     expect(r.code).toBe(0);
     expect(r.out).toContain("chunks: production 40, restored 40");
+    const hostArgs = readFileSync(SHIM_LOG, "utf8");
+    expect(hostArgs).toContain("requeue-missing-embeddings"); // the shim did see the server call...
+    expect(hostArgs).not.toContain(PW); // ...and the production URL (with its password) never reached host args
+    expect(hostArgs).not.toContain("postgres://");
     expect(r.out).toMatch(/queued 40 chunk/); // nightlies carry no vectors, so every chunk is re-queued
     expect(r.out).toMatch(/restore test passed/i);
     expect(scratchDbs()).toBe(""); // scratch database dropped
@@ -179,6 +227,25 @@ describe("restore-test.sh", () => {
     } finally {
       psql("insert into chunks (session_id, first_seq, last_seq, ts_from, ts_to, text) select 's1', g, g, now(), now(), 'chunk ' || g from generate_series(11, 40) g");
     }
+  }, 180_000);
+
+  dockerTest("restore-test sweeps day-old scratch databases but leaves recent ones, and refuses a scratch name equal to production", () => {
+    const target = join(root, "t9");
+    expect(backup(target, { CEREBRO_BACKUP_DATE: "2026-11-12", CEREBRO_BACKUP_DOW: "4" }).code).toBe(0);
+    const fresh = `cerebro_restoretest_${Math.floor(Date.now() / 1000)}_1`;
+    run(["docker", "exec", DB, "createdb", "-U", "cerebro", "cerebro_restoretest_1000_1"]);
+    run(["docker", "exec", DB, "createdb", "-U", "cerebro", fresh]);
+    try {
+      const r = restoreTest(target);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("dropping leftover scratch database cerebro_restoretest_1000_1");
+      expect(scratchDbs().split("\n")).toEqual([fresh]);
+    } finally {
+      run(["docker", "exec", DB, "dropdb", "-U", "cerebro", "--if-exists", fresh]);
+    }
+    const same = run(["bash", join(ZIMA, "restore-test.sh")], senv(target, { CEREBRO_SCRATCH_DB: "cerebro" }));
+    expect(same.code).toBe(1);
+    expect(same.out + same.err).toMatch(/equals the production database/);
   }, 180_000);
 
   dockerTest("restore-test refuses when there is no nightly dump", () => {
@@ -209,12 +276,15 @@ describe("exclude-from-zima-backup.sh", () => {
 set -euo pipefail
 DEST=/DATA/Backup/snapshots/$(date +%F)
 rsync -aH --delete --link-dest="$LAST" \\
-  --exclude='/DATA/AppData/postgres/data' \\
-  --exclude='/DATA/AppData/jellyfin/cache' \\
-  /DATA/AppData /var/lib/casaos/apps "$DEST/"
+    --exclude '/DATA/AppData/jellyfin/cache' \\
+    --exclude '/DATA/AppData/postgres/data/' \\
+    --exclude '/DATA/AppData/hermes/tmp' \\
+    /DATA/AppData /var/lib/casaos/apps "$DEST/"
 echo done
 `;
   const exclude = (file: string) => run(["bash", join(ZIMA, "exclude-from-zima-backup.sh"), file]);
+  const backups = (f: string) => readdirSync(root).filter((n) => n.startsWith(`${f}.bak-cerebro-`));
+  const occurrences = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 
   test("adds the cerebro excludes once, next to the postgres one, and keeps the script valid", () => {
     const f = join(root, "zima-backup.sh");
@@ -223,13 +293,42 @@ echo done
     const once = readFileSync(f, "utf8");
     expect(exclude(f).code).toBe(0); // idempotent
     expect(readFileSync(f, "utf8")).toBe(once);
-    expect(once.match(/AppData\/cerebro\/db/g)).toHaveLength(1);
-    expect(once.match(/AppData\/cerebro\/ollama/g)).toHaveLength(1);
-    expect(once).toContain("  --exclude='/DATA/AppData/cerebro/db' \\\n");
-    expect(once).toContain("  --exclude='/DATA/AppData/cerebro/ollama' \\\n");
+    expect(occurrences(once, /AppData\/cerebro\/db/g)).toBe(1);
+    expect(occurrences(once, /AppData\/cerebro\/ollama/g)).toBe(1);
+    expect(once).toContain("    --exclude '/DATA/AppData/postgres/data/' \\\n    --exclude '/DATA/AppData/cerebro/db/' \\\n    --exclude '/DATA/AppData/cerebro/ollama/' \\\n");
     expect(once.replace(/.*cerebro.*\n/g, "")).toBe(SAMPLE); // nothing else changed
     expect(run(["bash", "-n", f]).code).toBe(0);
-    expect(readFileSync(`${f}.bak-cerebro`, "utf8")).toBe(SAMPLE);
+    const [bak, ...rest] = backups("zima-backup.sh");
+    expect(rest).toEqual([]); // the idempotent second run made no second backup
+    expect(readFileSync(join(root, bak), "utf8")).toBe(SAMPLE);
+  });
+
+  test("a half-applied script only gets the missing line, and comments do not count", () => {
+    const f = join(root, "half.sh");
+    const half = SAMPLE.replace("    --exclude '/DATA/AppData/postgres/data/' \\\n", "    --exclude '/DATA/AppData/postgres/data/' \\\n    --exclude '/DATA/AppData/cerebro/db/' \\\n").replace("#!/bin/bash\n", "#!/bin/bash\n# TODO exclude AppData/cerebro/ollama someday\n");
+    writeFileSync(f, half);
+    expect(exclude(f).code).toBe(0);
+    const out = readFileSync(f, "utf8");
+    expect(occurrences(out, /--exclude '\/DATA\/AppData\/cerebro\/db/g)).toBe(1);
+    expect(occurrences(out, /--exclude '\/DATA\/AppData\/cerebro\/ollama/g)).toBe(1);
+    expect(run(["bash", "-n", f]).code).toBe(0);
+  });
+
+  test("a commented-out postgres exclude is not mirrored", () => {
+    const f = join(root, "commented.sh");
+    writeFileSync(f, "#!/bin/bash\n# --exclude '/DATA/AppData/postgres/data'\necho hi\n");
+    expect(exclude(f).code).toBe(1);
+  });
+
+  test("never overwrites the script with a result that does not parse", () => {
+    const f = join(root, "broken.sh");
+    const broken = SAMPLE + "if true; then\n"; // already invalid bash
+    writeFileSync(f, broken);
+    const r = exclude(f);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/would not parse/);
+    expect(readFileSync(f, "utf8")).toBe(broken);
+    expect(backups("broken.sh")).toEqual([]);
   });
 
   test("refuses to guess when the script has no postgres exclude to mirror", () => {

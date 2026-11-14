@@ -11,6 +11,7 @@
 #   CEREBRO_BACKUP_MOUNT  /DATA/Backup      the mountpoint that must be mounted
 #   CEREBRO_BACKUP_DATE   today (YYYY-MM-DD)  CEREBRO_BACKUP_DOW  day of week, 7 = Sunday
 #   CEREBRO_KEEP_NIGHTLY  14                CEREBRO_KEEP_WEEKLY 4
+#   CEREBRO_BACKUP_AVAIL_KB  free space to assume instead of asking df (tests)
 set -euo pipefail
 umask 077
 
@@ -35,13 +36,11 @@ is_mounted() {
 
 size_of() { wc -c < "$1" | tr -d ' '; }
 
-newest_dump() { ls -1 "$1" 2>/dev/null | grep '\.dump$' | sort | tail -n 1 || true; }
-
 # Keep the newest $2 *.dump files of directory $1.
 prune() {
   local dir=$1 keep=$2 f
   [ -d "$dir" ] || return 0
-  ls -1 "$dir" | grep '\.dump$' | sort -r | tail -n +"$((keep + 1))" | while read -r f; do
+  { ls -1 "$dir" | grep '\.dump$' || true; } | sort -r | tail -n +"$((keep + 1))" | while read -r f; do
     rm -f -- "$dir/$f"
     log "pruned $dir/$f"
   done
@@ -70,28 +69,30 @@ if ! is_mounted "$MOUNT"; then
 fi
 
 mkdir -p "$ROOT/nightly"
+rm -f -- "$ROOT"/nightly/.*.dump.tmp "$ROOT"/weekly/.*.dump.tmp # left behind by a killed run
 
-# Never fill the drive: need twice the size of the biggest recent dump.
+# Never fill the drive: need the larger of twice the biggest existing dump and the live database's size
+# (the first run, and the first Sunday's full dump, have no dump to estimate from).
 need=0
-for d in nightly weekly; do
-  f=$(newest_dump "$ROOT/$d")
-  if [ -n "$f" ]; then
-    s=$(size_of "$ROOT/$d/$f")
-    [ "$s" -le "$need" ] || need=$s
-  fi
+for f in "$ROOT"/nightly/*.dump "$ROOT"/weekly/*.dump; do
+  [ -f "$f" ] || continue
+  s=$(( $(size_of "$f") * 2 ))
+  [ "$s" -le "$need" ] || need=$s
 done
-need=$((need * 2))
-avail=$(( $(df -Pk "$ROOT/nightly" | awk 'NR==2 {print $4}') * 1024 ))
+db_size=$(docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc "select pg_database_size(current_database())")
+[ "$db_size" -le "$need" ] || need=$db_size
+if [ -n "${CEREBRO_BACKUP_AVAIL_KB:-}" ]; then
+  avail=$(( CEREBRO_BACKUP_AVAIL_KB * 1024 ))
+else
+  avail=$(( $(df -Pk "$ROOT/nightly" | awk 'NR==2 {print $4}') * 1024 ))
+fi
 if [ "$avail" -lt "$need" ]; then
-  log "not enough free space on $ROOT: $avail bytes free, need $need (2x the last dump); not dumping"
+  log "not enough free space on $ROOT: $avail bytes free, need $need (max of 2x the biggest dump and the database size); not dumping"
   exit 1
 fi
 
-# summary_embeddings only exists once the summariser migration has run.
-excludes=(--exclude-table-data=chunk_embeddings --exclude-table-data=embed_queue)
-if [ "$(docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc "select to_regclass('public.summary_embeddings') is not null")" = t ]; then
-  excludes+=(--exclude-table-data=summary_embeddings)
-fi
+# summary_embeddings may not exist yet: pg_dump ignores a missing table in --exclude-table-data (tested).
+excludes=(--exclude-table-data=chunk_embeddings --exclude-table-data=summary_embeddings --exclude-table-data=embed_queue)
 
 dump "$ROOT/nightly/$DATE.dump" "${excludes[@]}"
 if [ "$DOW" = 7 ]; then
