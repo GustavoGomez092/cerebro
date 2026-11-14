@@ -120,13 +120,34 @@ test("sessions: upsert re-marks unsent only when changed", () => {
   s.upsertSession(sess("a"));
   s.upsertSession(sess("b"));
   expect(s.unsentSessions(10).map((x) => x.id)).toEqual(["a", "b"]);
-  s.markSessionsSent(["a", "b"]);
+  s.markSessionsSent(s.unsentSessions(10));
   expect(s.unsentSessions(10)).toEqual([]);
   s.upsertSession(sess("a")); // unchanged
   expect(s.unsentSessions(10)).toEqual([]);
   s.upsertSession(sess("a", "/changed"));
   expect(s.unsentSessions(10).map((x) => x.cwd)).toEqual(["/changed"]);
   expect(s.unsentSessions(0)).toEqual([]);
+  s.close();
+});
+
+test("markSessionsSent does not swallow an update that landed after the read", () => {
+  const s = fresh();
+  s.upsertSession(sess("A"));
+  const read = s.unsentSessions(10);
+  s.upsertSession(sess("A", "/v2"));
+  s.markSessionsSent(read);
+  expect(s.unsentSessions(10).map((x) => x.cwd)).toEqual(["/v2"]);
+  s.close();
+});
+
+test("setCursor reopens a cursor that was marked done", () => {
+  const s = fresh();
+  const c = { source: "claude", sessionId: "s", offset: 1, line: 1, state: null, bindingId: null, cwd: "/a", repo: "r", subpath: "" };
+  s.setCursor("/t.jsonl", c);
+  s.markDone("/t.jsonl");
+  expect(s.openCursors()).toHaveLength(0);
+  s.setCursor("/t.jsonl", { ...c, offset: 2 });
+  expect(s.openCursors().map((x) => x.offset)).toEqual([2]);
   s.close();
 });
 

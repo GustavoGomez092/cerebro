@@ -83,7 +83,7 @@ export class Store {
        values (?,?,?,?,?,?,?,?,?,?)
        on conflict(transcript_path) do update set source=excluded.source, session_id=excluded.session_id,
          offset=excluded.offset, line=excluded.line, state=excluded.state, binding_id=excluded.binding_id,
-         cwd=excluded.cwd, repo=excluded.repo, subpath=excluded.subpath`,
+         cwd=excluded.cwd, repo=excluded.repo, subpath=excluded.subpath, done=0`,
     ).run(path, c.source, c.sessionId, c.offset, c.line, JSON.stringify(c.state ?? null), c.bindingId, c.cwd, c.repo, c.subpath);
   }
 
@@ -107,9 +107,10 @@ export class Store {
       .map((r) => JSON.parse(r.json));
   }
 
-  markSessionsSent(ids: string[]): void {
-    const q = this.db.query("update sessions set sent = 1 where id = ?");
-    this.db.transaction(() => { for (const id of ids) q.run(id); })();
+  /** Marks exactly the versions that were read/sent; a session re-upserted since stays unsent. */
+  markSessionsSent(sessions: IngestSession[]): void {
+    const q = this.db.query("update sessions set sent = 1 where id = ? and json = ?");
+    this.db.transaction(() => { for (const s of sessions) q.run(s.id, JSON.stringify(s)); })();
   }
 
   // events
