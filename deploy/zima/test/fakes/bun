@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "bun $*" >> "$FAKE_LOG"
+exit "${FAKE_BUN_RC:-0}"

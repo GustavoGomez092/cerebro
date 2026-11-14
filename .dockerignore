@@ -10,3 +10,14 @@ docs
 **/.env.*
 *.local
 **/*.local
+deploy
+.claude
+**/.claude
+.worktrees
+worktrees
+secrets
+**/secrets
+*.pem
+*.key
+**/*.pem
+**/*.key

@@ -108,3 +108,28 @@ Maintainers publish a release with `scripts/release-plugin.sh <version>` (`--dry
 to preview, `--remote <url>` to publish somewhere other than `origin`, which must be
 this GitHub repo): it compiles the arm64 and x64 binaries and force-pushes `plugin/` (atomically with the tag) as a
 single commit on `plugin-dist`, tagged `plugin-v<version>`.
+
+## Deploying to the Zima server
+
+`deploy/zima/deploy.sh [--first-run]` (owner-specific; `ssh zima`) syncs the committed tree,
+builds `cerebro-server:<sha7>` on the server, migrates, and switches only after `/health`
+reports `ok` and `db` within 60 s. A failed start, a failed health gate or an interrupt (Ctrl-C)
+rolls back to `cerebro-server:prev` and exits 1. `deploy/zima/check.sh` prints `ALL OK` or
+the failing checks.
+
+- **Migrations must be backward-compatible (expand/contract).** They run before the new
+  server starts, and a rollback starts `:prev` on the already-migrated schema; nothing undoes a
+  migration. Add columns and tables first, and drop or rename them only in a later release, once
+  no deployed code reads them.
+- A rollback runs `:prev` with the new release's compose definition (only the image tag
+  changes). A compose change that the old image can't run with needs a manual rollback.
+- When the release has migrations the schema hasn't seen (compared with
+  `state/schema-migrations`, written after every successful migrate), the deploy first saves
+  `pg_dump -Fc` (embeddings excluded, like the nightlies) to
+  `/DATA/AppData/cerebro/state/pre-deploy/<UTC ts>-<sha>.dump` (root 600, never overwritten).
+  Only the newest 3 are kept, but the dump taken before the last applied migration is always
+  kept, so retries after a rollback never replace the recovery point. Rollback and interrupt
+  messages name the migrations and that dump. It is never restored automatically.
+- `:prev` is always the last release that passed the health gate (`state/deployed`).
+- One deploy at a time: the server-side lock `/DATA/AppData/cerebro/state/deploy.lock` names its
+  owner. Remove it only when that deploy is certainly dead.
