@@ -20,8 +20,25 @@ export interface Chunk {
 }
 
 const TOOL_INPUT_MAX = 300;
+/** Characters of one event that are indexed; the full text stays in `events`. */
+export const INDEXABLE_CHARS = 32_000;
 
-function render(e: ChunkInput): string | null {
+/**
+ * Extra full-text terms for identifiers the tokenizer keeps whole: `server/src/indexer.ts`
+ * also yields `server src indexer ts`, `chunkEvents` yields `chunk events`.
+ */
+export function searchTerms(text: string): string {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/[\p{L}\p{N}]+(?:[/._-][\p{L}\p{N}]+)+|\p{Ll}+\p{Lu}[\p{L}\p{N}]*/gu)) {
+    for (const part of m[0].split(/[/._-]/)) {
+      for (const w of part.split(/(?<=\p{Ll})(?=\p{Lu})/u)) if (w.length > 1) out.add(w.toLowerCase());
+    }
+  }
+  return [...out].join(" ");
+}
+
+function render(raw: ChunkInput): string | null {
+  const e = raw.text.length > INDEXABLE_CHARS ? { ...raw, text: raw.text.slice(0, INDEXABLE_CHARS) } : raw;
   switch (e.kind) {
     case "tool_result":
       return null; // tool outputs are stored raw but never indexed

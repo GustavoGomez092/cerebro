@@ -12,3 +12,15 @@ export function normalizeRemote(url: string): string {
 export function pathIdentity(machineName: string, absPath: string): string {
   return `path:${machineName}:${absPath}`;
 }
+
+/** Canonical form of any folder identity: path identities kept verbatim, remotes normalised. */
+export function normalizeIdentity(repo: string): string {
+  const s = repo.trim();
+  return s.startsWith("path:") ? s : normalizeRemote(s);
+}
+
+/** For `path:<machine>:<abs>` identities, the machine name; otherwise null. */
+export function pathIdentityMachine(repo: string): string | null {
+  const m = /^path:([^:]*):/.exec(repo.trim());
+  return m ? m[1] : null;
+}

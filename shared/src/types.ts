@@ -21,18 +21,32 @@ export interface IngestEvent {
   text: string;
   toolName?: string;
   toolInput?: unknown;
+  /** Extra transcript fields (uuid, model, thinking…); unknown top-level fields are merged in. */
+  meta?: Record<string, unknown>;
 }
 
 export interface IngestSession {
   id: string;
   bindingId: string;
   cwd: string;
+  /** Folder identity (normalised git remote or path identity) and repo-relative subpath. */
+  repo: string;
+  subpath?: string;
   startedAt: string;
   imported?: boolean;
+  meta?: Record<string, unknown>;
 }
 
 export interface IngestBatch { sessions: IngestSession[]; events: IngestEvent[] }
-export interface IngestResult { sessions: number; inserted: number; duplicates: number }
+
+export type IngestRejection =
+  | { sessionId: string; code: "invalid_session" | "unknown_binding" | "foreign_path_identity" }
+  | { key: string | null; sessionId: string | null; code: "invalid_event" | "too_deep" | "unknown_session" };
+
+export interface IngestResult { sessions: number; inserted: number; duplicates: number; rejected: IngestRejection[] }
+
+/** Limits a client must respect; larger batches get 413 and should be split. */
+export const INGEST_LIMITS = { maxEvents: 2000, maxSessions: 200, maxBodyBytes: 10 * 1024 * 1024, maxDepth: 64 } as const;
 
 export interface SearchRequest {
   query: string;
