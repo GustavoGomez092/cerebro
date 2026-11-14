@@ -10,7 +10,7 @@
 # check token, ZimaOS registration, old image cleanup.
 #
 # Rollback runs :prev on the schema the new release migrated, so migrations must stay backward-compatible
-# (expand/contract; see README "Deploying to the Zima server").
+# (expand/contract; see deploy/zima/README.md).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=deploy/zima/lib.sh
