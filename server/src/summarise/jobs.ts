@@ -25,6 +25,27 @@ export async function enqueueSummary(
 }
 
 /**
+ * The query scheduleGrowingSessions runs: $1 = minimum new events, $2 = maximum age in hours.
+ * Per session (LATERAL), so each lookup is an index probe (summaries by session, then the session's
+ * uncovered messages in events_session_message_seq_idx): its cost grows with the number of sessions,
+ * never with the size of the events table.
+ */
+export const GROWING_SESSIONS_SQL = `
+    insert into summary_jobs (session_id, priority, covered_seq)
+    select s.id, case when s.imported then 1 else 0 end, c.covered
+    from sessions s
+    cross join lateral (
+      select coalesce(max(m.last_seq), -1) as covered
+      from summaries m where m.session_id = s.id and m.kind = 'session') c
+    cross join lateral (
+      select count(*) as n, min(e.ts) as oldest
+      from events e where e.session_id = s.id and e.kind in ('user', 'assistant') and e.seq > c.covered) u
+    where not exists (select 1 from summary_jobs j where j.session_id = s.id)
+      and (u.n >= $1 or (u.n >= 20 and u.oldest < now() - make_interval(hours => $2)))
+    on conflict (session_id) do nothing
+    returning session_id`;
+
+/**
  * Queues sessions whose uncovered user/assistant events number at least `minNewEvents`, or at
  * least 20 with the oldest of them older than `maxAgeHours`. Sessions already queued are skipped.
  * Returns how many were queued.
@@ -33,23 +54,7 @@ export async function scheduleGrowingSessions(
   sql: SQL, opts: { minNewEvents?: number; maxAgeHours?: number } = {},
 ): Promise<number> {
   const minNew = opts.minNewEvents ?? 150, maxAge = opts.maxAgeHours ?? 2;
-  const rows = await sql`
-    with cov as (
-      select s.id, coalesce((select max(last_seq) from summaries m where m.session_id = s.id and m.kind = 'session'), -1) as covered
-      from sessions s
-      where not exists (select 1 from summary_jobs j where j.session_id = s.id)
-    ), unc as (
-      select cov.id, count(*) as n, min(e.ts) as oldest
-      from cov join events e on e.session_id = cov.id and e.kind in ('user', 'assistant') and e.seq > cov.covered
-      group by cov.id
-    )
-    insert into summary_jobs (session_id, priority, covered_seq)
-    select unc.id, case when s.imported then 1 else 0 end, cov.covered
-    from unc join cov using (id) join sessions s on s.id = unc.id
-    where unc.n >= ${minNew}
-       or (unc.n >= 20 and unc.oldest < now() - make_interval(hours => ${maxAge}))
-    on conflict (session_id) do nothing
-    returning session_id`;
+  const rows = await sql.unsafe(GROWING_SESSIONS_SQL, [minNew, maxAge]);
   return rows.length;
 }
 

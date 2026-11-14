@@ -4,7 +4,7 @@ import { connect } from "../src/db";
 import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
 import {
-  enqueueSummary, scheduleGrowingSessions, claimSummaryJob, completeSummaryJob, failSummaryJob, requeueDeadSummaries,
+  enqueueSummary, scheduleGrowingSessions, claimSummaryJob, completeSummaryJob, failSummaryJob, requeueDeadSummaries, GROWING_SESSIONS_SQL,
 } from "../src/summarise/jobs";
 
 const msgs = (id: string, from: number, to: number) =>
@@ -303,5 +303,46 @@ test("cli requeue-dead-summaries revives dead summary jobs; requeue-dead covers 
     expect(out).toContain("requeued 0 chunk(s)");
     expect(out).toContain("requeued 1 summary job(s)");
     expect((await t.sql`select count(*)::int as n from summary_jobs where dead`)[0].n).toBe(0);
+  } finally { await t.drop(); }
+});
+
+/** Every plan node (depth first) of an EXPLAIN (FORMAT JSON) result. */
+function planNodes(plan: any): any[] {
+  return [plan, ...(plan.Plans ?? []).flatMap(planNodes)];
+}
+
+test("scheduleGrowingSessions reads events per session through an index, never scanning the whole table", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("seed", binding.id)] });
+    // 400 sessions of 60 messages each (24 000 events), all covered by summaries: nothing to queue.
+    await t.sql`
+      insert into sessions (id, binding_id, machine_id, cwd, repo, started_at, last_event_at)
+      select 'bulk' || g, binding_id, machine_id, cwd, repo, started_at, now() from sessions, generate_series(1, 400) g
+      where id = 'seed'`;
+    await t.sql`
+      insert into events (session_id, key, seq, ts, kind, text)
+      select 'bulk' || g, 'k' || i, i, now() - interval '3 hours', case when i % 2 = 0 then 'user' else 'assistant' end,
+        repeat('word ', 40)
+      from generate_series(1, 400) g, generate_series(1, 60) i`;
+    await t.sql`
+      insert into summaries (session_id, kind, binding_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+      select 'bulk' || g, 'session', ${binding.id}, 1, 60, now(), now(), 't', '{}', 'x', 'm' from generate_series(1, 400) g`;
+    await t.sql`analyze`;
+
+    const [row] = await t.sql.unsafe(`explain (format json) ${GROWING_SESSIONS_SQL}`, [150, 2]);
+    const nodes = planNodes(row["QUERY PLAN"][0].Plan);
+    const onEvents = nodes.filter((n) => n["Relation Name"] === "events");
+    expect(onEvents.length).toBeGreaterThan(0);
+    expect(onEvents.map((n) => n["Node Type"]).filter((x) => x === "Seq Scan")).toEqual([]);
+    expect(await scheduleGrowingSessions(t.sql)).toBe(0);
+
+    // Still finds a session that grew: 30 new messages older than 2 h.
+    await t.sql`
+      insert into events (session_id, key, seq, ts, kind, text)
+      select 'bulk7', 'n' || i, 60 + i, now() - interval '3 hours', 'user', 'more' from generate_series(1, 30) i`;
+    expect(await scheduleGrowingSessions(t.sql)).toBe(1);
+    expect((await t.sql`select session_id, covered_seq from summary_jobs`)).toEqual([{ session_id: "bulk7", covered_seq: 60 }]);
   } finally { await t.drop(); }
 });
