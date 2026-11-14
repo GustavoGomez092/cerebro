@@ -148,7 +148,12 @@ first_run_setup() {
     # server.env without them still starts. SUMMARISER_ENABLED takes true/false/1/0/yes/no/on/off only.
     printf '%s\n' "DATABASE_URL=postgres://cerebro:$pw@cerebro-db:5432/cerebro" SUMMARY_SHARE=0.2 \
       SUBSCRIPTION_TOKENS_PER_5H=2000000 SUMMARISER_ENABLED=true \
-      "# SUMMARISER_CMD=claude (set in the image; the CLI pinned in server/Dockerfile)" | secret_write "$secrets/server.env"
+      "# SUMMARISER_CMD=claude (set in the image; the CLI pinned in server/Dockerfile)" \
+      "# Embed on the Mac mini's Ollama first, falling back to cerebro-ollama (EMBED_URL): uncomment both, redeploy." \
+      "# The primary is skipped while its bge-m3 digest differs. See deploy/zima/README.md." \
+      "# EMBED_PRIMARY_URL=http://192.168.4.42:11434" \
+      "# EMBED_MODEL_DIGEST=790764642607" |
+      secret_write "$secrets/server.env"
     echo "secrets: wrote server.env"
   fi
   chown root:root "$secrets/db.env" "$secrets/server.env"

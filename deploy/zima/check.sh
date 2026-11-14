@@ -96,6 +96,21 @@ else
     fail embedder "$pending pending, last success $last"
   fi
 
+  # embedder.primary (server/src/embed/failover.ts): with EMBED_PRIMARY_URL set, the Mac mini's Ollama embeds and
+  # the Zima's own container is the fallback. A fallback still embeds everything, ~70x slower: warn, never fail.
+  route_state=$(jq -r '.embedder.primary.state // "unset"' <<<"$status")
+  route_url=$(jq -r '.embedder.primary.url // empty' <<<"$status")
+  route_error=$(jq -r '.embedder.primary.lastError // empty' <<<"$status")
+  route_used=$(jq -r '.embedder.lastUsed // empty' <<<"$status")
+  case $route_state in
+    down) warn embed-route "embedding on the Zima CPU (slow): Mac mini Ollama unreachable at $route_url${route_error:+ ($route_error)}" ;;
+    digest_mismatch) warn embed-route "embedding on the Zima CPU (slow): Mac mini Ollama mismatch at $route_url${route_error:+ ($route_error)}" ;;
+    up) ok embed-route "Mac mini Ollama at $route_url${route_used:+ (last embedding: $route_used)}" ;;
+    unknown) ok embed-route "Mac mini Ollama at $route_url not tried since the server started" ;;
+    unset) ok embed-route "Zima Ollama only (EMBED_PRIMARY_URL unset)" ;;
+    *) warn embed-route "unknown primary state $route_state" ;;
+  esac
+
   # summariser.paused.reason (server/src/summarise/loop.ts PauseReason): login and unavailable need the owner;
   # budget and usage_limit are normal deferral that ends by itself; disabled is SUMMARISER_ENABLED=false.
   reason=$(jq -r '.summariser.paused.reason // empty' <<<"$status")
