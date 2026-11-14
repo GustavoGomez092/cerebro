@@ -85,12 +85,18 @@ function digestEnv(env: Record<string, string | undefined>, name: string): strin
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const databaseUrl = env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
+  const embedMachineUrls = machineUrlsEnv(env, "EMBED_MACHINE_URLS");
+  const embedModelDigest = digestEnv(env, "EMBED_MODEL_DIGEST");
+  // Without a pinned digest a Mac serving another model under the same name would mix its vectors with the Zima's.
+  if (Object.keys(embedMachineUrls).length && !embedModelDigest) {
+    throw new Error("EMBED_MODEL_DIGEST is required when EMBED_MACHINE_URLS is set (bge-m3's digest, as BGE_M3_DIGEST)");
+  }
   return {
     databaseUrl,
     port: intEnv(env, "PORT", 8790),
     embedUrl: urlEnv(env, "EMBED_URL"),
-    embedMachineUrls: machineUrlsEnv(env, "EMBED_MACHINE_URLS"),
-    embedModelDigest: digestEnv(env, "EMBED_MODEL_DIGEST"),
+    embedMachineUrls,
+    embedModelDigest,
     embedModel: env.EMBED_MODEL || "bge-m3",
     embedDims: intEnv(env, "EMBED_DIMS", 1024),
     summariser: {

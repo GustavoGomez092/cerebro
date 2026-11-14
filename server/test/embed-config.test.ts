@@ -11,9 +11,10 @@ test("EMBED_MACHINE_URLS is optional; unset or empty means no per-machine endpoi
 });
 
 test("EMBED_MACHINE_URLS maps machine-token names to their Ollama", () => {
-  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: "mac-mini=http://192.168.4.42:11434" }).embedMachineUrls)
+  const base2 = { ...base, EMBED_MODEL_DIGEST: "790764642607" };
+  expect(loadConfig({ ...base2, EMBED_MACHINE_URLS: "mac-mini=http://192.168.4.42:11434" }).embedMachineUrls)
     .toEqual({ "mac-mini": "http://192.168.4.42:11434" });
-  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: " mac-mini = http://192.168.4.42:11434 , macbook-pro=http://192.168.4.45:11434/ ," }).embedMachineUrls)
+  expect(loadConfig({ ...base2, EMBED_MACHINE_URLS: " mac-mini = http://192.168.4.42:11434 , macbook-pro=http://192.168.4.45:11434/ ," }).embedMachineUrls)
     .toEqual({ "mac-mini": "http://192.168.4.42:11434", "macbook-pro": "http://192.168.4.45:11434/" });
 });
 
@@ -37,4 +38,11 @@ test("EMBED_MODEL_DIGEST takes a 12-hex prefix or the full sha256 (optionally sh
   expect(loadConfig({ ...base, EMBED_MODEL_DIGEST: `sha256:${DIGEST}` }).embedModelDigest).toBe(DIGEST);
   for (const bad of ["7907646426", "79076464260z", "790764642607" + "a".repeat(10), "bge-m3"])
     expect(() => loadConfig({ ...base, EMBED_MODEL_DIGEST: bad })).toThrow(/EMBED_MODEL_DIGEST/);
+});
+
+test("EMBED_MODEL_DIGEST is required whenever EMBED_MACHINE_URLS maps a machine", () => {
+  expect(() => loadConfig({ ...base, EMBED_MACHINE_URLS: "mac-mini=http://192.168.4.42:11434" })).toThrow(/EMBED_MODEL_DIGEST is required/);
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: "mac-mini=http://192.168.4.42:11434", EMBED_MODEL_DIGEST: "790764642607" }).embedModelDigest)
+    .toBe("790764642607");
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: "" }).embedModelDigest).toBeNull(); // no map, no digest needed
 });
