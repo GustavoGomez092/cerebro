@@ -206,10 +206,213 @@ test("a store failure returns an outcome, releases the lock and does not throw",
   store.unlock("flush");
 });
 
-test("stops starting new requests once the deadline passes", async () => {
-  const { store } = seeded(6);
+test("stops starting new requests once the deadline passes; what is not sent stays queued", async () => {
+  const { store, sid } = seeded(6);
   let t = 0;
   const r = await flush(store, h.api, { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600) });
-  expect(r.outcome).toBe("done");
+  const pending = store.pendingCount();
+  expect(pending).toBeGreaterThan(0);
+  expect(r.sent).toBe(6 - pending);
+  expect(await serverCount(sid)).toBe(r.sent);
+});
+
+const endedAt = "2026-10-20T05:00:00.000Z";
+const serverEnded = async (sid: string) => {
+  const [row] = await h.sql`select ended_at from sessions where id = ${sid}`;
+  return row?.ended_at ? new Date(row.ended_at).toISOString() : null;
+};
+
+test("a session end survives a locked flush and is sent by the next plain flush", async () => {
+  const { store, sid } = seeded(2);
+  expect(store.tryLock("flush", 60_000)).toBe(true);
+  expect((await flush(store, h.api, { end: { sessionId: sid, endedAt } })).outcome).toBe("locked");
+  store.unlock("flush");
+  expect(store.pendingEnds()).toEqual([{ sessionId: sid, endedAt }]);
+  await flush(store, h.api);
+  expect(await serverEnded(sid)).toBe(endedAt);
+  expect(store.pendingEnds()).toEqual([]);
+});
+
+test("a session end survives an unreachable server", async () => {
+  const { store, sid } = seeded(2);
+  const down = new ApiClient({ serverUrl: TEST_URL, token: "t" }, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
+  expect((await flush(store, down, { end: { sessionId: sid, endedAt } })).outcome).toBe("unreachable");
+  expect(store.pendingEnds().length).toBe(1);
+  await flush(store, h.api, { now: () => Date.now() + 3_600_000 });
+  expect(await serverEnded(sid)).toBe(endedAt);
+  expect(store.pendingEnds()).toEqual([]);
+});
+
+test("a session end survives a deadline that stops the run before anything uploads", async () => {
+  const { store, sid } = seeded(2);
+  await flush(store, h.api, { deadlineMs: 0, end: { sessionId: sid, endedAt } });
+  expect(await serverEnded(sid)).toBeNull();
+  expect(store.pendingEnds().length).toBe(1);
+  await flush(store, h.api);
+  expect(await serverEnded(sid)).toBe(endedAt);
+});
+
+test("a session end is sent once the session row is up, even with events still queued", async () => {
+  const { store, sid } = seeded(6);
+  let t = 0;
+  await flush(store, h.api, { maxEvents: 2, deadlineMs: 1000, now: () => (t += 600), end: { sessionId: sid, endedAt } });
   expect(store.pendingCount()).toBeGreaterThan(0);
+  expect(await serverEnded(sid)).toBe(endedAt);
+  expect(store.pendingEnds()).toEqual([]);
+});
+
+test("an end the server answers 404 for is dropped", async () => {
+  const store = newStore();
+  store.addPendingEnd("ghost-session", endedAt);
+  await flush(store, h.api);
+  expect(store.pendingEnds()).toEqual([]);
+});
+
+test("a batch the server rejects with 422 is split until the poison event is quarantined", async () => {
+  const { store, sid } = seeded(10);
+  store.enqueueEvents([{ ...events(sid, 1, "poison")[0], key: `${sid}:poison`, seq: 99 }]);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).includes("poison")) {
+      return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(r.outcome).toBe("done");
+  expect(r.quarantined).toBe(1);
+  expect(store.pendingCount()).toBe(0);
+  expect(await serverCount(sid)).toBe(10);
+});
+
+test("many consecutive 413s from a small proxy limit never quarantine events that fit", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  store.enqueueEvents(events(sid, 40, "y".repeat(30_000)));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).length > 50_000) {
+      return Response.json({ error: "too_large", message: "x" }, { status: 413 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped), { maxBytes: 1_000_000 });
+  expect(r.quarantined).toBe(0);
+  expect(store.pendingCount()).toBe(0);
+  expect(await serverCount(sid)).toBe(40);
+});
+
+test("a single event bigger than the proxy limit is quarantined as too_large after the server refuses it alone", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  const evs = events(sid, 5, "y".repeat(1000));
+  evs[2] = { ...evs[2], text: "z".repeat(80_000) };
+  store.enqueueEvents(evs);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).length > 50_000) {
+      return Response.json({ error: "too_large", message: "x" }, { status: 413 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(r.quarantined).toBe(1);
+  expect(await serverCount(sid)).toBe(4);
+});
+
+const refusing = (status: number, error: string) => (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const req = new Request(input, init);
+  if (new URL(req.url).pathname === "/v1/ingest") return Response.json({ error, message: "no" }, { status });
+  return h.fetch(req);
+}) as typeof fetch;
+
+test("a proxy 429 backs off and quarantines nothing", async () => {
+  const { store } = seeded(5);
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(429, "rate_limited")));
+  expect(["backoff", "unreachable"]).toContain(r.outcome);
+  expect(store.quarantineCount()).toBe(0);
+  expect(store.pendingCount()).toBe(5);
+  expect(Number(store.get("backoffUntil"))).toBeGreaterThan(0);
+});
+
+test("a 403 on every request quarantines nothing and records the error", async () => {
+  const { store } = seeded(5);
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(403, "forbidden")));
+  expect(r.outcome).toBe("unreachable");
+  expect(store.quarantineCount()).toBe(0);
+  expect(store.pendingCount()).toBe(5);
+  expect(store.get("lastError")).toContain("403");
+});
+
+test("a poison event does not take its session row down with it", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  store.enqueueEvents(events(sid, 1, "poison"));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).includes("poison")) {
+      return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.quarantineCount()).toBe(1);
+  expect(store.get(`sessionRejected:${sid}`)).toBeUndefined();
+  expect(store.unsentSessions(10)).toEqual([]);
+  const [row] = await h.sql`select id from sessions where id = ${sid}`;
+  expect(row?.id).toBe(sid);
+});
+
+test("a session row the server refuses on its own is retired and the reason recorded", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest") return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.get(`sessionRejected:${sid}`)).toBe("invalid_data");
+  expect(store.unsentSessions(10)).toEqual([]);
+});
+
+test("an end the server rejects with a 400 is dropped and the next end is still sent", async () => {
+  const store = newStore();
+  const [a, b] = [uid(), uid()];
+  for (const id of [a, b]) { store.upsertSession(session(id)); store.enqueueEvents(events(id, 1)); store.addPendingEnd(id, endedAt); }
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "invalid_ended_at", message: "bad" }, { status: 400 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.pendingEnds()).toEqual([]);
+  expect(store.get(`endRejected:${a}`)).toContain("400");
+  expect(await serverEnded(b)).toBe(endedAt);
+});
+
+test("a 429 on an end keeps it for later", async () => {
+  const store = newStore();
+  const a = uid();
+  store.upsertSession(session(a));
+  store.addPendingEnd(a, endedAt);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "rate_limited", message: "slow" }, { status: 429 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.pendingEnds().length).toBe(1);
+});
+
+test("an unexpected failure records lastError", async () => {
+  const store = newStore();
+  const broken = Object.create(store) as Store;
+  broken.unsentSessions = () => { throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }); };
+  await flush(broken, h.api);
+  expect(store.get("lastError")).toContain("SQLITE_BUSY");
 });

@@ -151,6 +151,22 @@ test("setCursor reopens a cursor that was marked done", () => {
   s.close();
 });
 
+test("pending session ends persist, keep the latest time, and are removed only when the sent time still matches", () => {
+  const s = fresh();
+  s.addPendingEnd("s1", "2026-01-01T01:00:00.000Z");
+  s.addPendingEnd("s1", "2026-01-01T02:00:00.000Z");
+  s.addPendingEnd("s2", "2026-01-01T03:00:00.000Z");
+  expect(s.pendingEnds()).toEqual([
+    { sessionId: "s1", endedAt: "2026-01-01T02:00:00.000Z" },
+    { sessionId: "s2", endedAt: "2026-01-01T03:00:00.000Z" },
+  ]);
+  s.removePendingEnd("s1", "2026-01-01T01:00:00.000Z");
+  expect(s.pendingEnds().length).toBe(2);
+  s.removePendingEnd("s1", "2026-01-01T02:00:00.000Z");
+  expect(s.pendingEnds().map((e) => e.sessionId)).toEqual(["s2"]);
+  s.close();
+});
+
 test("state get/set", () => {
   const s = fresh();
   expect(s.get("instanceId")).toBeUndefined();
