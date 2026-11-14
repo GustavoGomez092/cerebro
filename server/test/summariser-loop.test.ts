@@ -394,6 +394,29 @@ test("a scope invalidated by a re-bind is rebuilt before imported jobs, after li
   }
 });
 
+test("an import of many sessions folds its summaries into the state in batches, not one call per summary", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli();
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  try {
+    const { binding } = await boundFolder(t, { client: "Importer", project: "Big", repo: "github.com/acme/big" });
+    const N = 24;
+    for (let i = 1; i <= N; i++) await endedSession(t, binding.id, `imp${i}`, `import${i}`, { imported: true });
+    for (let i = 0; i < 10; i++) await loop.tick();
+    expect(await t.sql`select 1 from summary_jobs`).toHaveLength(0);
+    expect(summaryCalls(cli.calls)).toHaveLength(N);
+    const stateCalls = cli.calls.filter((c) => "current_status" in ((c.schema as any).properties ?? {}));
+    expect(stateCalls.length).toBeGreaterThan(0);
+    expect(stateCalls.length).toBeLessThanOrEqual(5);
+    const [st] = await t.sql`select dirty, cardinality(source_summary_ids)::int as n from project_states
+      where scope = ${scopeKey(binding.clientId, binding.projectId)}`;
+    expect(st).toEqual({ dirty: false, n: N });
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
 test("a scope whose update fails is not retried every tick", async () => {
   const { t, state } = await setup();
   const c = clock();

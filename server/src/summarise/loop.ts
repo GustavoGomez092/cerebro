@@ -85,9 +85,10 @@ const OUTAGE_MAX_MS = 30 * 60_000;
 
 /**
  * Runs the summariser in the background: every 30 s it queues growing sessions, then claims and
- * summarises jobs one at a time (live before imported), folds each new summary into its scope's state,
- * and updates up to two dirty scopes (re-binds, histories), which may use at most three quarters of the
- * budget window. Single-flight throughout: one Claude call at a time, ever.
+ * summarises jobs one at a time (live before imported), folds each new live summary into its scope's
+ * state, and updates up to two dirty scopes (re-binds, histories, imported summaries, batched), which may
+ * use at most three quarters of the budget window. Dirty scopes are updated before the first imported
+ * job of a tick, so imports never starve them. Single-flight throughout: one Claude call at a time, ever.
  *
  * Pauses (reported in `state.paused`): over budget until the window frees up; a usage limit until the
  * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds; an outage
@@ -291,7 +292,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     let dirtyDone = false;
     for (let n = 0; !stopped; n++) {
       if (n >= JOBS_PER_TICK) {
-        if (!dirtyDone) await updateDirtyScopes();
+        await updateDirtyScopes();
         return true;
       }
       const b = await budgetState(sql, budget);
@@ -315,13 +316,16 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       if (res.status === "deferred" && (res.reason === "login" || res.reason === "unavailable")) probeDeferred.add(job.sessionId);
       if (res.status === "done") outageMs = OUTAGE_MIN_MS;
       if (handle("summary", res)) return false;
+      // Imported history waits for the dirty-scope pass, which folds up to 10 summaries per call:
+      // one state call per imported summary would spend a whole window on a single opt-in.
+      if (job.priority > 0) continue;
       for (const scope of res.scopes) {
         const r = await updateState(sql, scope, [], { run, budget, signal });
         noteRun(r);
         if (handle("state", r)) return false;
       }
     }
-    if (!stopped && !dirtyDone) await updateDirtyScopes();
+    if (!stopped) await updateDirtyScopes();
     return false;
   };
 
