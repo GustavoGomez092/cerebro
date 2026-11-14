@@ -89,6 +89,28 @@ test("oversized text is truncated with the marker", () => {
   expect(t.length).toBeLessThan(8 * 1024 * 1024 + 100);
 });
 
+test("a PEM key straddling the truncation cut is redacted, not cut", () => {
+  const limit = 8 * 1024 * 1024;
+  const body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(40);
+  const pem = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----`;
+  // key starts 100 bytes before the limit, so the cut would land inside it and drop the END line
+  const text = "a".repeat(limit - 100) + pem + "b".repeat(1000);
+  const r = normalizeEntries([{ lineNo: 0, text: JSON.stringify({ type: "user", uuid: "00000000-0000-4000-a000-000000000001", timestamp: "2026-10-20T05:00:00.000Z", message: { role: "user", content: text } }) }], "s", new Map());
+  const t = r.events[0]!.text;
+  expect(t).toContain("[REDACTED:private-key]");
+  expect(t).not.toContain("MIIEvQIBADANBg");
+  expect(t).not.toContain("BEGIN PRIVATE KEY");
+  expect(t).toContain("[truncated by cerebro:");
+});
+
+test("a secret in gitBranch is redacted in meta and sessionMeta", () => {
+  const secret = "sk-ant-api03-" + "B".repeat(40);
+  const line = JSON.stringify({ type: "user", uuid: "00000000-0000-4000-a000-000000000001", timestamp: "2026-10-20T05:00:00.000Z", gitBranch: `fix/${secret}`, message: { role: "user", content: "hi" } });
+  const r = normalizeEntries([{ lineNo: 0, text: line }], "s", new Map());
+  expect(r.events[0]!.meta!.gitBranch).toBe("fix/[REDACTED:anthropic-key]");
+  expect(r.sessionMeta.gitBranch).toBe("fix/[REDACTED:anthropic-key]");
+});
+
 test("format drift is skipped and counted, never fatal", () => {
   const lines = linesOf("session-drift.jsonl");
   const expected = Number(/expected skipped: (\d+)/.exec(lines[0]!.text)![1]);

@@ -23,16 +23,19 @@ type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v : undefined);
 
-/** Truncates over-long text, then makes it storable and redacts secrets. */
+/**
+ * Makes text storable and redacts secrets FIRST, then truncates, so a secret straddling the cut
+ * (e.g. a PEM key losing its END line) can never survive unredacted.
+ */
 function clean(text: string): string {
-  let t = text;
+  const t = redactSecrets(storable(text));
   if (t.length * 3 > MAX_TEXT_BYTES) {
     const bytes = Buffer.byteLength(t);
     if (bytes > MAX_TEXT_BYTES) {
-      t = Buffer.from(t).subarray(0, MAX_TEXT_BYTES).toString("utf8") + `\n[truncated by cerebro: ${bytes} bytes total]`;
+      return storable(Buffer.from(t).subarray(0, MAX_TEXT_BYTES).toString("utf8")) + `\n[truncated by cerebro: ${bytes} bytes total]`;
     }
   }
-  return redactSecrets(storable(t));
+  return t;
 }
 
 /** Cleans every string value (keys go through `storable` only). */
@@ -86,7 +89,8 @@ export function normalizeEntries(
       if (typeof e.isSidechain === "boolean") meta.isSidechain = e.isSidechain;
       for (const k of ["gitBranch", "version", "entrypoint"] as const) {
         const v = str(e[k]);
-        if (v) meta[k] = storable(v);
+        // gitBranch is free-form (can embed a token); version/entrypoint are identifiers.
+        if (v) meta[k] = k === "gitBranch" ? clean(v) : storable(v);
       }
       const model = str(e.message.model);
       if (model) meta.model = storable(model);
