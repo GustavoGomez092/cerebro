@@ -617,7 +617,12 @@ describe("check.sh", () => {
   const GOOD = {
     FAKE_HEALTH_LAN: healthy, FAKE_HEALTH_LOCAL: healthy, FAKE_TOKEN: TOKEN, FAKE_STATUS: status(),
     FAKE_OLLAMA_LIST: "NAME             ID              SIZE      MODIFIED\nbge-m3:latest    790764642607    1.2 GB    2 days ago",
-    FAKE_STATS: "cerebro-db 12.50%\ncerebro-ollama 40.00%\ncerebro-server 20.00%",
+    // <container> <anon> <shmem> <file (page cache)> <limit> <oom_kill>
+    FAKE_MEM: [
+      "cerebro-db 200000000 100000000 1700000000 2147483648 0",
+      "cerebro-ollama 1500000000 0 100000000 3221225472 0",
+      "cerebro-server 150000000 0 10000000 1073741824 0",
+    ].join("\n"),
     FAKE_TIMER_STATE: "active",
     FAKE_DF_PCT: "40%",
   };
@@ -654,7 +659,7 @@ describe("check.sh", () => {
       FAKE_HEALTH_LOCAL: '{"ok":false,"db":false,"apiVersion":1,"instanceId":"inst-2"}',
       FAKE_STATUS: status({ pending: 12, dead: 3, lastSuccessMinutes: 120, paused: "login", dbBytes: 160e9 }),
       FAKE_OLLAMA_LIST: "NAME    ID    SIZE    MODIFIED",
-      FAKE_STATS: "cerebro-db 95.00%\ncerebro-ollama 40.00%",
+      FAKE_MEM: "cerebro-db 1800000000 300000000 0 2147483648 0\ncerebro-ollama 1500000000 0 100000000 3221225472 0",
       FAKE_TIMER_STATE: "inactive",
     });
     expect(r.code, show(r)).toBe(1);
@@ -662,7 +667,7 @@ describe("check.sh", () => {
     for (const name of ["health-lan", "health-local", "instance-id", "queue", "embedder", "summariser", "db-size", "bge-m3", "backup-timer", "backup-age", "memory"])
       expect(r.out, show(r)).toMatch(new RegExp(`^FAIL +${name} `, "m"));
     expect(r.out).toMatch(/^FAIL +embedder +12 pending, last success 120 min ago$/m);
-    expect(r.out).toMatch(/^FAIL +memory +cerebro-db at 95\.00% of its limit, cerebro-server not running$/m);
+    expect(r.out).toMatch(/^FAIL +memory +cerebro-db at 97% of its limit \(anon\+shmem\), cerebro-server not running$/m);
   });
 
   test("check warns at 120 GB and fails at 150 GB", () => {
@@ -671,6 +676,23 @@ describe("check.sh", () => {
     expect(warn.code, show(warn)).toBe(0);
     expect(warn.out).toMatch(/^warn +db-size /m);
     expect(warn.out).toContain("ALL OK");
+  });
+
+  test("memory counts anon+shmem against each limit, not the page cache", () => {
+    const s = checkSandbox();
+    // docker stats would say 95% for the db: 1.7 GB of it is reclaimable page cache.
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATS: "cerebro-db 95.00%\ncerebro-ollama 40.00%\ncerebro-server 20.00%" });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^ok +memory +cerebro-db 13% cerebro-ollama 46% cerebro-server 13% \(anon\+shmem of each limit\)$/m);
+  });
+
+  test("memory warns about OOM kills inside a container that is still running", () => {
+    const s = checkSandbox();
+    const mem = GOOD.FAKE_MEM.replace("cerebro-db 200000000 100000000 1700000000 2147483648 0", "cerebro-db 200000000 100000000 1700000000 2147483648 2");
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_MEM: mem });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +memory +cerebro-db: 2 OOM kill\(s\) since the container started/m);
+    expect(r.out).toContain("ALL OK (1 warning(s))");
   });
 
   test("check warns when the shared backup drive is over 80% full", () => {

@@ -55,6 +55,12 @@ case $1 in
   exec)
     case "$*" in
       *pg_dump*) printf '%s' "${FAKE_DUMP_CONTENT:-PGDMP-fake}"; exit "${FAKE_DUMP_RC:-0}" ;;
+      *memory.stat*)
+        # FAKE_MEM lines "<container> <anon> <shmem> <file> <limit> <oom_kill>" stand for the container's cgroup files.
+        line=$(grep "^$2 " <<<"${FAKE_MEM-}") || { echo "Error response from daemon: No such container: $2" >&2; exit 1; }
+        read -r _ anon shmem file limit oom <<<"$line"
+        printf 'limit %s\nanon %s\nfile %s\nkernel 1000\nshmem %s\nlow 0\nhigh 0\nmax 0\noom 0\noom_kill %s\n' "$limit" "$anon" "$file" "$shmem" "$oom"
+        exit 0 ;;
       *"token create check"*)
         printf 'Token for check (shown once, store it on that machine):\n%s\nDo not create tokens inside a recorded Claude Code session.\n' "$FAKE_CHECK_TOKEN"
         exit 0 ;;

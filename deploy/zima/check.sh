@@ -32,6 +32,19 @@ status_fetch() {
   printf 'Authorization: Bearer %s\n' "$tok" | curl -s -f -m 10 -H @- http://127.0.0.1:8790/v1/status
 }
 
+# shellcheck disable=SC2329 # invoked on the server through zfn
+# Runs on the server as root (via zfn): per container, "<name> <anon+shmem bytes> <limit> <oom kills>" from its
+# cgroup (v2) files, or "<name> missing". docker stats' MemPerc counts the page cache, which the kernel reclaims
+# before it OOM-kills: for Postgres it reads near 100 % on a healthy box.
+mem_report() {
+  local c
+  for c in "$@"; do
+    { docker exec "$c" sh -c 'cd /sys/fs/cgroup && echo "limit $(cat memory.max)" && cat memory.stat memory.events' 2>/dev/null || true; } |
+      awk -v c="$c" '$1 == "limit" { l = $2 } $1 == "anon" || $1 == "shmem" { u += $2 } $1 == "oom_kill" { k = $2 }
+        END { if (l == "") print c, "missing"; else printf "%s %.0f %s %.0f\n", c, u, l, k }'
+  done
+}
+
 # /health through Caddy (from this Mac) and on the server itself.
 url=http://cerebro.home.lab/health
 lan=$(curl -s -m 5 "$url" || true)
@@ -123,21 +136,34 @@ else
   ok backup-disk "$BACKUP_MOUNT $used used"
 fi
 
-# Usage as a share of each container's hard memory limit (no swap, so 100 % means the OOM killer).
-stats=$(zssh "sudo docker stats --no-stream --format '{{.Name}} {{.MemPerc}}'" || true)
+# Memory the kernel can't reclaim (anon + shmem: Postgres' shared buffers) as a share of each container's hard
+# limit (no swap, so 100 % means the OOM killer). OOM kills inside a container that kept running (a Postgres
+# backend, a model runner) are a warning: the container recovered, but its limit was hit.
+mem=$(zfn mem_report cerebro-db cerebro-ollama cerebro-server || true)
 mem_bad=""
 mem_ok=""
+mem_warn=""
 for c in cerebro-db cerebro-ollama cerebro-server; do
-  pct=$(awk -v n="$c" '$1 == n { sub("%", "", $2); print $2 }' <<<"$stats")
-  if [[ -z $pct ]]; then
+  read -r used limit kills < <(awk -v n="$c" '$1 == n { print $2, $3, $4 }' <<<"$mem") || true
+  if [[ -z ${used-} || $used == missing ]]; then
     mem_bad="$mem_bad, $c not running"
-  elif awk -v p="$pct" 'BEGIN { exit !(p >= 90) }'; then
-    mem_bad="$mem_bad, $c at ${pct}% of its limit"
-  else
-    mem_ok="$mem_ok $c ${pct}%"
+    continue
   fi
+  if [[ ! $limit =~ ^[0-9]+$ ]]; then
+    mem_bad="$mem_bad, $c has no memory limit"
+    continue
+  fi
+  pct=$((used * 100 / limit))
+  if ((pct >= 90)); then mem_bad="$mem_bad, $c at ${pct}% of its limit (anon+shmem)"; else mem_ok="$mem_ok $c ${pct}%"; fi
+  if ((kills > 0)); then mem_warn="$mem_warn, $c: $kills OOM kill(s) since the container started"; fi
 done
-if [[ -n $mem_bad ]]; then fail memory "${mem_bad#, }"; else ok memory "${mem_ok# }"; fi
+if [[ -n $mem_bad ]]; then
+  fail memory "${mem_bad#, }"
+elif [[ -n $mem_warn ]]; then
+  warn memory "${mem_warn#, } (now:$mem_ok)"
+else
+  ok memory "${mem_ok# } (anon+shmem of each limit)"
+fi
 
 if [[ -z $FAILED ]]; then
   if ((WARNED)); then echo "ALL OK ($WARNED warning(s))"; else echo "ALL OK"; fi
