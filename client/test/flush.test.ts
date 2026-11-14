@@ -285,24 +285,128 @@ test("a batch the server rejects with 422 is split until the poison event is qua
   expect(await serverCount(sid)).toBe(10);
 });
 
-test("a small body limit only quarantines the event that is itself too big", async () => {
+test("many consecutive 413s from a small proxy limit never quarantine events that fit", async () => {
   const sid = uid();
   const store = newStore();
   store.upsertSession(session(sid));
-  const evs = events(sid, 9, "y".repeat(30_000));
-  evs[4] = { ...evs[4], text: "z".repeat(200_000) };
+  store.enqueueEvents(events(sid, 40, "y".repeat(30_000)));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).length > 50_000) {
+      return Response.json({ error: "too_large", message: "x" }, { status: 413 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped), { maxBytes: 1_000_000 });
+  expect(r.quarantined).toBe(0);
+  expect(store.pendingCount()).toBe(0);
+  expect(await serverCount(sid)).toBe(40);
+});
+
+test("a single event bigger than the proxy limit is quarantined as too_large after the server refuses it alone", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  const evs = events(sid, 5, "y".repeat(1000));
+  evs[2] = { ...evs[2], text: "z".repeat(80_000) };
   store.enqueueEvents(evs);
   const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
-    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).length > 100_000) {
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).length > 50_000) {
       return Response.json({ error: "too_large", message: "x" }, { status: 413 });
     }
     return h.fetch(req);
   }) as typeof fetch;
   const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
   expect(r.quarantined).toBe(1);
-  expect(store.pendingCount()).toBe(0);
-  expect(await serverCount(sid)).toBe(8);
+  expect(await serverCount(sid)).toBe(4);
+});
+
+const refusing = (status: number, error: string) => (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const req = new Request(input, init);
+  if (new URL(req.url).pathname === "/v1/ingest") return Response.json({ error, message: "no" }, { status });
+  return h.fetch(req);
+}) as typeof fetch;
+
+test("a proxy 429 backs off and quarantines nothing", async () => {
+  const { store } = seeded(5);
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(429, "rate_limited")));
+  expect(["backoff", "unreachable"]).toContain(r.outcome);
+  expect(store.quarantineCount()).toBe(0);
+  expect(store.pendingCount()).toBe(5);
+  expect(Number(store.get("backoffUntil"))).toBeGreaterThan(0);
+});
+
+test("a 403 on every request quarantines nothing and records the error", async () => {
+  const { store } = seeded(5);
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(403, "forbidden")));
+  expect(r.outcome).toBe("unreachable");
+  expect(store.quarantineCount()).toBe(0);
+  expect(store.pendingCount()).toBe(5);
+  expect(store.get("lastError")).toContain("403");
+});
+
+test("a poison event does not take its session row down with it", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  store.enqueueEvents(events(sid, 1, "poison"));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest" && (await req.clone().text()).includes("poison")) {
+      return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
+    }
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.quarantineCount()).toBe(1);
+  expect(store.get(`sessionRejected:${sid}`)).toBeUndefined();
+  expect(store.unsentSessions(10)).toEqual([]);
+  const [row] = await h.sql`select id from sessions where id = ${sid}`;
+  expect(row?.id).toBe(sid);
+});
+
+test("a session row the server refuses on its own is retired and the reason recorded", async () => {
+  const sid = uid();
+  const store = newStore();
+  store.upsertSession(session(sid));
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/ingest") return Response.json({ error: "invalid_data", message: "bad" }, { status: 422 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.get(`sessionRejected:${sid}`)).toBe("invalid_data");
+  expect(store.unsentSessions(10)).toEqual([]);
+});
+
+test("an end the server rejects with a 400 is dropped and the next end is still sent", async () => {
+  const store = newStore();
+  const [a, b] = [uid(), uid()];
+  for (const id of [a, b]) { store.upsertSession(session(id)); store.enqueueEvents(events(id, 1)); store.addPendingEnd(id, endedAt); }
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "invalid_ended_at", message: "bad" }, { status: 400 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.pendingEnds()).toEqual([]);
+  expect(store.get(`endRejected:${a}`)).toContain("400");
+  expect(await serverEnded(b)).toBe(endedAt);
+});
+
+test("a 429 on an end keeps it for later", async () => {
+  const store = newStore();
+  const a = uid();
+  store.upsertSession(session(a));
+  store.addPendingEnd(a, endedAt);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "rate_limited", message: "slow" }, { status: 429 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(store.pendingEnds().length).toBe(1);
 });
 
 test("an unexpected failure records lastError", async () => {
