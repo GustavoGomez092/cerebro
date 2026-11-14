@@ -17,7 +17,7 @@ const IMAGE = `cerebro-server:imgtest-${suffix}`;
 const NET = `cerebro-imgtest-${suffix}`;
 const DB = `${NET}-db`;
 const APP = `${NET}-app`;
-const PINNED_CLAUDE = "2.1.325";
+const PINNED_CLAUDE = "2.1.311"; // npm "stable" tag; released 2026-10-26, at least 2 weeks before it was pinned
 
 beforeAll(() => {
   if (!dockerUp) return;

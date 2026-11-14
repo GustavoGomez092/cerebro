@@ -2,8 +2,9 @@
 # Base pinned by digest (multi-arch index: linux/amd64 for the Zima host, arm64 for local builds).
 FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
 
-# Claude Code CLI, pinned to the version on the owner's Mac (summariser runs it headless).
-ARG CLAUDE_CODE_VERSION=2.1.325
+# Claude Code CLI (the summariser runs it headless), pinned to an exact release at least two weeks old:
+# 2.1.311 is npm's "stable" tag, released 2026-10-26. Never @latest; DISABLE_AUTOUPDATER below keeps it fixed.
+ARG CLAUDE_CODE_VERSION=2.1.311
 RUN BUN_INSTALL=/usr/local bun install -g --trust "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && rm -rf /root/.bun/install/cache /usr/local/install/cache \
  && claude --version
