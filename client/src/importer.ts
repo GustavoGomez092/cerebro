@@ -1,13 +1,14 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ApiClient } from "./api";
-import { captureTranscript } from "./capture";
+import { captureTranscript, readState } from "./capture";
 import { flush } from "./flush";
 import { folderIdentity, type FolderIdentity } from "./identity";
 import { verifyServer } from "./instance";
 import { logError, logInfo } from "./log";
 import { allSources } from "./sources";
+import { claudeCodeSource } from "./sources/claude-code";
 import type { HistorySource, SourceFile } from "./sources/types";
 import type { Store } from "./store";
 
@@ -37,6 +38,28 @@ function within(root: string, dir: string): string | null {
   if (rel === "") return "";
   if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) return null;
   return rel.split("\\").join("/");
+}
+
+/** Where everything currently in the file has been read (`SourceFile.endOffset`, else its size), or null when unknown. */
+function endOf(file: SourceFile): number | null {
+  if (file.endOffset !== undefined) return file.endOffset;
+  if (file.size !== undefined) return file.size;
+  try { return statSync(file.path).size; } catch { return null; }
+}
+
+/**
+ * Whether the import leaves a file alone because of its cursor: a live session (opened by the hooks and not
+ * yet ended) is captured by its own hooks as live work, and a closed cursor that recorded the session, or
+ * read it to the end, has nothing left. A closed cursor that never recorded anything (the session ran before
+ * the folder was bound) is imported from where it stopped.
+ */
+function settledByCursor(store: Store, file: SourceFile): boolean {
+  const cursor = store.getCursor(file.path);
+  if (!cursor) return false;
+  if (!cursor.done) return cursor.source === claudeCodeSource.id && readState(cursor.state).imported !== true;
+  if (cursor.bindingId !== null) return true;
+  const end = endOf(file);
+  return end !== null && cursor.offset >= end;
 }
 
 /** Imports the past conversations of one folder (and its subfolders) from every registered source. */
@@ -87,7 +110,7 @@ export async function importFolder(
 
       for (const file of files) {
         try {
-          if (store.getCursor(file.path)?.done) continue;
+          if (settledByCursor(store, file)) continue;
           const fileCwd = file.cwd ?? source.read(file, { offset: 0, line: 0 }).cwd;
           if (!fileCwd) continue;
           const rel = within(root, real(fileCwd));

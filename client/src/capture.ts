@@ -16,7 +16,7 @@ export type CaptureStatus = "recorded" | "not_bound" | "declined" | "headless" |
 export interface CaptureResult { status: CaptureStatus; events: number; skipped: number }
 
 /** What capture keeps in the cursor's `state`, wrapping the adapter's own state. */
-interface CaptureState {
+export interface CaptureState {
   adapter?: unknown;
   /** Decided once, from the first read that yielded entries. */
   headless?: boolean;
@@ -26,7 +26,7 @@ interface CaptureState {
   imported?: boolean;
 }
 
-function readState(raw: unknown): CaptureState {
+export function readState(raw: unknown): CaptureState {
   return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as CaptureState) : {};
 }
 
@@ -62,7 +62,8 @@ export function captureTranscript(
   const file = { source: source.id, path: input.transcriptPath, sessionId: input.sessionId, cwd: input.cwd, modifiedMs: Date.now() };
   const r = source.read(file, { offset: cursor?.offset ?? 0, line: cursor?.line ?? 0, state: prior.adapter });
 
-  const next: CaptureState = { ...prior, adapter: r.state, imported: opts.imported ?? prior.imported ?? false };
+  // A session keeps whatever it was first captured as: one recorded live never turns into imported history.
+  const next: CaptureState = { ...prior, adapter: r.state, imported: prior.imported ?? opts.imported ?? false };
   if (next.startedAt === undefined && r.firstTimestamp) {
     next.headless = r.headless;
     next.startedAt = r.firstTimestamp;

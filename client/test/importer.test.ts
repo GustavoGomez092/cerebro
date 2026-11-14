@@ -2,6 +2,8 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { flush } from "../src/flush";
+import { handleHook, type HookEvent, type HookInput } from "../src/hooks";
 import { importFolder } from "../src/importer";
 import { Store } from "../src/store";
 import { liveServer, type LiveServer } from "./harness";
@@ -233,4 +235,47 @@ test("import sends nothing while uploads are blocked (revoked or refused token)"
     await importFolder(store, h.clientFor(store, fetchFn), root, "mac", { home });
     expect({ reason, authed }).toEqual({ reason, authed: [] });
   }
+});
+
+/** Runs one hook for `t` in `cwd` as Claude Code would, against a client gated by `store`. */
+function hook(store: Store, event: HookEvent, t: { sid: string; path: string }, cwd: string, extra: Partial<HookInput> = {}) {
+  return handleHook(event, { session_id: t.sid, transcript_path: t.path, cwd, hook_event_name: event, ...extra }, {
+    store, api: h.clientFor(store), machine: "mac", env: {}, spawn: () => {},
+  });
+}
+
+test("a session that ran (and ended) before the folder was bound is imported once it is bound", async () => {
+  const home = tmp();
+  const { root, remote } = repo("before-optin");
+  const t = transcript(home, root);
+  const store = newStore();
+  await hook(store, "SessionStart", t, root, { source: "startup" });
+  await hook(store, "Stop", t, root);
+  await hook(store, "SessionEnd", t, root, { reason: "prompt_input_exit" });
+  expect(store.getCursor(t.path)).toMatchObject({ done: true, bindingId: null, offset: 0 });
+
+  const b = await bind(remote, "", "BeforeOptIn");
+  const r = await importFolder(store, h.clientFor(store), root, "mac", { home });
+  expect(r.sessions).toBe(1);
+  const s = await serverSession(t.sid);
+  expect(s?.binding_id).toBe(b.id);
+  expect(s?.imported).toBe(true);
+});
+
+test("the session that opts the folder in (still open) is left to live capture and is not marked imported", async () => {
+  const home = tmp();
+  const { root, remote } = repo("optin-live");
+  const t = transcript(home, root, { ageMs: 1000 });
+  const store = newStore();
+  await hook(store, "SessionStart", t, root, { source: "startup" });
+  // cerebro_bind: binds on the server, caches the binding, then starts the import
+  const b = await bind(remote, "", "OptInLive");
+  store.cacheBinding(remote, "", b);
+  const r = await importFolder(store, h.clientFor(store), root, "mac", { home });
+  expect(r.sessions).toBe(0);
+  await hook(store, "Stop", t, root);
+  await flush(store, h.clientFor(store));
+  const s = await serverSession(t.sid);
+  expect(s?.binding_id).toBe(b.id);
+  expect(s?.imported).toBe(false);
 });

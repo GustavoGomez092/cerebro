@@ -105,6 +105,17 @@ test("opting in later captures the whole session from the start", () => {
   store.close();
 });
 
+test("a session already captured live stays live when a later capture calls it imported", () => {
+  const { store, path, input } = setup();
+  store.cacheBinding(ident.repo, "", binding());
+  writeFileSync(path, line("user", "a"));
+  captureTranscript(store, input, ident);
+  appendFileSync(path, line("assistant", "b"));
+  captureTranscript(store, input, ident, { imported: true });
+  expect(store.unsentSessions(10)[0]).toMatchObject({ id: SID, imported: false });
+  store.close();
+});
+
 test("tool names survive across captures", () => {
   const { store, path, input } = setup();
   store.cacheBinding(ident.repo, "", binding());
