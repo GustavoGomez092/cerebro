@@ -2,6 +2,10 @@ export interface Config {
   databaseUrl: string;
   port: number;
   embedUrl: string | null;
+  /** Ollama tried first (e.g. the Mac mini's Metal GPU); embedUrl is the fallback. Null: embedUrl only. */
+  embedPrimaryUrl: string | null;
+  /** Expected model digest on the primary (12-hex prefix or full sha256, lower case), or null for no check. */
+  embedModelDigest: string | null;
   embedModel: string;
   embedDims: number;
   summariser: { enabled: boolean; share: number; windowTokens: number; cmd: string };
@@ -35,13 +39,33 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return n;
 }
 
+/** An optional http(s) base URL; anything else is a startup error. */
+function urlEnv(env: Record<string, string | undefined>, name: string): string | null {
+  const raw = (env[name] ?? "").trim();
+  if (raw === "") return null;
+  let u: URL | null = null;
+  try { u = new URL(raw); } catch { /* reported below */ }
+  if (!u || !["http:", "https:"].includes(u.protocol) || !u.hostname) throw new Error(`${name} must be an http(s) URL`);
+  return raw;
+}
+
+/** An Ollama model digest: the 12-hex `ollama list` ID or the full sha256 (an optional `sha256:` prefix is dropped). */
+function digestEnv(env: Record<string, string | undefined>, name: string): string | null {
+  const raw = (env[name] ?? "").trim().toLowerCase().replace(/^sha256:/, "");
+  if (raw === "") return null;
+  if (!/^[0-9a-f]{12}$|^[0-9a-f]{64}$/.test(raw)) throw new Error(`${name} must be a 12-hex digest prefix or the full sha256`);
+  return raw;
+}
+
 export function loadConfig(env: Record<string, string | undefined>): Config {
   const databaseUrl = env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
   return {
     databaseUrl,
     port: intEnv(env, "PORT", 8790),
-    embedUrl: env.EMBED_URL || null,
+    embedUrl: urlEnv(env, "EMBED_URL"),
+    embedPrimaryUrl: urlEnv(env, "EMBED_PRIMARY_URL"),
+    embedModelDigest: digestEnv(env, "EMBED_MODEL_DIGEST"),
     embedModel: env.EMBED_MODEL || "bge-m3",
     embedDims: intEnv(env, "EMBED_DIMS", 1024),
     summariser: {

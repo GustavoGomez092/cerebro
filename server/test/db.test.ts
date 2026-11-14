@@ -79,7 +79,7 @@ test("embedding model and dims are pinned on first start", async () => {
 
 test("loadConfig applies defaults and validates", () => {
   expect(loadConfig({ DATABASE_URL: "postgres://x" })).toEqual({
-    databaseUrl: "postgres://x", port: 8790, embedUrl: null, embedModel: "bge-m3", embedDims: 1024,
+    databaseUrl: "postgres://x", port: 8790, embedUrl: null, embedPrimaryUrl: null, embedModelDigest: null, embedModel: "bge-m3", embedDims: 1024,
     summariser: { enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" },
   });
   expect(() => loadConfig({})).toThrow(/DATABASE_URL/);
