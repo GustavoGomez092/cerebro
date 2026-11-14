@@ -71,12 +71,15 @@ test("config prefers plugin options over the config file", () => {
   withHome((home) => {
     expect(cerebroHome()).toBe(home);
     expect(loadClientConfig({})).toBeNull();
+    expect(loadClientConfig({ CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://env" })).toBeNull();
     saveClientConfig({ serverUrl: "http://file", token: "f" });
     expect(statSync(join(home, "config.json")).mode & 0o777).toBe(0o600);
     expect(statSync(home).mode & 0o777).toBe(0o700);
     expect(loadClientConfig({})).toEqual({ serverUrl: "http://file", token: "f" });
     expect(loadClientConfig({ CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://env", CLAUDE_PLUGIN_OPTION_TOKEN: "e" })).toEqual({ serverUrl: "http://env", token: "e" });
     expect(loadClientConfig({ CEREBRO_SERVER_URL: "http://env2", CEREBRO_TOKEN: "e2" })).toEqual({ serverUrl: "http://env2", token: "e2" });
+    expect(loadClientConfig({ CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://env" })).toEqual({ serverUrl: "http://file", token: "f" });
+    expect(loadClientConfig({ CEREBRO_TOKEN: "e" })).toEqual({ serverUrl: "http://file", token: "f" });
     writeFileSync(join(home, "config.json"), "{not json");
     expect(loadClientConfig({})).toBeNull();
   });
@@ -86,7 +89,7 @@ test("logging writes JSON lines and never throws", () => {
   withHome((home) => {
     logInfo("hello", { a: 1 });
     logError("where", new Error("boom"));
-    const lines = readFileSync(join(home, "client.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const lines = readFileSync(join(home, "logs", "client.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(lines.map((l) => l.msg ?? l.where)).toEqual(["hello", "where"]);
     expect(lines[1].error).toContain("boom");
     process.env.CEREBRO_HOME = join(home, "client.log", "nope"); // unwritable: parent is a file

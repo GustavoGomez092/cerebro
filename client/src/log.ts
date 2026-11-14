@@ -1,10 +1,12 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { cerebroHome } from "./paths";
 
 function write(entry: Record<string, unknown>): void {
   try {
-    appendFileSync(join(cerebroHome(), "client.log"), JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
+    const dir = join(cerebroHome(), "logs");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    appendFileSync(join(dir, "client.log"), JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
   } catch { /* logging must never fail a session */ }
 }
 
