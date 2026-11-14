@@ -1,6 +1,7 @@
 import type { IngestEvent, IngestRejection, IngestSession } from "@cerebro/shared";
 import { ApiError, type ApiClient } from "./api";
 import { sweepOpenCursors } from "./capture";
+import { checkInstance } from "./instance";
 import type { BlockedReason, Store } from "./store";
 
 export type FlushOutcome = "done" | "nothing" | "locked" | "backoff" | "unreachable" | "blocked" | "instance_mismatch" | "error";
@@ -63,19 +64,9 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
     sweepOpenCursors(store);
 
     // Preflight on an unauthenticated route, so an impostor never sees the token or any data.
-    try {
-      const health = await api.health({ timeoutMs: HEALTH_TIMEOUT_MS });
-      if (!health.ok || !health.instanceId) return fail();
-      const pinned = store.get("instanceId");
-      if (pinned === undefined) store.set("instanceId", health.instanceId);
-      else if (pinned !== health.instanceId) {
-        store.set("blocked", "instance_mismatch");
-        return finish("instance_mismatch");
-      }
-    } catch (e) {
-      if (e instanceof ApiError) return fail();
-      throw e;
-    }
+    const instance = await checkInstance(store, api, { timeoutMs: HEALTH_TIMEOUT_MS });
+    if (instance === "unreachable") return fail();
+    if (instance === "mismatch") return finish("instance_mismatch");
 
     const configuredEvents = opts.maxEvents ?? 2000;
     const configuredBytes = opts.maxBytes ?? 8 * 1024 * 1024;
