@@ -1,0 +1,3 @@
+#!/bin/bash
+# Short real pause, so time-based loops finish quickly in tests.
+/bin/sleep 0.05
