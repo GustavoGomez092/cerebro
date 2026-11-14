@@ -230,3 +230,22 @@ test("ending a session and queueing its job are one transaction", async () => {
     expect(s.ended_at).toBeNull();
   } finally { await t.drop(); }
 });
+
+test("failure messages with NUL, lone surrogates or great length are still recorded", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)] });
+    await enqueueSummary(t.sql, "s", { priority: 0 });
+    await claimSummaryJob(t.sql);
+    await failSummaryJob(t.sql, "s", "a\u0000b \uD800 lone", { retryable: false });
+    let [j] = await t.sql`select attempts, locked_until, last_error from summary_jobs where session_id = 's'`;
+    expect(j.attempts).toBe(1);
+    expect(j.locked_until).toBeNull();
+    expect(j.last_error).toBe("a\uFFFDb \uFFFD lone");
+    await failSummaryJob(t.sql, "s", "x\u0000".repeat(5000), { retryable: true });
+    [j] = await t.sql`select last_error from summary_jobs where session_id = 's'`;
+    expect(j.last_error.length).toBeLessThanOrEqual(2000);
+    expect(j.last_error).not.toContain("\u0000");
+  } finally { await t.drop(); }
+});

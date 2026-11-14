@@ -1,7 +1,9 @@
 import type { SQL } from "bun";
+import { storable } from "@cerebro/shared";
 
 const MAX_ATTEMPTS = 5;
 const REDUE_HOURS = 2;
+const MAX_ERROR_CHARS = 2000;
 
 /**
  * Queues a session for summarising. One job per session: a repeat keeps the lower priority number
@@ -100,10 +102,12 @@ export async function completeSummaryJob(
 /**
  * Releases the lease after a failure. Retryable failures (budget, usage limit, login) do not count
  * as attempts (and use `dueAt` when given); the others back off exponentially and dead-letter after five.
+ * The message is capped and made storable (it may echo CLI or model output), so recording never throws.
  */
 export async function failSummaryJob(
   sql: SQL, sessionId: string, error: string, opts: { retryable: boolean; dueAt?: Date },
 ): Promise<void> {
+  error = storable(error.slice(0, MAX_ERROR_CHARS));
   if (opts.retryable) {
     await sql`
       update summary_jobs set last_error = ${error}, locked_until = null,

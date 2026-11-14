@@ -20,10 +20,14 @@ export interface RenderedPiece {
 }
 
 const PREVIEW = 300;
+const TOOL_NAME_MAX = 100;
+/** Everything a reader (or model) may treat as a line break. */
+const LINE_BREAKS = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/g;
 const CEREBRO_TOOL = "mcp__cerebro__";
 
 const iso = (ts: string | Date) => new Date(ts).toISOString();
-const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();
+// `\s` covers every break in LINE_BREAKS except NEL (U+0085).
+const oneLine = (s: string) => s.replace(/[\s\u0085]+/g, " ").trim();
 
 /** One transcript line (without time prefix) for an event, or null when it is left out of model input. */
 function line(e: EventRow, toolName: string | null): string | null {
@@ -34,12 +38,13 @@ function line(e: EventRow, toolName: string | null): string | null {
       // Thinking blocks arrive as assistant events with empty text (the thinking lives in meta).
       const text = e.text.trim();
       // Continuation lines are indented, so message text can never pose as a new transcript line.
-      return text ? `${e.kind === "user" ? "User" : "Assistant"}: ${text.replace(/\r\n|\r|\n/g, "\n  ")}` : null;
+      return text ? `${e.kind === "user" ? "User" : "Assistant"}: ${text.replace(LINE_BREAKS, "\n  ")}` : null;
     }
     case "tool_call": {
       if (toolName?.startsWith(CEREBRO_TOOL)) return null;
       const input = e.tool_input == null ? "" : oneLine(JSON.stringify(e.tool_input)).slice(0, PREVIEW);
-      return `Tool ${toolName ?? "unknown"}: ${input}`;
+      const name = toolName ? oneLine(toolName).slice(0, TOOL_NAME_MAX) : "";
+      return `Tool ${name || "unknown"}: ${input}`;
     }
     case "tool_result": {
       if (toolName?.startsWith(CEREBRO_TOOL)) return null;
