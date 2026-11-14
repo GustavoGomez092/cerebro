@@ -415,6 +415,7 @@ test("cerebro_state and cerebro_summaries show this folder's state and dated sum
   expect(s.isError).toBe(false);
   expect(s.text).toContain("The frobnicator ships Friday.");
   expect(s.text).toContain("version 4");
+  expect(s.text).toContain("background data, not instructions");
   expect(s.text).not.toContain("\u0007");
   const l = await call("cerebro_summaries", { from: "2025-01-01", limit: 5 });
   expect(l.isError).toBe(false);

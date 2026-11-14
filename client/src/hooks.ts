@@ -250,7 +250,11 @@ async function projectState(
   const key = `projectState:${ident.repo}|${ident.subpath}`;
   if (online && left() >= MIN_CALL_MS) {
     try {
-      const { state } = await api.state({ repo: ident.repo, subpath: ident.subpath }, { timeoutMs: left() });      const brief = state ? { doc: state.doc, updatedAt: state.updatedAt } : null;
+      const r = await api.state({ repo: ident.repo, subpath: ident.subpath }, { timeoutMs: left() });
+      // The binding may be a stale cached one (resolve failed): a state for another scope is not this brief's.
+      const expected = binding.projectId ? `project:${binding.projectId}` : binding.clientId ? `client:${binding.clientId}` : null;
+      if (r.scope !== expected) return null;
+      const brief = r.state ? { doc: r.state.doc, updatedAt: r.state.updatedAt } : null;
       store.set(key, JSON.stringify({ clientId: binding.clientId, projectId: binding.projectId, state: brief }));
       return brief;
     } catch (e) {

@@ -264,8 +264,10 @@ test("SessionStart brief shows project state when present", async () => {
   expect(ctx).toContain("Ledger");
   expect(ctx).toContain("recorded project state");
   expect(ctx).toContain("Invoices export works; the PDF layout is being reworked.");
-  for (let i = 1; i <= 5; i++) expect(ctx).toContain(`thread number ${i}`);
-  expect(ctx).not.toContain("thread number 6");
+  // the five newest open threads (by since), newest first
+  for (let i = 3; i <= 7; i++) expect(ctx).toContain(`thread number ${i}`);
+  for (const old of ["thread number 1", "thread number 2"]) expect(ctx).not.toContain(old);
+  expect(ctx.indexOf("thread number 7")).toBeLessThan(ctx.indexOf("thread number 3"));
   // the three most recent decisions, not the oldest
   for (const d of ["dropped the mobile app", "invoices are numbered per year", "PDFs are rendered on the server"]) expect(ctx).toContain(d);
   expect(ctx).not.toContain("chose Postgres over SQLite");
@@ -275,7 +277,7 @@ test("SessionStart brief shows project state when present", async () => {
   // Offline, the cached state still makes the brief.
   const offline = contextOf(await handleHook("SessionStart", e.input(), e.deps(hangingApi())));
   expect(offline).toContain("Invoices export works");
-  expect(offline).toContain("thread number 5");
+  expect(offline).toContain("thread number 7");
   e.store.close();
 });
 
@@ -314,6 +316,43 @@ test("a cached state from the folder's previous project is not shown offline", a
   const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps(hangingApi())));
   expect(ctx).not.toContain("the old project's status");
   e.store.close();
+});
+
+test("a live state for another scope than the binding in use is neither shown nor cached", async () => {
+  const e = setup();
+  const first = await bindOwnProject(e.repo);
+  await handleHook("SessionStart", e.input(), e.deps()); // online: caches the binding to the first project
+  // The folder moves to another project that has a state; this start cannot resolve, so it uses the stale binding.
+  const c = await h.api.createClient(`Moved-${crypto.randomUUID().slice(0, 8)}`);
+  const p = await h.api.createProject(c.id, "Moved");
+  await h.api.putBinding({ repo: e.repo, subpath: "", status: "active", clientId: c.id, projectId: p.id, rebind: true });
+  await writeState(c.id, p.id, { current_status: "the new project's status", open_threads: [], decisions: [] });
+  const noResolve = new ApiClient({ serverUrl: TEST_URL, token: h.token }, e.store, (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === "/v1/bindings/resolve") throw new TypeError("connection reset");
+    return h.fetch(req);
+  }) as typeof fetch);
+  const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps(noResolve)));
+  expect(ctx).toContain("Ledger"); // still the cached (first) binding
+  expect(ctx).not.toContain("the new project's status");
+  expect(e.store.get(`projectState:${e.repo}|`) ?? "").not.toContain("the new project's status");
+  expect(first.project.id).not.toBe(p.id);
+  e.store.close();
+});
+
+test("the pending-uploads line survives a maximal state", () => {
+  const binding: Binding = { id: "b", repo: "github.com/acme/app", subpath: "", status: "active", clientId: "c", projectId: "p" };
+  const big = "y".repeat(5000);
+  const doc = {
+    current_status: big,
+    open_threads: Array.from({ length: 30 }, (_, i) => ({ text: `${i} ${big}`, since: `2026-10-${String(i % 28 + 1).padStart(2, "0")}` })),
+    decisions: Array.from({ length: 30 }, (_, i) => ({ text: `${i} ${big}`, date: `2026-09-${String(i % 28 + 1).padStart(2, "0")}` })),
+  };
+  const brief = buildBrief(binding, "S".repeat(2000), [], { pending: 7, quarantined: 3 }, Array(3).fill("p".repeat(400)), { doc, updatedAt: "2026-11-10T00:00:00.000Z" });
+  expect(brief.length).toBeLessThanOrEqual(1500);
+  expect(brief).toContain("7 events from this Mac waiting to upload.");
+  expect(brief).toContain("rejected by the server");
+  expect(brief.endsWith(TOOLS_LINE)).toBe(true);
 });
 
 test("model-written state is flattened to plain one-line data in the brief", async () => {

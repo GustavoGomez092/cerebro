@@ -24,7 +24,7 @@ Cerebro records Claude Code work into a searchable memory, grouped by client and
    - If the folder is not a git repo (or `git log` fails), skip `git log` and work from the docs alone. Otherwise run `git log --since="12 months ago" --date=short --pretty='%ad %s' | head -400` in the folder.
    - Read the README and the main docs briefly (for example `README*`, `CHANGELOG*`, `docs/`). Never read or open secrets files while doing this: `.env` and `.env.*`, `*.pem`, `*.key`, `id_rsa`-style keys, `credentials*`, `secrets*`, or anything that looks like it holds passwords or tokens.
    - Write at most 1500 words of plain prose covering: what the project is, how it got here, key decisions with dates, current state, open questions. Only what the log and docs show; no guesses, and no secrets even if you saw one.
-   - Call `cerebro_save_history` with `title` (for example "<project>: history to <today>"), `text`, `from` (the oldest date the history covers, such as the first `git log` date) and `to` (today), both as YYYY-MM-DD.
+   - Call `cerebro_save_history` with `title` (for example "<project>: history to <today>"), `text`, `from` (the oldest date covered: the last line of the `git log` output, which lists newest first; without git, the oldest date the docs show) and `to` (today), both as YYYY-MM-DD.
    - Tell the user the project history is saved in Cerebro. If the call says the folder is not bound or is declined, tell the user that instead and do not retry.
 
 ## Changing an existing binding or declining a bound folder

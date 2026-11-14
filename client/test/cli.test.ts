@@ -182,6 +182,8 @@ test("the skill names cerebro_save_history after binding", () => {
   for (const part of ["what the project is", "how it got here", "key decisions with dates", "current state", "open questions"]) expect(step).toContain(part);
   expect(step).toContain("`cerebro_save_history`");
   for (const arg of ["`title`", "`text`", "`from`", "`to`"]) expect(step).toContain(arg);
+  // git log lists newest first: the period starts at its last line
+  expect(step).toContain("`from` (the oldest date covered: the last line of the `git log` output");
   expect(step).toMatch(/tell the user/i);
   // a folder without git history still gets a history, from its docs alone
   expect(step).toMatch(/not a git repo[^.]*skip `git log`/i);

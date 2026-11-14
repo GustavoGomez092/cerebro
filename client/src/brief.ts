@@ -52,27 +52,28 @@ const field = (x: unknown, k: string): unknown => (x && typeof x === "object" ? 
 /** The state's status, newest decisions and first open threads as plain lines; null when it has none of them. */
 function stateLines(doc: unknown): { status: string; threads: string[]; decisions: string[] } | null {
   const status = plainLine(field(doc, "current_status"), 400);
-  const threads = list(field(doc, "open_threads"))
-    .map((t) => {
-      const text = plainLine(typeof t === "string" ? t : field(t, "text"), 200);
-      const since = plainLine(field(t, "since"), 20);
-      return text && since ? `${text} (since ${since})` : text;
-    })
-    .filter(Boolean)
-    .slice(0, MAX_THREADS);
-  const decisions = list(field(doc, "decisions"))
-    .map((d, i) => ({ text: plainLine(typeof d === "string" ? d : field(d, "text"), 200), date: plainLine(field(d, "date"), 20), i }))
-    .filter((d) => d.text)
-    // Newest first by date; undated ones count as oldest, and later entries win ties.
-    .sort((a, b) => (a.date === b.date ? b.i - a.i : a.date < b.date ? 1 : -1))
-    .slice(0, MAX_DECISIONS)
+  const threads = newest(dated(field(doc, "open_threads"), "since"), MAX_THREADS)
+    .map((t) => (t.date ? `${t.text} (since ${t.date})` : t.text));
+  const decisions = newest(dated(field(doc, "decisions"), "date"), MAX_DECISIONS)
     .map((d) => (d.date ? `${d.date}: ${d.text}` : d.text));
   return status || threads.length || decisions.length ? { status, threads, decisions } : null;
 }
 
+/** A state list's `{text, <dateKey>}` items (or plain strings) as plain lines, keeping their position. */
+function dated(v: unknown, dateKey: string): { text: string; date: string; i: number }[] {
+  return list(v)
+    .map((x, i) => ({ text: plainLine(typeof x === "string" ? x : field(x, "text"), 200), date: plainLine(field(x, dateKey), 20), i }))
+    .filter((x) => x.text);
+}
+
+/** The `max` newest items by date; undated ones count as oldest, and later entries win ties. */
+function newest<T extends { date: string; i: number }>(xs: T[], max: number): T[] {
+  return xs.sort((a, b) => (a.date === b.date ? b.i - a.i : a.date < b.date ? 1 : -1)).slice(0, max);
+}
+
 /**
- * The SessionStart context for a bound folder: binding, problems, then the project state when there is one
- * (else recent sessions), upload queue, recall tools. ≤ 1500 chars.
+ * The SessionStart context for a bound folder: binding, problems, upload queue, then the project state when
+ * there is one (else recent sessions), recall tools. ≤ 1500 chars.
  */
 export function buildBrief(
   binding: Binding,
@@ -90,6 +91,8 @@ export function buildBrief(
     lines.push(`Problem: ${queue.quarantined} event${queue.quarantined === 1 ? " was" : "s were"} rejected by the server and set aside (see \`~/.cerebro/bin/cerebro status\`).`);
   }
   for (const p of problems) lines.push(`Problem: ${clip(p, 300)}`);
+  // Before the state or session list too, so a long state can never clip it away.
+  if (queue.pending > 0) lines.push(`${queue.pending} event${queue.pending === 1 ? "" : "s"} from this Mac waiting to upload.`);
 
   const where = binding.projectId ? "this project" : binding.clientId ? "this client" : "all clients";
   const s = state ? stateLines(state.doc) : null;
@@ -107,7 +110,6 @@ export function buildBrief(
       lines.push(`- ${when(r.startedAt)} on ${clip(r.machine, 60)}${r.imported ? " (imported)" : ""}`);
     }
   }
-  if (queue.pending > 0) lines.push(`${queue.pending} event${queue.pending === 1 ? "" : "s"} from this Mac waiting to upload.`);
 
   const room = BRIEF_MAX_CHARS - TOOLS_LINE.length - 1;
   return clip(lines.join("\n"), room) + "\n" + TOOLS_LINE;
