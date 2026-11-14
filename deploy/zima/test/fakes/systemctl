@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "systemctl $*" >> "$FAKE_LOG"
+if [[ $1 == is-active ]]; then s=${FAKE_TIMER_STATE:-active}; echo "$s"; [[ $s == active ]]; exit; fi
+exit 0

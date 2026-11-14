@@ -1,0 +1,15 @@
+#!/bin/bash
+# Fake ssh: drops options and the host, maps /DATA and /var/lib/casaos into $FAKE_ROOT, runs the command locally.
+while (($#)); do
+  case $1 in
+    -o|-p|-i|-l|-F) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+host=$1; shift
+cmd="$*"
+cmd=${cmd//\/var\/lib\/casaos\//$FAKE_ROOT/var/lib/casaos/}
+cmd=${cmd//\/DATA\//$FAKE_ROOT/DATA/}
+printf 'ssh %s %s\n' "$host" "$cmd" >> "$FAKE_LOG"
+exec bash -c "$cmd"

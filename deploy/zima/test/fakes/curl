@@ -1,0 +1,17 @@
+#!/bin/bash
+# Fake curl. Server /health is healthy for every tag unless FAKE_HEALTHY_TAGS lists the healthy ones;
+# FAKE_HEALTH_LOCAL / FAKE_HEALTH_LAN override the bodies; /v1/status needs the bearer header on stdin (-H @-).
+echo "curl $*" >> "$FAKE_LOG"
+url=${*: -1}; hdr=
+for a in "$@"; do [[ $a == @- ]] && hdr=$(cat); done
+case $url in
+  http://cerebro.home.lab/health) [[ -n ${FAKE_HEALTH_LAN-} ]] || exit 7; printf '%s' "$FAKE_HEALTH_LAN" ;;
+  */health)
+    if [[ -n ${FAKE_HEALTH_LOCAL-} ]]; then printf '%s' "$FAKE_HEALTH_LOCAL"; exit 0; fi
+    run=$(cat "$FAKE_STATE/running" 2>/dev/null); tag=${run#*:}
+    if [[ -z ${FAKE_HEALTHY_TAGS+x} || " $FAKE_HEALTHY_TAGS " == *" $tag "* ]]; then
+      printf '{"ok":true,"db":true,"apiVersion":1,"instanceId":"%s"}' "${FAKE_INSTANCE:-inst-1}"
+    else exit 7; fi ;;
+  */v1/status) [[ $hdr == "Authorization: Bearer ${FAKE_TOKEN-}" ]] || exit 22; printf '%s' "$FAKE_STATUS" ;;
+  *) exit 6 ;;
+esac

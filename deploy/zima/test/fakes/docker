@@ -1,0 +1,37 @@
+#!/bin/bash
+# Fake docker. State in $FAKE_STATE: `running` = image of cerebro-server, `images` = known tags.
+echo "docker $*" >> "$FAKE_LOG"
+st=$FAKE_STATE
+case $1 in
+  inspect) [[ -s $st/running ]] || { echo "Error: No such object" >&2; exit 1; }; cat "$st/running"; exit 0 ;;
+  image) grep -qxF -- "${*: -1}" "$st/images" 2>/dev/null; exit ;;
+  build) while (($#)); do [[ $1 == -t ]] && echo "$2" >> "$st/images"; shift; done; exit "${FAKE_BUILD_RC:-0}" ;;
+  tag) echo "$3" >> "$st/images"; exit 0 ;;
+  compose)
+    shift; file=; sub=
+    while (($#)); do
+      case $1 in
+        -f|-p|--env-file) [[ $1 == -f ]] && file=$2; shift 2 ;;
+        -*) shift ;;
+        *) sub=$1; shift; break ;;
+      esac
+    done
+    case $sub in
+      up) if [[ " $* " == *" server "* ]]; then
+            img=$(sed -n 's/^ *image: *\(cerebro-server:.*\)$/\1/p' "$file"); echo "$img" > "$st/running"
+            echo "compose-up-server $img" >> "$FAKE_LOG"
+          fi ;;
+      run) [[ "$*" == *migrate* ]] && exit "${FAKE_MIGRATE_RC:-0}" ;;
+    esac
+    exit 0 ;;
+  run)
+    # One-off `ollama pull`: write the model manifest into the mounted models dir.
+    if [[ "$*" == *"ollama pull"* ]]; then
+      v=; prev=; for a in "$@"; do [[ $prev == -v ]] && v=${a%%:*}; prev=$a; done
+      m=$v/models/manifests/registry.ollama.ai/library/bge-m3; mkdir -p "$m"; printf '%s' "$FAKE_MANIFEST" > "$m/latest"
+    fi
+    exit 0 ;;
+  exec) printf '%s\n' "${FAKE_OLLAMA_LIST-}"; exit 0 ;;
+  stats) printf '%s\n' "${FAKE_STATS-}"; exit 0 ;;
+esac
+exit 0
