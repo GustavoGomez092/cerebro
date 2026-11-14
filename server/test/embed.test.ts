@@ -21,7 +21,7 @@ test("ollama embedder posts input and validates dims", async () => {
     return new Response(JSON.stringify({ embeddings: [[1, 2, 3]] }));
   }) as any);
   expect(await ok.embed(["a"])).toEqual([[1, 2, 3]]);
-  expect(body).toEqual({ model: "bge-m3", input: ["a"] });
+  expect(body).toEqual({ model: "bge-m3", input: ["a"], keep_alive: -1 });
 
   const wrongDims = ollamaEmbedder("http://o", "m", 4, (async () => new Response(JSON.stringify({ embeddings: [[1, 2, 3]] }))) as any);
   await expect(wrongDims.embed(["a"])).rejects.toBeInstanceOf(EmbedderError);
@@ -29,4 +29,21 @@ test("ollama embedder posts input and validates dims", async () => {
   await expect(down.embed(["a"])).rejects.toBeInstanceOf(EmbedderError);
   const refused = ollamaEmbedder("http://o", "m", 3, (async () => { throw new TypeError("fetch failed"); }) as any);
   await expect(refused.embed(["a"])).rejects.toBeInstanceOf(EmbedderError);
+});
+
+test("ollama errors are classified: unreachable is transient, timeouts and bad bodies are not", async () => {
+  const refused = ollamaEmbedder("http://o", "m", 3, (async () => { throw new TypeError("Unable to connect"); }) as any);
+  expect(await refused.embed(["a"]).catch((e) => e.transient)).toBe(true);
+  const busy = ollamaEmbedder("http://o", "m", 3, (async () => new Response("", { status: 503 })) as any);
+  expect(await busy.embed(["a"]).catch((e) => e.transient)).toBe(true);
+  const slow = ollamaEmbedder("http://o", "m", 3, ((_u: string, init: any) => new Promise((_r, rej) => {
+    init.signal.addEventListener("abort", () => rej(init.signal.reason));
+  })) as any, 50);
+  const t = await slow.embed(["a"]).catch((e) => e);
+  expect(t).toBeInstanceOf(EmbedderError);
+  expect(t.transient).toBe(false);
+  const garbage = ollamaEmbedder("http://o", "m", 3, (async () => new Response("<html>")) as any);
+  expect(await garbage.embed(["a"]).catch((e) => e.transient)).toBe(false);
+  const nan = ollamaEmbedder("http://o", "m", 3, (async () => new Response(JSON.stringify({ embeddings: [[1, null, 3]] }))) as any);
+  await expect(nan.embed(["a"])).rejects.toBeInstanceOf(EmbedderError);
 });

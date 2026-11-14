@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { chunkEvents, type ChunkInput } from "../src/chunker";
+import { chunkEvents, searchTerms, type ChunkInput } from "../src/chunker";
 
 const e = (seq: number, kind: ChunkInput["kind"], text: string, toolName: string | null = null, toolInput: unknown = null): ChunkInput =>
   ({ seq, ts: new Date(Date.UTC(2026, 10, 1, 12, 0, seq)).toISOString(), kind, text, toolName, toolInput });
@@ -27,9 +27,10 @@ test("starts a new chunk when the next event would overflow", () => {
   expect(chunks.map((c) => [c.firstSeq, c.lastSeq])).toEqual([[1, 1], [2, 2]]);
 });
 
-test("a 200 KB message splits into bounded windows", () => {
+test("a 200 KB message indexes its first 32k chars in bounded windows", () => {
   const chunks = chunkEvents([e(7, "assistant", "x".repeat(200_000))]);
-  expect(chunks.length).toBeGreaterThanOrEqual(125);
+  expect(chunks.length).toBeGreaterThanOrEqual(20);
+  expect(chunks.length).toBeLessThanOrEqual(30);
   for (const c of chunks) {
     expect(c.text.length).toBeLessThanOrEqual(1600);
     expect([c.firstSeq, c.lastSeq]).toEqual([7, 7]);
@@ -45,4 +46,10 @@ test("tool input is truncated", () => {
 test("empty events produce no chunks", () => {
   expect(chunkEvents([e(1, "assistant", "   ")])).toEqual([]);
   expect(chunkEvents([])).toEqual([]);
+});
+
+test("identifiers yield extra search terms", () => {
+  const terms = searchTerms("edited server/src/auth/cookies.ts and chunkEvents in my-file_name").split(" ");
+  expect(terms).toEqual(expect.arrayContaining(["server", "src", "auth", "cookies", "ts", "chunk", "events", "my", "file", "name"]));
+  expect(searchTerms("plain words only")).toBe("");
 });

@@ -50,7 +50,9 @@ export const INGEST_LIMITS = { maxEvents: 2000, maxSessions: 200, maxBodyBytes: 
 
 export interface SearchRequest {
   query: string;
+  /** Folder identity; required unless `scope` is "open". */
   repo?: string;
+  scope?: "open";
   subpath?: string;
   clientId?: string;
   projectId?: string;
@@ -96,4 +98,13 @@ export interface SessionView {
   lastEventAt: string | null;
   endedAt: string | null;
   imported: boolean;
+}
+
+export interface SearchResponse {
+  scope: "project" | "open";
+  /** The most specific binding for the folder (any status), so the client can confirm it. */
+  binding: Binding | null;
+  hits: (SearchHit & { matched: ("fts" | "vec")[]; distance: number | null })[];
+  degraded: boolean;
+  degradedReasons: ("embedder" | "vector_timeout" | "fts_timeout")[];
 }

@@ -1,5 +1,5 @@
 import type { SQL } from "bun";
-import type { Binding } from "@cerebro/shared";
+import { normalizeIdentity, type Binding } from "@cerebro/shared";
 
 export class BindingError extends Error {
   constructor(public code: "invalid" | "conflict" | "not_found", message: string) { super(message); }
@@ -59,11 +59,15 @@ export async function upsertBinding(sql: SQL, input: BindingInput): Promise<Bind
 }
 
 /** The most specific binding for a folder: longest subpath that equals or is a path-boundary prefix. */
-export async function resolveBinding(sql: SQL, repo: string, rawSubpath: string): Promise<Binding | null> {
+export async function resolveBinding(
+  sql: SQL, rawRepo: string, rawSubpath: string, opts: { activeOnly?: boolean } = {},
+): Promise<Binding | null> {
+  const repo = normalizeIdentity(rawRepo);
   const subpath = normalizeSubpath(rawSubpath);
   const rows = await sql.unsafe(
     `select ${COLS} from bindings
      where repo = $1 and (subpath = '' or subpath = $2 or $2 like replace(replace(replace(subpath, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '/%')
+       ${opts.activeOnly ? "and status = 'active'" : ""}
      order by length(subpath) desc limit 1`,
     [repo, subpath],
   );

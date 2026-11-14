@@ -116,3 +116,14 @@ test("status reports queue health", async () => {
     expect(s.embedder).toHaveProperty("lastSuccessAt");
   } finally { await t.drop(); }
 });
+
+test("a 200 KB message embeds end to end", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("huge", binding.id)], events: [ev("huge", 1, "assistant", "z ".repeat(100_000))] });
+    const r = await embedPending(t.sql, fakeEmbedder(), { state: newWorkerState(), limit: 100 });
+    expect(r.failed).toBe(0);
+    expect(r.embedded).toBeGreaterThan(15);
+  } finally { await t.drop(); }
+});
