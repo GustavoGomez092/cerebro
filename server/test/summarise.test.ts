@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, setSystemTime } from "bun:test";
 import { authedApp } from "./helpers";
 import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
@@ -258,11 +258,19 @@ test("a job stopped at the event cap is due again now, not in two hours", async 
   const t = await authedApp();
   try {
     const { job } = await endedSession(t, 6);
-    expect((await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET, maxEvents: 3 })).status).toBe("done");
+    // The app host's clock running ahead of the database's must not push the job into the future.
+    setSystemTime(new Date(Date.now() + 3600_000));
+    try {
+      expect((await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET, maxEvents: 3 })).status).toBe("done");
+    } finally {
+      setSystemTime();
+    }
     const [j] = await t.sql`select covered_seq, due_at, locked_until from summary_jobs where session_id = 's1'`;
     expect(j.covered_seq).toBe(3);
     expect(j.locked_until).toBeNull();
-    expect(Math.abs(j.due_at.getTime() - Date.now())).toBeLessThan(5000);
+    // Due by the database's clock (which claims compare with), not the app host's.
+    const [{ due }] = await t.sql`select due_at <= statement_timestamp() as due from summary_jobs where session_id = 's1'`;
+    expect(due).toBe(true);
   } finally { await t.drop(); }
 });
 
@@ -279,5 +287,64 @@ test("a binding declined after the claim defers without calling claude", async (
     expect(await t.sql`select * from usage_ledger`).toHaveLength(0);
     const [j] = await t.sql`select attempts, locked_until from summary_jobs where session_id = 's1'`;
     expect(j).toEqual({ attempts: 0, locked_until: null });
+  } finally { await t.drop(); }
+});
+
+test("timeouts count as attempts, dead-letter after five, and charge their estimated spend", async () => {
+  const t = await authedApp();
+  try {
+    let { job } = await endedSession(t);
+    const slow = (input: ClaudeInput) => fakeRun("slow")({ ...input, timeoutMs: 200 });
+    for (let i = 1; i <= 5; i++) {
+      expect(await summariseJob(t.sql, t.embedder, job, { run: slow, budget: BUDGET }))
+        .toMatchObject({ status: "failed", reason: "timeout" });
+      const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+      expect(j).toEqual({ attempts: i, dead: i === 5 });
+      if (i < 5) job = await reclaim(t);
+    }
+    const rows = await t.sql`select tokens, kind from usage_ledger`;
+    expect(rows).toHaveLength(5);
+    for (const r of rows) {
+      expect(r.kind).toBe("summary");
+      expect(r.tokens).toBeGreaterThan(4000);
+    }
+    expect(await t.sql`select 1 from summaries`).toHaveLength(0);
+  } finally { await t.drop(); }
+});
+
+test("a stop signal ends a job between pieces and frees it for the next run", async () => {
+  const t = await authedApp();
+  try {
+    const { job } = await endedSession(t, 8);
+    const stop = new AbortController();
+    let calls = 0;
+    const run = async (input: ClaudeInput) => { calls++; stop.abort(); return fakeRun("ok")(input); };
+    expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET, maxChars: 120, signal: stop.signal }))
+      .toMatchObject({ status: "deferred", reason: "stopped" });
+    expect(calls).toBe(1);
+    expect(await t.sql`select 1 from summaries`).toHaveLength(1); // the paid-for piece is kept
+    const [j] = await t.sql`select attempts, locked_until from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ attempts: 0, locked_until: null });
+    const next = await claimSummaryJob(t.sql);
+    expect(next?.coveredSeq).toBeGreaterThan(0); // resumes after the stored piece
+  } finally { await t.drop(); }
+});
+
+test("a call killed by a stop is not counted as a failure", async () => {
+  const t = await authedApp();
+  try {
+    const { job } = await endedSession(t);
+    const stop = new AbortController();
+    const run = async (input: ClaudeInput) => {
+      setTimeout(() => stop.abort(), 100);
+      return fakeRun("slow")({ ...input, signal: stop.signal });
+    };
+    const started = Date.now();
+    expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET, signal: stop.signal }))
+      .toMatchObject({ status: "deferred", reason: "stopped" });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ attempts: 0, dead: false });
+    expect((await t.sql`select tokens from usage_ledger`)[0]?.tokens).toBeGreaterThan(4000);
   } finally { await t.drop(); }
 });

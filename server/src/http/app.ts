@@ -4,6 +4,7 @@ import type { SQL } from "bun";
 import { bearerAuth, type Machine } from "../auth";
 import type { Embedder } from "../embed/embedder";
 import type { EmbedGate, WorkerState } from "../worker";
+import type { SummariserState } from "../summarise/loop";
 import { pgState } from "../db";
 import { statusRoutes } from "./routes/status";
 import { catalogRoutes } from "./routes/catalog";
@@ -21,6 +22,8 @@ export interface AppDeps {
   embedder: Embedder;
   gate?: EmbedGate;
   workerState?: WorkerState;
+  /** The summariser's live state and budget, for /v1/status. */
+  summariser?: { state: SummariserState; budget: { share: number; windowTokens: number } };
   /** Structured log sink (one JSON line per request); defaults to stdout. */
   log?: (line: string) => void;
 }

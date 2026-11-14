@@ -3,7 +3,7 @@ import { redactSecrets, storable } from "@cerebro/shared";
 import { toVector, type Embedder } from "../embed/embedder";
 import { budgetState, canSpend, estimateTokens, record } from "./budget";
 import type { runClaude } from "./claude";
-import { completeSummaryJob, failSummaryJob } from "./jobs";
+import { completeSummaryJob, failSummaryJob, releaseSummaryJob } from "./jobs";
 import { SUMMARY_SCHEMA, summaryRequest } from "./prompts";
 import { renderRange, type EventRow } from "./render";
 import { markScopesDirty, scopeKey } from "./state";
@@ -30,9 +30,15 @@ export interface SummariseDeps {
   maxChars?: number;
   /** Events loaded per job (default 2000); a job stopped at the cap is due again at once. */
   maxEvents?: number;
+  /**
+   * Stop request (shutdown): checked between pieces. A call that fails once it is set (killed by the
+   * caller's shutdown deadline) is not held against the job.
+   */
+  signal?: AbortSignal;
 }
 
-export type SummariseReason = "budget" | "usage_limit" | "login" | "timeout" | "binding" | "bad_output" | "failed";
+export type SummariseReason =
+  | "budget" | "usage_limit" | "login" | "timeout" | "binding" | "bad_output" | "failed" | "stopped";
 
 export interface SummariseResult {
   status: "done" | "deferred" | "failed";
@@ -99,8 +105,15 @@ export function summaryEmbedText(row: { title: string; body: { overview?: string
   return [row.title, row.body.overview ?? "", ...(row.body.facts ?? [])].filter(Boolean).join("\n");
 }
 
-/** Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it). */
-export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<void> {
+/**
+ * Embeds `text`, the summaryEmbedText of summary `id`, and stores the vector only if the summary still
+ * yields that text: a history replaced while its old text was being embedded must not get the old vector.
+ * The row is share-locked while checking and writing, so a replacement in flight either commits first
+ * (and the check fails) or waits for this write and then deletes the vector itself.
+ * Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it; the
+ * summariser loop retries later). True when the vector was stored.
+ */
+export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<boolean> {
   const ctl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -111,11 +124,17 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
       }, EMBED_TIMEOUT_MS);
     });
     const [vec] = await Promise.race([embedder.embed([text], ctl.signal), timeout]);
-    await sql`
-      insert into summary_embeddings (summary_id, embedding) values (${id}, ${toVector(vec)}::text::halfvec)
-      on conflict (summary_id) do update set embedding = excluded.embedding`;
+    return await sql.begin(async (tx) => {
+      const [row] = await tx`select title, body from summaries where id = ${id} for share`;
+      if (!row || summaryEmbedText(row) !== text) return false;
+      await tx`
+        insert into summary_embeddings (summary_id, embedding) values (${id}, ${toVector(vec)}::text::halfvec)
+        on conflict (summary_id) do update set embedding = excluded.embedding`;
+      return true;
+    });
   } catch {
-    // un-embedded; nothing queued
+    // un-embedded; the loop's sweep retries
+    return false;
   } finally {
     clearTimeout(timer);
   }
@@ -127,8 +146,9 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
  * completed, so a crash or a later deferral resumes after the last stored piece.
  *
  * - "done": everything loaded is covered; the job is completed (due again now if the event cap was hit).
- * - "deferred": budget, usage limit, login, timeout or an inactive binding; no attempt is counted.
- * - "failed": bad model output or another failure (including a store error); counts towards dead-lettering.
+ * - "deferred": budget, usage limit, login, an inactive binding or a stop request; no attempt is counted.
+ * - "failed": timeout, bad model output or another failure (including a store error); counts towards
+ *   dead-lettering. A timed-out (killed) call is charged its estimated tokens.
  */
 export async function summariseJob(
   sql: SQL,
@@ -154,6 +174,11 @@ export async function summariseJob(
     await failSummaryJob(sql, sessionId, error, { retryable: false });
     return result("failed", { reason });
   };
+  /** Stopped part-way (shutdown): stored pieces stay; the job is free and due as before, no attempt counted. */
+  const stopped = async () => {
+    await releaseSummaryJob(sql, sessionId);
+    return result("deferred", { reason: "stopped", until: null });
+  };
   const bindingActive = async () =>
     (await sql`
       select 1 from sessions s join bindings b on b.id = s.binding_id
@@ -170,6 +195,7 @@ export async function summariseJob(
   }
 
   for (const piece of renderRange(events, deps.maxChars)) {
+    if (deps.signal?.aborted) return stopped();
     // Checked before every call, so nothing is spent on a folder that was declined meanwhile.
     if (!(await bindingActive())) return defer("binding", "binding is not active", null);
 
@@ -178,13 +204,18 @@ export async function summariseJob(
       return defer("budget", "over budget", state.resumesAt ?? new Date(Date.now() + RETRY_LATER_MS));
     }
 
-    const run = await deps.run({ ...summaryRequest(piece), schema: SUMMARY_SCHEMA });
+    const req = summaryRequest(piece);
+    const run = await deps.run({ ...req, schema: SUMMARY_SCHEMA });
     if (!run.ok) {
+      // A killed call reports no usage, but it may have spent: charge its estimate so the budget sees it.
+      if (run.kind === "timeout") await record(sql, estimateTokens(req.systemPrompt.length + req.prompt.length), "summary");
+      if (deps.signal?.aborted) return stopped();
       const error = `${run.kind}: ${run.message}`;
       const later = run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS);
       if (run.kind === "usage_limit") return defer("usage_limit", error, later);
       if (run.kind === "auth") return defer("login", error, later);
-      if (run.kind === "timeout") return defer("timeout", error, later);
+      // A job that keeps timing out must dead-letter like any failing job, not retry forever.
+      if (run.kind === "timeout") return fail("timeout", error);
       return fail(run.kind === "bad_output" ? "bad_output" : "failed", error);
     }
     credentialExpiresAt = run.credentialExpiresAt;
@@ -232,6 +263,6 @@ export async function summariseJob(
   }
 
   const hitCap = events.length >= maxEvents;
-  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, hitCap ? { dueAt: new Date() } : {});
+  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, { dueNow: hitCap });
   return result("done");
 }

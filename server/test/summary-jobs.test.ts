@@ -249,3 +249,18 @@ test("failure messages with NUL, lone surrogates or great length are still recor
     expect(j.last_error).not.toContain("\u0000");
   } finally { await t.drop(); }
 });
+
+test("a completion can leave the job due now by the database's clock", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: [sess("s", binding.id)], events: msgs("s", 1, 6) });
+    await endSession(t.sql, "s", new Date().toISOString());
+    const job = await claimSummaryJob(t.sql);
+    await completeSummaryJob(t.sql, "s", 3, { dueNow: true });
+    const [j] = await t.sql`select covered_seq, locked_until, due_at <= now() as due from summary_jobs where session_id = 's'`;
+    expect(job?.sessionId).toBe("s");
+    expect(j).toEqual({ covered_seq: 3, locked_until: null, due: true });
+    expect((await claimSummaryJob(t.sql))?.sessionId).toBe("s");
+  } finally { await t.drop(); }
+});
