@@ -144,8 +144,11 @@ first_run_setup() {
   fi
   [[ -n $pw ]] || { echo "secrets: db.env has no POSTGRES_PASSWORD" >&2; return 1; }
   if [[ ! -s $secrets/server.env ]]; then
+    # Written once: every setting after DATABASE_URL has the same default in server/src/config.ts, so an older
+    # server.env without them still starts. SUMMARISER_ENABLED takes true/false/1/0/yes/no/on/off only.
     printf '%s\n' "DATABASE_URL=postgres://cerebro:$pw@cerebro-db:5432/cerebro" SUMMARY_SHARE=0.2 \
-      SUBSCRIPTION_TOKENS_PER_5H=2000000 SUMMARISER_ENABLED=true | secret_write "$secrets/server.env"
+      SUBSCRIPTION_TOKENS_PER_5H=2000000 SUMMARISER_ENABLED=true \
+      "# SUMMARISER_CMD=claude (set in the image; the CLI pinned in server/Dockerfile)" | secret_write "$secrets/server.env"
     echo "secrets: wrote server.env"
   fi
   chown root:root "$secrets/db.env" "$secrets/server.env"

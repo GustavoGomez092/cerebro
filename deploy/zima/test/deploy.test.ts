@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { loadConfig } from "../../../server/src/config";
 
 const DEPLOY = join(import.meta.dir, "..", "..");
 
@@ -96,6 +97,19 @@ describe("deploy.sh", () => {
     expect(r.err).toContain("bun test");
     expect(s.calls()).toContain("bun test");
     expect(s.calls()).not.toContain("ssh ");
+  });
+
+  test("the first-run server.env, and an older one without the summariser settings, both load at startup", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"]);
+    expect(r.code, show(r)).toBe(0);
+    const env = (lines: string[]) =>
+      Object.fromEntries(lines.filter((l) => l && !l.startsWith("#")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+    const written = env(readFileSync(join(s.app("secrets"), "server.env"), "utf8").split("\n"));
+    // Every value deploy.sh writes must be one loadConfig accepts (SUMMARISER_ENABLED rejects unknown words).
+    expect(loadConfig(written).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
+    // server.env is written only on the first deploy: one from before plan 3 has DATABASE_URL alone.
+    expect(loadConfig({ DATABASE_URL: written.DATABASE_URL }).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
   });
 
   test("a later run without secrets on the server asks for --first-run", () => {
