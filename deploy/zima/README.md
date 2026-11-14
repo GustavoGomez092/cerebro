@@ -37,13 +37,60 @@ never retry quickly and never open parallel connections).
    ```
    `check.sh` fails `summariser` with "Claude login expired" when it has to be repeated, and with "Claude CLI
    unavailable / outage" while the CLI is missing or the API is unreachable (the summariser probes and resumes by
-   itself; a budget or usage-limit pause is normal deferral and only reported).
-5. **A token per Mac**, created on the server in a plain terminal (never inside a recorded Claude Code session:
-   the token is printed once):
+   itself; a budget or usage-limit pause is normal deferral and only reported). The server probes the CLI when it
+   starts, so until this login is made `/v1/status` shows `paused.reason: "login"` and `check.sh` fails.
+
+   **Smoke call** (right after the login, before anything else): one tiny real summary call through the server's
+   own `runClaude`, summary prompt and schema check, as user `cerebro`. It prints `ok: …` (model, tokens, login
+   expiry) or `FAIL <class>: …` with what to do, and exits 1 on a failure; it never prints the prompt, the
+   answer or any credential (the tokens are charged to the summariser's budget):
    ```sh
-   ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token create <mac-name>
+   ssh zima sudo docker exec -u cerebro cerebro-server bun --no-install server/src/cli.ts claude-smoke
    ```
-   Then on that Mac: `claude plugin install cerebro@cerebro` (URL `http://cerebro.home.lab`, that token).
+   - `FAIL auth`: the login didn't take; repeat the login above.
+   - `FAIL bad_output` or `FAIL failed`: the pinned CLI (`CLAUDE_CODE_VERSION` in `server/Dockerfile`) answers in a
+     shape the server doesn't read. Stop here: every summary would fail the same way. Bump the pin (to a release
+     at least two weeks old), redeploy, log in if asked, and run the smoke call again.
+   - `FAIL unavailable` / `FAIL timeout`: CLI missing or network/API down; `docker logs cerebro-server`, retry.
+
+   On `ok`, restart the server so its start-up probe sees the new login at once (otherwise the login pause lifts
+   by itself within 15 minutes): `ssh zima sudo docker restart cerebro-server`.
+5. **The Macs.** The client is a Claude Code plugin served from the private GitHub repo
+   `GustavoGomez092/cerebro`: the marketplace (`.claude-plugin/marketplace.json`, read from the repo's default
+   branch, `main`) points at the `plugin-dist` branch, which `scripts/release-plugin.sh` publishes.
+   1. **Publish the repo (once, before the first release).** This repo has no remote until the owner creates the
+      private GitHub repo; doing so is what creates the `origin` remote that `scripts/release-plugin.sh` pushes to
+      (it refuses any `origin` other than `GustavoGomez092/cerebro`). From the main checkout, with the release
+      merged into `main`:
+      ```sh
+      gh repo create GustavoGomez092/cerebro --private --source . --remote origin
+      git push -u origin main
+      ```
+   2. **Release the plugin** (after step 1; again for every client change, with a new version). From a clean
+      checkout of `main`, with the dev Postgres up (the script runs `bun test` first and refuses on a failure, a
+      dirty tree, an existing `plugin-v<version>` tag, or an `origin` that isn't the repo above):
+      ```sh
+      docker compose -f docker-compose.dev.yml up -d --wait db
+      scripts/release-plugin.sh 0.1.0 --dry-run   # preview: prints every step, changes nothing
+      scripts/release-plugin.sh 0.1.0
+      ```
+      It compiles the arm64 and x64 binaries, writes the version into `plugin.json`, and force-pushes `plugin/`
+      as a single commit on `plugin-dist` with the tag `plugin-v0.1.0` (atomically). Check it landed:
+      `git ls-remote origin plugin-dist refs/tags/plugin-v0.1.0` lists both.
+   3. **A token per Mac**, created on the server in a plain terminal (never inside a recorded Claude Code session:
+      the token is printed once):
+      ```sh
+      ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token create <mac-name>
+      ```
+   4. **On each Mac** (the repo is private, so git needs your GitHub login first):
+      ```sh
+      gh auth login && gh auth setup-git
+      claude plugin marketplace add GustavoGomez092/cerebro
+      claude plugin install cerebro@cerebro       # asks for the server URL (http://cerebro.home.lab) and that token
+      ```
+      Then start a Claude Code session in any folder (the session start creates `~/.cerebro/bin/cerebro`) and run
+      `~/.cerebro/bin/cerebro status`: it shows the server and no block. `~/.cerebro/bin/cerebro retention` keeps
+      transcripts until they are imported (see the top-level README, "Install on a Mac").
 6. **Backup timer** (the deploy refreshes the scripts and the unit files in `zima/`, not the installed units;
    repeat this when `systemd/` changes):
    ```sh
@@ -65,7 +112,29 @@ never retry quickly and never open parallel connections).
    ssh zima "sudo rsync <the script's options> -n --itemize-changes <its excludes> <its sources> /tmp/rsync-probe/ | grep -c 'AppData/cerebro/data/'"   # 0
    ```
    Then record it in the `operating-zima-home-server` skill (Backups row).
-8. **Check**: `deploy/zima/check.sh` prints `ALL OK` (warnings don't fail it) or `FAILED: <names>`.
+8. **Check**: `deploy/zima/check.sh` prints `ALL OK` (warnings don't fail it) or `FAILED: <names>`. After the
+   first real session ends, `summariser` should read `running` with no `(last error: summary: bad_output)` and
+   `summariser-jobs` `dead 0`.
+
+## Maintenance on Zima
+
+The database has no published port, so the maintenance CLI runs inside the server container (as its user,
+`cerebro`, with its `DATABASE_URL`). From a terminal on the Mac, in a plain terminal (not inside a recorded Claude
+Code session: tokens and redaction patterns would be recorded):
+
+```sh
+ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts requeue-dead                # dead chunks and dead summary jobs
+ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts requeue-dead-summaries      # dead summary jobs only
+ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts requeue-missing-embeddings  # after restoring a dump
+ssh zima "sudo docker exec cerebro-server bun --no-install server/src/cli.ts redact <session-id> '<regex>'"  # scrub a leaked secret
+ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts migrate                     # apply migrations (the server also does at start)
+ssh zima sudo docker exec -u cerebro cerebro-server bun --no-install server/src/cli.ts claude-smoke     # one real summary call (see step 4)
+ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token list           # also: token create|revoke <mac-name>
+```
+
+`redact` takes the session id (from `/v1/sessions` or the search hit) and an optional extra regex; the outer double
+quotes keep the single-quoted regex intact through ssh. Requeue dead summary jobs only after fixing their cause
+(`check.sh` shows the last error; `claude-smoke` shows the class): otherwise they dead-letter again.
 
 ## Upgrades and rollback
 
@@ -149,17 +218,40 @@ From a terminal on the Mac (`<dump>` = e.g. `/DATA/Backup/cerebro/nightly/2026-1
    your ssh user and fails with "Permission denied".)
    If `pg_restore` stops with an error, fix the cause and repeat step 2 from `dropdb` (never start the server on
    a partial restore).
-3. Start the server (it applies any newer migrations at start-up): `ssh zima sudo docker start cerebro-server`
+3. Start the server (it applies any newer migrations at start-up, and re-applies the database-level
+   `statement_timeout` and `idle_in_transaction_session_timeout`, which `pg_restore` into a new database drops):
+   `ssh zima sudo docker start cerebro-server`
 4. Nightly dump only: queue the chunks and summaries that have no vector:
    `ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts requeue-missing-embeddings`
-5. `deploy/zima/check.sh`. `instance-id` stays ok (the id lives in the database and comes back with it); the
-   queue shows the re-embedding backlog draining.
+5. `deploy/zima/check.sh`. `instance-id` stays ok (the id lives in the database and comes back with it, and
+   the deploy record still names it); the queue shows the re-embedding backlog draining.
 
-If the whole data dir is gone, run `deploy/zima/deploy.sh --first-run` first (it keeps existing secrets and pulls
-the model again), then restore as above.
+**If the whole data dir is gone** (`/DATA/AppData/cerebro/data`: database, models and the Claude login):
+
+1. `deploy/zima/deploy.sh --first-run` (it keeps the existing secrets, recreates the data dirs and pulls the model
+   again). It starts the server on a new, empty database with a **new** instance id and records that id in
+   `state/instance-id`.
+2. Stop the server at once, so no Mac uploads to the empty instance: `ssh zima sudo docker stop cerebro-server`.
+   A Mac that flushed in between saw the new id and blocked itself (`instance mismatch`); its data stays on the Mac.
+3. Restore as above, steps 2-4 (step 3 starts the server again on the restored database, with the **old** id).
+4. Record the restored id as the deploy's, or `check.sh` fails `instance-id` ("database replaced?") until the
+   next deploy. Two ssh calls, one after the other (never in parallel):
+   ```sh
+   id=$(ssh zima curl -s 127.0.0.1:8790/health | jq -r .instanceId); echo "$id"   # a UUID
+   echo "$id" | ssh zima sudo tee /DATA/AppData/cerebro/state/instance-id
+   ```
+5. Log in to Claude again and run the smoke call (first deploy, step 4): the login lived in `data/claude`.
+6. On any Mac whose brief shows "instance mismatch" (or whose `~/.cerebro/bin/cerebro status` says blocked), run
+   `~/.cerebro/bin/cerebro status --retry`: it clears the block and uploads what is waiting.
+7. `deploy/zima/check.sh`: `instance-id` ok, the queue draining.
 
 ## Troubleshooting
 
+- `check.sh` `summariser-jobs` fails with `dead N`: summary jobs gave up after five failures. The line shows the
+  summariser's last error (e.g. `summary: bad_output`); run `claude-smoke` (see Maintenance) for the class. Fix the
+  cause (a CLI pin whose output the server can't read, a login), then `requeue-dead-summaries`.
+- `check.sh` `summariser` warns "no Claude call has answered since the server started": the start-up probe hasn't
+  succeeded (never logged in, or a CLI failing every call). Run `claude auth status` and `claude-smoke`.
 - `check.sh` `memory`: anon+shmem of each container's limit (page cache doesn't count). A warning about OOM kills
   means a process inside hit the limit and was killed while the container kept running.
 - `deploy.sh` says another deploy holds the lock: wait for it, or remove `/DATA/AppData/cerebro/state/deploy.lock`

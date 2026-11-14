@@ -89,6 +89,10 @@ sessions, so a long import never holds back live summaries or a re-bound folder'
 
 To retry dead summary jobs (for example after fixing whatever made them fail), run
 `bun server/src/cli.ts requeue-dead-summaries`; `requeue-dead` retries both dead chunks and dead summary jobs.
+On the Zima server they run inside the container (`ssh zima sudo docker exec cerebro-server bun --no-install
+server/src/cli.ts requeue-dead-summaries`; see "Maintenance on Zima" in
+[deploy/zima/README.md](deploy/zima/README.md)). `bun server/src/cli.ts claude-smoke` makes one tiny real summary
+call through the server's own runner and prints `ok` or the failure class.
 
 ## Running the server locally
 
@@ -141,6 +145,9 @@ project; anything else may search all clients. Repo spellings are normalised ser
 
 ### Maintenance
 
+Local forms (they need `DATABASE_URL` to reach the database). On the Zima server the database has no published
+port: use the `docker exec` forms in [deploy/zima/README.md](deploy/zima/README.md), "Maintenance on Zima".
+
 ```sh
 DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret from a session, its summaries and project states
 DATABASE_URL=… bun server/src/cli.ts requeue-dead                  # retry dead chunks and dead summary jobs
@@ -153,7 +160,9 @@ embeds chunks (live sessions before imported history) and the vector half of sea
 
 ## Install on a Mac
 
-The client ships as a Claude Code plugin from this (private) repo's `plugin-dist` branch.
+The client ships as a Claude Code plugin from this (private) repo's `plugin-dist` branch. The first time, the
+repo has to be published to GitHub and a release made first: see step 5 of the first deploy in
+[deploy/zima/README.md](deploy/zima/README.md).
 
 ```sh
 gh auth login && gh auth setup-git          # private repo access
@@ -161,8 +170,8 @@ claude plugin marketplace add GustavoGomez092/cerebro
 claude plugin install cerebro@cerebro       # asks for the server URL and token
 ```
 
-Create the token on the server with `bun server/src/cli.ts token create <mac-name>`,
-outside a recorded Claude Code session.
+Create the token on the server, outside a recorded Claude Code session:
+`ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token create <mac-name>`.
 
 A folder's past conversations are imported when you opt it in (the cerebro skill asks in
 each new folder). Claude Code deletes transcripts after 30 days by default, so once it has
