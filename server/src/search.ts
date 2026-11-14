@@ -2,7 +2,7 @@ import type { SQL } from "bun";
 import type { SearchHit, SearchRequest, SearchScope } from "@cerebro/shared";
 import { resolveBinding } from "./bindings";
 import { EmbedderError, type Embedder } from "./embed/embedder";
-import { toVector } from "./indexer";
+import { toVector } from "./embed/embedder";
 
 const CANDIDATES = 50;
 const RRF_K = 60;
