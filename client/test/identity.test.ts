@@ -55,3 +55,15 @@ test("non-git folder is a machine-specific path identity", () => {
 test("a missing cwd never throws", () => {
   expect(folderIdentity("/nope/x", "m").repo).toBe("path:m:/nope/x");
 });
+
+test("GIT_* variables in the environment never redirect git to another repo", () => {
+  const here = repo({ origin: "https://github.com/acme/here.git" });
+  const elsewhere = repo({ origin: "https://github.com/acme/elsewhere.git" });
+  // Bun hands children the environment the process started with, so the variables are set on a fresh process.
+  const script = `import { folderIdentity } from ${JSON.stringify(join(import.meta.dir, "../src/identity.ts"))};
+    console.log(JSON.stringify(folderIdentity(${JSON.stringify(here)}, "m")));`;
+  const r = Bun.spawnSync([process.execPath, "-e", script], {
+    env: { ...process.env, GIT_DIR: join(elsewhere, ".git"), GIT_WORK_TREE: elsewhere },
+  });
+  expect(JSON.parse(r.stdout.toString())).toEqual({ repo: "github.com/acme/here", subpath: "", root: here, isGit: true });
+});

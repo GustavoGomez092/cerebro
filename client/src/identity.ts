@@ -8,6 +8,11 @@ export interface FolderIdentity {
   isGit: boolean;
 }
 
+/** The environment without GIT_* variables (GIT_DIR, GIT_WORK_TREE...), which would point git at another repo. */
+function gitEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
+}
+
 /** Runs one git command in `cwd`; returns trimmed stdout, or null on any failure or timeout. */
 function git(cwd: string, args: string[]): string | null {
   try {
@@ -15,6 +20,7 @@ function git(cwd: string, args: string[]): string | null {
       stdout: "pipe",
       stderr: "ignore",
       timeout: 1000,
+      env: gitEnv(),
     });
     if (r.exitCode !== 0) return null;
     return r.stdout.toString().trim();
