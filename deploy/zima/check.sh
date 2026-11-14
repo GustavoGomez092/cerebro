@@ -10,6 +10,8 @@ command -v jq >/dev/null || die "needs jq"
 BACKUP_MOUNT=/DATA/Backup
 BACKUPS=$BACKUP_MOUNT/cerebro
 TOKEN_FILE=$SECRETS/check.token # the `check` machine token (bun server/src/cli.ts token create check)
+# The server's maintenance CLI, run inside its container (the database has no published port).
+SERVER_CLI="ssh zima sudo docker exec cerebro-server bun --no-install server/src/cli.ts"
 
 FAILED=""
 WARNED=0
@@ -77,7 +79,7 @@ else
   dead=$(jq -r '.queue.dead' <<<"$status")
   oldest=$(jq -r '.queue.oldestPendingSeconds' <<<"$status")
   if ((dead > 0)); then
-    fail queue "pending $pending, dead $dead (retry them: bun server/src/cli.ts requeue-dead)"
+    fail queue "pending $pending, dead $dead (retry them: $SERVER_CLI requeue-dead)"
   else
     ok queue "pending $pending, dead 0, oldest pending ${oldest}s"
   fi
@@ -98,6 +100,9 @@ else
   # budget and usage_limit are normal deferral that ends by itself; disabled is SUMMARISER_ENABLED=false.
   reason=$(jq -r '.summariser.paused.reason // empty' <<<"$status")
   until=$(jq -r '.summariser.paused.until // empty' <<<"$status")
+  # lastError names the failing step and class only ("summary: bad_output"), never model or transcript text.
+  last_error=$(jq -r '.summariser.lastError // empty' <<<"$status")
+  last_run=$(jq -r '.summariser.lastRunAt // empty' <<<"$status")
   if ! jq -e '.summariser | type == "object"' >/dev/null <<<"$status"; then
     warn summariser "not reported by /v1/status"
   elif [[ $reason == login ]]; then
@@ -110,8 +115,22 @@ else
     ok summariser "disabled (SUMMARISER_ENABLED); jobs stay queued"
   elif [[ -n $reason ]]; then
     warn summariser "paused: unknown reason $reason"
+  elif [[ -z $last_run ]]; then
+    # Nothing has answered since the server started: a login never made, or a CLI failing every call.
+    warn summariser "running, but no Claude call has answered since the server started (logged in? ${last_error:+last error: $last_error; }ssh -t zima sudo docker exec -it -u cerebro cerebro-server claude auth status)"
   else
-    ok summariser "running"
+    ok summariser "running${last_error:+ (last error: $last_error)}"
+  fi
+
+  # Summary jobs given up on after five failures that were the session's own fault (bad output, timeouts with
+  # a working CLI). A CLI that breaks every call dead-letters every job within hours without ever pausing.
+  if jq -e '.summariser | type == "object"' >/dev/null <<<"$status"; then
+    summary_dead=$(jq -r '.summariser.backlog.dead // 0' <<<"$status")
+    if ((summary_dead > 0)); then
+      fail summariser-jobs "dead $summary_dead (${last_error:+last error: $last_error; }fix the cause, then: $SERVER_CLI requeue-dead-summaries)"
+    else
+      ok summariser-jobs "dead 0"
+    fi
   fi
 
   gb=$(jq -r '.dbBytes / 1e9 | floor' <<<"$status")

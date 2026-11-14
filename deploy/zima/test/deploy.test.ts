@@ -6,6 +6,9 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, 
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { loadConfig } from "../../../server/src/config";
+import { newSummariserState } from "../../../server/src/summarise/loop";
+import { authedApp } from "../../../server/test/helpers";
+import { boundFolder, ingest, sess } from "../../../server/test/fixtures";
 
 const DEPLOY = join(import.meta.dir, "..", "..");
 
@@ -641,7 +644,10 @@ describe("deploy.sh", () => {
 describe("check.sh", () => {
   const TOKEN = "tok-check-secret-123";
   const healthy = '{"ok":true,"db":true,"apiVersion":1,"instanceId":"inst-1"}';
-  const status = (o: { pending?: number; dead?: number; lastSuccessMinutes?: number | null; paused?: string | null; dbBytes?: number; summariser?: boolean } = {}) =>
+  const status = (o: {
+    pending?: number; dead?: number; lastSuccessMinutes?: number | null; paused?: string | null; dbBytes?: number; summariser?: boolean;
+    summaryDead?: number; lastError?: string | null; lastRunAt?: string | null;
+  } = {}) =>
     JSON.stringify({
       machine: "check",
       queue: { pending: o.pending ?? 0, dead: o.dead ?? 0, oldestPendingSeconds: 0 },
@@ -649,7 +655,15 @@ describe("check.sh", () => {
         lastSuccessAt: o.lastSuccessMinutes === null ? null : new Date(Date.now() - (o.lastSuccessMinutes ?? 10) * 60_000).toISOString(),
         lastError: null, pausedUntil: null,
       },
-      ...(o.summariser === false ? {} : { summariser: { enabled: true, paused: o.paused ? { reason: o.paused, until: null } : null } }),
+      ...(o.summariser === false ? {} : {
+        summariser: {
+          enabled: true, paused: o.paused ? { reason: o.paused, until: null } : null,
+          lastRunAt: o.lastRunAt === undefined ? new Date(Date.now() - 5 * 60_000).toISOString() : o.lastRunAt,
+          lastError: o.lastError ?? null, credentialExpiresAt: null,
+          backlog: { live: 0, imported: 0, dead: o.summaryDead ?? 0 },
+          budget: { used: 0, limit: 400000, resumesAt: null },
+        },
+      }),
       dbBytes: o.dbBytes ?? 5e9,
     });
   const GOOD = {
@@ -785,6 +799,59 @@ describe("check.sh", () => {
     const nul = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: JSON.stringify({ ...JSON.parse(status()), summariser: null }) });
     expect(nul.code, show(nul)).toBe(0);
     expect(nul.out).toMatch(/^warn +summariser +not reported by \/v1\/status/m);
+  });
+
+  test("I1: dead summary jobs fail the check, naming the server-side requeue command", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ summaryDead: 2, lastError: "summary: bad_output" }) });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.out).toMatch(
+      /^FAIL +summariser-jobs +dead 2 \(last error: summary: bad_output; fix the cause, then: ssh zima sudo docker exec cerebro-server bun --no-install server\/src\/cli\.ts requeue-dead-summaries\)$/m);
+    expect(r.out).toContain("FAILED: summariser-jobs");
+    const ok = s.run("check.sh", [], GOOD);
+    expect(ok.out).toMatch(/^ok +summariser-jobs +dead 0$/m);
+  });
+
+  test("I1: a running summariser shows its last error", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ lastError: "summary: bad_output" }) });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^ok +summariser +running \(last error: summary: bad_output\)$/m);
+  });
+
+  test("M9: a running summariser that no Claude call has answered since start warns", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ lastRunAt: null }) });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +summariser +running, but no Claude call has answered since the server started \(logged in\?/m);
+    expect(r.out).toContain("ALL OK (1 warning(s))");
+  });
+
+  test("I1: check.sh reads the server's real /v1/status: dead summary jobs and lastError", async () => {
+    const state = newSummariserState(true);
+    const t = await authedApp({ deps: { summariser: { state, budget: { share: 0.2, windowTokens: 2_000_000 } } } });
+    let real: string;
+    try {
+      const { binding } = await boundFolder(t, { project: "Web" });
+      await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
+      await t.sql`insert into summary_jobs (session_id, attempts, dead, last_error) values ('s1', 5, true, 'bad_output: x')`;
+      state.lastRunAt = new Date().toISOString();
+      state.lastError = "summary: bad_output";
+      real = await (await t.call("GET", "/v1/status")).text();
+    } finally { await t.drop(); }
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: real });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.out).toMatch(/^ok +summariser +running \(last error: summary: bad_output\)$/m);
+    expect(r.out).toMatch(/^FAIL +summariser-jobs +dead 1 /m);
+  });
+
+  test("M6: the dead-chunk hint is the server-side docker exec form", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ dead: 3 }) });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.out).toMatch(
+      /^FAIL +queue +pending 0, dead 3 \(retry them: ssh zima sudo docker exec cerebro-server bun --no-install server\/src\/cli\.ts requeue-dead\)$/m);
   });
 
   test("an idle embedder with an empty queue is fine", () => {
