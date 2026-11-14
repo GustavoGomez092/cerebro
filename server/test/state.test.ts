@@ -8,7 +8,7 @@ import { adoptSessions, moveSession } from "../src/bindings";
 import { endSession } from "../src/ingest";
 import { claimSummaryJob } from "../src/summarise/jobs";
 import { summariseJob } from "../src/summarise/summarise";
-import { record } from "../src/summarise/budget";
+import { budgetState, record } from "../src/summarise/budget";
 import { runClaude, type ClaudeInput } from "../src/summarise/claude";
 import {
   STATE_SCHEMA, markScopesDirty, rebuildState, scopeKey, updateState, type StateDeps,
@@ -56,6 +56,17 @@ async function addSummary(
     returning id`;
   await markScopesDirty(t.sql, [scopeKey(b.clientId, b.projectId)]);
   return BigInt(row.id);
+}
+
+/** Waits until some query in this test database is blocked on a lock; false after ~3 s. */
+async function lockWaitSeen(t: any): Promise<boolean> {
+  for (let i = 0; i < 120; i++) {
+    const [w] = await t.sql`
+      select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`;
+    if (w.n > 0) return true;
+    await Bun.sleep(25);
+  }
+  return false;
 }
 
 const stateRow = async (t: any, scope: string) => (await t.sql`select * from project_states where scope = ${scope}`)[0];
@@ -560,12 +571,7 @@ test("a session move racing the summary store keeps the summary, in the new scop
       await conn.unsafe("begin");
       await conn`update sessions set binding_id = ${target.id} where id = 's1'`;
       const run = summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET });
-      for (let i = 0; i < 400 && !waited; i++) {
-        const [w] = await t.sql`
-          select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`;
-        waited = w.n > 0;
-        if (!waited) await Bun.sleep(25);
-      }
+      waited = await lockWaitSeen(t);
       await conn.unsafe("commit");
       expect(waited).toBe(true);
       expect((await run).status).toBe("done");
@@ -574,6 +580,95 @@ test("a session move racing the summary store keeps the summary, in the new scop
     }
     const rows = await t.sql`select binding_id, client_id, project_id from summaries where session_id = 's1'`;
     expect(rows).toEqual([{ binding_id: target.id, client_id: B.id, project_id: null }]);
+    expect((await stateRow(t, scopeKey(B.id, null))).dirty).toBe(true);
+  } finally { await t.drop(); }
+});
+
+test("a rebuild too big for the budget shrinks to the newest summaries and leaves room for live work", async () => {
+  const t = await authedApp();
+  const rec = join(tmpdir(), `cerebro-state-calls-${crypto.randomUUID()}.jsonl`);
+  const calls = () => (existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").filter(Boolean).length : 0);
+  try {
+    const SMALL = { share: 1, windowTokens: 200_000 };
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const all: bigint[] = [];
+    for (let i = 0; i < 40; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: 1 + (i >> 1), big: true }));
+    // Tokens reported in proportion to the input, as the real CLI does.
+    const run = fakeRun("maxstate", { FAKE_CLAUDE_TOKENS: "input", FAKE_CLAUDE_RECORD: rec });
+
+    const res = await rebuildState(t.sql, scope, { run, budget: SMALL });
+    expect(res.status).toBe("updated"); // finished in one go: no deferral part-way through its own spend
+    const st = await stateRow(t, scope);
+    const used = ids(st);
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.length).toBeLessThan(40);
+    expect(used).toEqual(all.slice(40 - used.length)); // the newest ones
+    expect(calls()).toBe(used.length);
+    const spent = (await budgetState(t.sql, SMALL)).used;
+    expect(spent).toBeLessThanOrEqual(100_000); // at most half the window
+
+    // The summaries left out are not folded in afterwards, one costly call at a time.
+    expect((await updateState(t.sql, scope, [], { run, budget: SMALL })).status).toBe("updated");
+    expect(calls()).toBe(used.length);
+
+    // Live work still fits in the same window.
+    const live = await addSummary(t, binding, { title: "Live", day: 25, big: true });
+    expect((await updateState(t.sql, scope, [live], { run, budget: SMALL })).status).toBe("updated");
+    expect(ids(await stateRow(t, scope))).toContain(live);
+
+    // A rebuild whose estimate exceeds what remains does not start at all.
+    await record(t.sql, 150_000, "summary");
+    const n = calls();
+    expect(await rebuildState(t.sql, scope, { run, budget: SMALL })).toMatchObject({ status: "deferred", reason: "budget" });
+    expect(calls()).toBe(n);
+  } finally {
+    if (existsSync(rec)) rmSync(rec);
+    await t.drop();
+  }
+});
+
+test("adopt and move wait for a re-bind of their target and use its new scope", async () => {
+  const t = await authedApp();
+  try {
+    const { binding: root } = await boundFolder(t, { client: "Acme" });
+    const B = await (await t.call("POST", "/v1/clients", { name: "Beta" })).json();
+    const C = await (await t.call("POST", "/v1/clients", { name: "Gamma" })).json();
+    await ingest(t, {
+      sessions: [sess("s1", root.id, { subpath: "apps/web" }), sess("s2", root.id, { subpath: "apps/web" })], events: [],
+    });
+    const s1 = await addSummary(t, root, { title: "Web one", day: 1, sessionId: "s1" });
+    const s2 = await addSummary(t, root, { title: "Web two", day: 2, sessionId: "s2" });
+    const web = (await (await t.call("PUT", "/v1/bindings", {
+      repo: root.repo, subpath: "apps/web", status: "active", clientId: B.id,
+    })).json()).binding;
+
+    /** Runs `op` while a re-bind of `web` to `clientId` is mid-transaction, committing it once `op` waits. */
+    const duringRebind = async <T>(clientId: string, op: () => Promise<T>): Promise<T> => {
+      const conn = await t.sql.reserve();
+      try {
+        await conn.unsafe("begin");
+        await conn`update bindings set client_id = ${clientId}, project_id = null, updated_at = now() where id = ${web.id}`;
+        const pending = op();
+        expect(await lockWaitSeen(t)).toBe(true);
+        await conn.unsafe("commit");
+        return await pending;
+      } finally {
+        conn.release();
+      }
+    };
+    const scopeOf = async (id: bigint) =>
+      (await t.sql`select client_id, project_id from summaries where id = ${id}`)[0];
+
+    // The adopt was asked for while `web` belonged to Beta, but the re-bind to Gamma lands first.
+    // (Only s1 lies under apps/web's adopt rule here; s2 is moved explicitly below.)
+    await t.sql`update sessions set subpath = 'other' where id = 's2'`;
+    expect(await duringRebind(C.id, () => adoptSessions(t.sql, web.id))).toBe(1);
+    expect(await scopeOf(s1)).toEqual({ client_id: C.id, project_id: null });
+    expect((await stateRow(t, scopeKey(C.id, null))).dirty).toBe(true);
+
+    expect(await duringRebind(B.id, () => moveSession(t.sql, "s2", web.id))).toBe(true);
+    expect(await scopeOf(s2)).toEqual({ client_id: B.id, project_id: null });
     expect((await stateRow(t, scopeKey(B.id, null))).dirty).toBe(true);
   } finally { await t.drop(); }
 });

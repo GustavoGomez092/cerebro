@@ -33,6 +33,15 @@ async function record(sql: SQL, bindingId: string, machine: Machine | undefined,
 }
 
 /**
+ * The binding, share-locked for the rest of the transaction: a re-bind of it in flight finishes first
+ * (so its new scope is read), and one starting later waits until this transaction is done.
+ */
+async function lockBinding(tx: SQL, id: string): Promise<Binding | null> {
+  const rows = await tx.unsafe(`select ${COLS} from bindings where id = $1 for share`, [id]);
+  return rows[0] ?? null;
+}
+
+/**
  * Re-binding moves history: puts summaries in their binding's current scope (a declined binding has
  * none) and invalidates the project state of every scope they left or joined, so each is rebuilt
  * rather than folded into. `which` picks the summaries: all of a binding's, or those of sessions that
@@ -160,16 +169,22 @@ export async function repointBinding(sql: SQL, id: string, rawRepo: string, rawS
  */
 export async function adoptSessions(sql: SQL, bindingId: string, machine?: Machine): Promise<number> {
   return sql.begin(async (tx) => {
-    const b = await getBinding(tx, bindingId);
+    const b = await lockBinding(tx, bindingId);
     if (!b) throw new BindingError("not_found", "unknown binding");
     if (b.status !== "active") throw new BindingError("invalid", "only an active binding can adopt sessions");
+    // Session rows locked in id order, so concurrent adopts and moves cannot deadlock.
     const moved = await tx`
+      with m as (
+        select s.id, cur.id as from_binding
+        from sessions s join bindings cur on cur.id = s.binding_id
+        where cur.repo = ${b.repo} and length(cur.subpath) < length(${b.subpath})
+          and s.repo = ${b.repo}
+          and (${b.subpath} = '' or s.subpath = ${b.subpath} or starts_with(s.subpath, ${b.subpath} || '/'))
+        order by s.id
+        for update of s)
       update sessions s set binding_id = ${b.id}
-      from bindings cur
-      where cur.id = s.binding_id and cur.repo = ${b.repo} and length(cur.subpath) < length(${b.subpath})
-        and s.repo = ${b.repo}
-        and (${b.subpath} = '' or s.subpath = ${b.subpath} or starts_with(s.subpath, ${b.subpath} || '/'))
-      returning s.id, cur.id as from_binding`;
+      from m where s.id = m.id
+      returning s.id, m.from_binding`;
     if (moved.length) {
       await record(tx, b.id, machine, "adopt", null, { sessions: moved.map((m: any) => ({ id: m.id, from: m.from_binding })) });
       await rescopeSummaries(tx, b, { sessionIds: moved.map((m: any) => m.id) });
@@ -181,7 +196,7 @@ export async function adoptSessions(sql: SQL, bindingId: string, machine?: Machi
 /** Moves one session to another active binding. Returns false when the session is unknown. */
 export async function moveSession(sql: SQL, sessionId: string, bindingId: string, machine?: Machine): Promise<boolean> {
   return sql.begin(async (tx) => {
-    const target = await getBinding(tx, bindingId);
+    const target = await lockBinding(tx, bindingId);
     if (!target) throw new BindingError("invalid", "unknown binding");
     if (target.status !== "active") throw new BindingError("invalid", "sessions can only move to an active binding");
     const [s] = await tx`select binding_id from sessions where id = ${sessionId} for update`;

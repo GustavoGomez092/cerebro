@@ -218,17 +218,27 @@ function fitSummary(input: Record<string, unknown>, room: number): Record<string
   const out: Record<string, unknown> = { ...input };
   delete out.changes;
   const lists = SUMMARY_LISTS.filter((k) => Array.isArray(out[k]));
-  for (const k of lists) out[k] = [...(out[k] as string[])];
-  while (jsonLength(out) > room) {
+  // Sizes tracked arithmetically: removing an item takes its JSON length plus a separating comma.
+  const sizes = new Map<string, number[]>();
+  const listChars = new Map<string, number>();
+  for (const k of lists) {
+    const v = [...(out[k] as string[])];
+    out[k] = v;
+    sizes.set(k, v.map(jsonLength));
+    listChars.set(k, jsonLength(v));
+  }
+  let total = jsonLength(out);
+  while (total > room) {
     let longest: string | null = null;
-    let longestChars = 0;
     for (const k of lists) {
-      const v = out[k] as string[];
-      const n = jsonLength(v);
-      if (v.length && n > longestChars) [longest, longestChars] = [k, n];
+      if ((out[k] as string[]).length && (!longest || listChars.get(k)! > listChars.get(longest)!)) longest = k;
     }
     if (!longest) break;
-    (out[longest] as string[]).pop();
+    const v = out[longest] as string[];
+    const removed = sizes.get(longest)!.pop()! + (v.length > 1 ? 1 : 0);
+    v.pop();
+    listChars.set(longest, listChars.get(longest)! - removed);
+    total -= removed;
   }
   for (const k of ["overview", "text", "title"]) {
     const over = jsonLength(out) - room;
@@ -261,8 +271,8 @@ function fitState(sc: Scope, doc: StateDoc): StateDoc {
     const k = order.find((key) => d[key].length);
     if (k) d[k].shift();
     else if (d.overview || d.current_status) {
-      d.overview = d.overview.slice(0, d.overview.length >> 1);
-      d.current_status = d.current_status.slice(0, d.current_status.length >> 1);
+      d.overview = storable(d.overview.slice(0, d.overview.length >> 1));
+      d.current_status = storable(d.current_status.slice(0, d.current_status.length >> 1));
     } else break;
   }
   return d;
@@ -317,6 +327,38 @@ function rebuildEstimate(sc: Scope, rows: SummaryRow[]): number {
   return tokens;
 }
 
+/**
+ * The summaries a rebuild uses, oldest first, and their estimated cost: the scope's newest 40, or, when
+ * that would cost more than half the budget window, the newest N that fit in half. So a rebuild always
+ * finishes within one window and leaves the other half for live summaries. When even the newest one
+ * alone costs more than half, it is used on its own.
+ */
+function rebuildPlan(sc: Scope, newestFirst: SummaryRow[], limit: number): { rows: SummaryRow[]; estimate: number } {
+  const half = Math.floor(limit / 2);
+  const plan = (n: number) => {
+    const rows = newestFirst.slice(0, n).reverse();
+    return { rows, estimate: rebuildEstimate(sc, rows) };
+  };
+  const full = plan(newestFirst.length);
+  if (full.estimate <= half || newestFirst.length <= 1) return full;
+  let best = plan(1);
+  if (best.estimate > half) return best;
+  // Cost grows with the number of summaries: the largest N within half the window.
+  let lo = 2;
+  let hi = newestFirst.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const p = plan(mid);
+    if (p.estimate <= half) {
+      best = p;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
 const SUMMARY_COLS = "id::text as id, ts_from, ts_to, title, body, text";
 
 /** The scope's newest summaries, newest first. */
@@ -337,6 +379,23 @@ async function summariesInScope(sql: SQL, sc: Scope, ids: string[]): Promise<Sum
     : sql.unsafe(`select ${SUMMARY_COLS} from summaries where id = any($1::bigint[]) and client_id = $2 and project_id is null`,
       [ids, sc.clientId]);
 }
+
+type SummaryKey = Pick<SummaryRow, "id" | "ts_to">;
+
+/** Those of `ids` that are summaries in this scope now (id and time only), oldest first. */
+async function sourcesInScope(sql: SQL, sc: Scope, ids: string[]): Promise<SummaryKey[]> {
+  return sc.projectId
+    ? sql.unsafe(`select id::text as id, ts_to from summaries where id = any($1::bigint[]) and project_id = $2
+       order by ts_to, id`, [ids, sc.projectId])
+    : sql.unsafe(`select id::text as id, ts_to from summaries where id = any($1::bigint[]) and client_id = $2
+       and project_id is null order by ts_to, id`, [ids, sc.clientId]);
+}
+
+/** Summary order: by time, then id. */
+const isNewer = (a: SummaryKey, b: SummaryKey) => {
+  const d = new Date(a.ts_to).getTime() - new Date(b.ts_to).getTime();
+  return d > 0 || (d === 0 && BigInt(a.id) > BigInt(b.id));
+};
 
 interface StateRow {
   version: number;
@@ -406,8 +465,8 @@ const failedScope: StateResult = { status: "failed", reason: "failed" };
 
 /**
  * Folds new summaries into a scope's state: the given ids plus any of the scope's newest 40 not yet
- * folded (so a summary whose update was lost is picked up), oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS
- * per model call.
+ * folded that are newer than the oldest folded one (so a summary whose update was lost is picked up,
+ * but ones a budget-shrunk rebuild left out are not), oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS per call.
  * Each call's result replaces `doc` and `text`, bumps `version` and appends to `source_summary_ids`,
  * committed only if no other update landed meanwhile (else the update starts over from the new state).
  * `dirty` is cleared when everything is folded and no new mark arrived while it ran.
@@ -422,14 +481,19 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
   attempts: for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const st = await loadState(sql, sc);
     if (!st) return failedScope;
-    if (!st.sources.length || (await summariesInScope(sql, sc, st.sources)).length < st.sources.length) {
-      return rebuildState(sql, scope, deps);
-    }
+    const sources = st.sources.length ? await sourcesInScope(sql, sc, st.sources) : [];
+    if (!st.sources.length || sources.length < st.sources.length) return rebuildState(sql, scope, deps);
     const folded = new Set(st.sources);
     const pending = new Map<string, SummaryRow>();
-    const newest = await newestSummaries(sql, sc, REBUILD_WINDOW);
-    const asked = await summariesInScope(sql, sc, newSummaryIds.map(String));
-    for (const r of [...newest, ...asked]) if (!folded.has(r.id)) pending.set(r.id, r);
+    // Unfolded summaries among the newest 40 that are newer than the oldest folded one (older ones were
+    // left out on purpose by a budget-shrunk rebuild), plus any asked for by id.
+    const oldest = sources[0];
+    for (const r of await newestSummaries(sql, sc, REBUILD_WINDOW)) {
+      if (!folded.has(r.id) && isNewer(r, oldest)) pending.set(r.id, r);
+    }
+    for (const r of await summariesInScope(sql, sc, newSummaryIds.map(String))) {
+      if (!folded.has(r.id)) pending.set(r.id, r);
+    }
     const rows = [...pending.values()].sort(
       (a, b) => new Date(a.ts_to).getTime() - new Date(b.ts_to).getTime() || Number(BigInt(a.id) - BigInt(b.id)));
 
@@ -467,12 +531,15 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
 
 /**
  * Rebuilds a scope's state from scratch out of its newest 40 summaries (oldest first, ≤ 10 and
- * ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. Nothing is spent unless the
- * budget covers the whole rebuild (rebuildEstimate, capped at the budget's limit so a large rebuild can
- * still start once the window is clear). Nothing is committed part-way: a rebuild deferred mid-way by a
- * usage limit, login or timeout is redone from scratch later, since a partial state built from the
- * oldest summaries would replace a newer brief. The result is committed only if no update landed
- * meanwhile (else it starts over); `dirty` is cleared only if no new mark arrived while it ran.
+ * ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. When those would cost more than
+ * half the budget window, only the newest that fit in half are used (rebuildPlan). Nothing is spent
+ * unless the remaining budget covers the whole planned rebuild, so it does not defer part-way through
+ * its own spend. The one exception is a single summary costing more than the whole window: that estimate
+ * is capped at the limit, so it can still run once the window is clear. Nothing is committed part-way:
+ * a rebuild deferred mid-way by a usage limit, login or timeout is redone from scratch later, since a
+ * partial state built from the oldest summaries would replace a newer brief. The result is committed
+ * only if no update landed meanwhile (else it starts over); `dirty` is cleared only if no new mark
+ * arrived while it ran.
  * A scope with no summaries gets an empty state, without a call.
  */
 export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Promise<StateResult> {
@@ -482,11 +549,13 @@ export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Pr
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const st = await loadState(sql, sc);
     if (!st) return failedScope;
-    const rows = (await newestSummaries(sql, sc, REBUILD_WINDOW)).reverse();
-    if (rows.length) {
+    const newest = await newestSummaries(sql, sc, REBUILD_WINDOW);
+    let rows: SummaryRow[] = [];
+    if (newest.length) {
       const budget = await budgetState(sql, deps.budget);
-      const estimate = Math.min(rebuildEstimate(sc, rows), budget.limit);
-      if (!canSpend(budget, estimate)) return done(ctx, overBudget(budget.resumesAt));
+      const planned = rebuildPlan(sc, newest, budget.limit);
+      rows = planned.rows;
+      if (!canSpend(budget, Math.min(planned.estimate, budget.limit))) return done(ctx, overBudget(budget.resumesAt));
     }
     let doc = emptyDoc();
     for (let i = 0; i < rows.length;) {

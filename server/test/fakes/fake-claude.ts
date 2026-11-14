@@ -7,13 +7,14 @@ export {};
 // and open threads added; threads named in a summary's resolved_threads moved to resolved_recently).
 // "maxstate" answers a STATE_SCHEMA object with every field at its cap, filled with FAKE_CLAUDE_FILL (default "x").
 // With FAKE_CLAUDE_RECORD=<file>, each call appends {"chars": <system prompt + stdin length>} as a JSON line.
+// With FAKE_CLAUDE_TOKENS=input, usage.input_tokens is ceil(input chars / 3.5) instead of 10.
 import { appendFileSync } from "node:fs";
 const mode = process.env.FAKE_CLAUDE_MODE ?? "ok";
 const stdin = await Bun.stdin.text();
 const argv = process.argv.slice(2);
+const inputChars = (argv[argv.indexOf("--system-prompt") + 1] ?? "").length + stdin.length;
 if (process.env.FAKE_CLAUDE_RECORD) {
-  const sys = argv[argv.indexOf("--system-prompt") + 1] ?? "";
-  appendFileSync(process.env.FAKE_CLAUDE_RECORD, `${JSON.stringify({ chars: sys.length + stdin.length })}\n`);
+  appendFileSync(process.env.FAKE_CLAUDE_RECORD, `${JSON.stringify({ chars: inputChars })}\n`);
 }
 
 const envelope = (over: Record<string, unknown>) => ({
@@ -28,7 +29,7 @@ const envelope = (over: Record<string, unknown>) => ({
   session_id: "fake-session",
   total_cost_usd: 0,
   usage: {
-    input_tokens: 10,
+    input_tokens: process.env.FAKE_CLAUDE_TOKENS === "input" ? Math.ceil(inputChars / 3.5) : 10,
     output_tokens: 5,
     cache_creation_input_tokens: Number(process.env.FAKE_CLAUDE_CACHE_CREATION ?? 7),
     cache_read_input_tokens: 3,
