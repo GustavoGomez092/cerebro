@@ -1,7 +1,9 @@
 import { test, expect } from "bun:test";
 import { authedApp, freshDb } from "./helpers";
 import { boundFolder, sess, ingest } from "./fixtures";
-import { requeueMissingEmbeddings } from "../src/cli";
+import { claudeSmoke, requeueMissingEmbeddings } from "../src/cli";
+import { runClaude, type ClaudeInput } from "../src/summarise/claude";
+import { SUMMARY_SCHEMA } from "../src/summarise/prompts";
 import { fakeEmbedder } from "../src/embed/fake";
 import { toVector } from "../src/embed/embedder";
 import { summaryEmbedText } from "../src/summarise/summarise";
@@ -109,5 +111,51 @@ test("requeue-missing-embeddings fails clearly when the embedder returns the wro
     await expect(requeueMissingEmbeddings(db.sql, async () => short)).rejects.toThrow(/1 vector\(s\) for 2 summaries/);
     const [{ n }] = await db.sql`select count(*)::int as n from summary_embeddings`;
     expect(n).toBe(0);
+  } finally { await db.drop(); }
+});
+
+// M3: one tiny real summary call through the server's own runClaude, run in the container after `claude auth login`.
+const FAKE_CLAUDE = "bun server/test/fakes/fake-claude.ts";
+const fakeRun = (mode: string) => (input: ClaudeInput) =>
+  runClaude(input, { ...process.env, SUMMARISER_CMD: FAKE_CLAUDE, FAKE_CLAUDE_MODE: mode } as NodeJS.ProcessEnv);
+
+test("M3: claude-smoke runs one summary call with the server's prompt and schema, charges it, and prints ok", async () => {
+  const db = await freshDb();
+  try {
+    const calls: ClaudeInput[] = [];
+    const r = await claudeSmoke((input) => { calls.push(input); return fakeRun("ok")(input); }, db.sql);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].schema).toBe(SUMMARY_SCHEMA);
+    expect(r.ok).toBe(true);
+    expect(r.line).toMatch(/^ok: a summary call answered .*model claude-haiku-fake, 22 tokens/);
+    expect(await db.sql`select tokens, kind from usage_ledger`).toEqual([{ tokens: 22, kind: "summary" }]);
+  } finally { await db.drop(); }
+});
+
+test("M3: claude-smoke prints the classified error with what to do, and never the prompt", async () => {
+  for (const [mode, kind, hint] of [["auth", "auth", /claude auth login/], ["missing", "bad_output", /summary schema/], ["notjson", "bad_output", /Dockerfile/], ["connection", "unavailable", /network|API/]] as const) {
+    const r = await claudeSmoke(fakeRun(mode));
+    expect([mode, r.ok]).toEqual([mode, false]);
+    expect(r.line).toStartWith(`FAIL ${kind}: `);
+    expect(r.line).toMatch(hint);
+    expect(r.line).not.toContain("<transcript");
+  }
+});
+
+test("M3: `cli.ts claude-smoke` exits 0 on a good call and 1 on a failure", async () => {
+  const db = await freshDb();
+  try {
+    const run = async (mode: string) => {
+      const p = Bun.spawn(["bun", CLI, "claude-smoke"], {
+        env: { ...process.env, DATABASE_URL: db.url, SUMMARISER_CMD: FAKE_CLAUDE, FAKE_CLAUDE_MODE: mode }, stdout: "pipe", stderr: "pipe",
+      });
+      return { out: await new Response(p.stdout).text(), code: await p.exited };
+    };
+    const good = await run("ok");
+    expect(good.code).toBe(0);
+    expect(good.out).toStartWith("ok: ");
+    const bad = await run("auth");
+    expect(bad.code).toBe(1);
+    expect(bad.out).toStartWith("FAIL auth: ");
   } finally { await db.drop(); }
 });
