@@ -13,6 +13,20 @@ function run(cmd: string[], env: Record<string, string> = {}) {
   return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
 }
 
+const PGVECTOR_IMAGE = /image: (pgvector\/pgvector\S+)/.exec(await Bun.file(COMPOSE).text().catch(() => ""))?.[1] ?? "pgvector/pgvector:0.8.1-pg17";
+
+// The Docker tests need a daemon and a free host port 8790.
+const dockerUp = run(["docker", "info"]).code === 0;
+const portFree = (() => {
+  try {
+    Bun.listen({ hostname: "127.0.0.1", port: 8790, socket: { data() {} } }).stop(true);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const dockerTest = dockerUp && portFree ? test : test.skip;
+
 // Temp data and secrets dirs, so `config` can resolve env_file and the stack never touches real data.
 const root = mkdtempSync(join(tmpdir(), "cerebro-compose-"));
 const data = join(root, "data");
@@ -31,7 +45,7 @@ beforeAll(() => {
 afterAll(() => {
   run(["docker", "compose", "-p", PROJECT, "-f", COMPOSE, "down", "-v", "--remove-orphans"], env);
   // Postgres writes its data dir as another uid; remove it through a container.
-  run(["docker", "run", "--rm", "-v", `${root}:/r`, "alpine", "rm", "-rf", "/r/data"]);
+  run(["docker", "run", "--rm", "-v", `${root}:/r`, PGVECTOR_IMAGE, "rm", "-rf", "/r/data"]);
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -65,7 +79,13 @@ describe("compose config", () => {
     expect(server.depends_on.db.condition).toBe("service_healthy");
     expect(server.depends_on.ollama.condition).toBe("service_started");
 
-    for (const s of [db, ollama, server]) expect(s.restart).toBe("unless-stopped");
+    for (const s of [db, ollama, server]) {
+      expect(s.restart).toBe("unless-stopped");
+      expect(s.memswap_limit).toBe(s.mem_limit); // no swap: the cap is hard
+      expect(s.oom_score_adj).toBe(500); // kernel kills Cerebro before AdGuard or the media stack
+    }
+    expect(Number(db.cpus)).toBe(2);
+    expect(db.healthcheck.test.join(" ")).toContain("-h 127.0.0.1"); // TCP, not the first-boot temp server's socket
     expect(db.healthcheck.test.join(" ")).toContain("pg_isready");
     expect(Object.keys(db.networks)).toEqual(["cerebro-net"]);
     expect(Object.keys(ollama.networks)).toEqual(["cerebro-net"]);
@@ -82,8 +102,8 @@ describe("compose config", () => {
   test("postgres.conf carries the tuned settings", async () => {
     const conf = await Bun.file(join(DEPLOY, "postgres.conf")).text();
     const want = [
-      "shared_buffers = 512MB", "effective_cache_size = 1536MB", "work_mem = 16MB", "maintenance_work_mem = 256MB",
-      "max_parallel_maintenance_workers = 2", "max_connections = 40", "default_toast_compression = lz4",
+      "shared_buffers = 512MB", "effective_cache_size = 1536MB", "work_mem = 8MB", "maintenance_work_mem = 256MB",
+      "max_parallel_maintenance_workers = 2", "autovacuum_work_mem = 64MB", "autovacuum_max_workers = 2", "max_parallel_workers_per_gather = 1", "max_connections = 40", "default_toast_compression = lz4",
       "wal_compression = lz4", "checkpoint_timeout = 15min", "listen_addresses = '*'",
     ];
     for (const line of want) expect(conf).toContain(line);
@@ -96,6 +116,14 @@ describe("compose stack (Docker)", () => {
     run(["docker", "exec", "cerebro-server", "bun", "-e", "const r=await fetch('http://127.0.0.1:8790/health');console.log(r.status)"]);
   const psql = (sql: string) => run(["docker", "exec", "cerebro-db", "psql", "-U", "cerebro", "-tAc", sql]);
 
+  // `docker kill` counts as a manual stop and suppresses the restart policy. SIGKILL the container's init
+  // from outside instead (like the OOM killer or a crash would); the daemon then restarts it per policy.
+  function crash(name: string) {
+    const pid = run(["docker", "inspect", "-f", "{{.State.Pid}}", name]).out.trim();
+    expect(Number(pid)).toBeGreaterThan(0);
+    expect(run(["docker", "run", "--rm", "--privileged", "--pid=host", "--entrypoint", "sh", PGVECTOR_IMAGE, "-c", `kill -9 ${pid}`]).code).toBe(0);
+  }
+
   async function waitHealthy(ms = 120_000) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
@@ -105,7 +133,7 @@ describe("compose stack (Docker)", () => {
     throw new Error("server never became healthy:\n" + dc("logs", "--tail", "40").out);
   }
 
-  test("the stack comes back after its containers are killed", async () => {
+  dockerTest("the stack comes back after its containers are killed", async () => {
     expect(run(["docker", "build", "-q", "-t", "cerebro-server:test", "-f", "server/Dockerfile", "."]).code).toBe(0);
 
     expect(dc("up", "-d").code).toBe(0);
@@ -115,8 +143,17 @@ describe("compose stack (Docker)", () => {
     expect(psql("show shared_buffers").out.trim()).toBe("512MB");
 
     for (const n of ["cerebro-server", "cerebro-ollama", "cerebro-db"]) expect(run(["docker", "kill", n]).code).toBe(0);
-    expect(dc("up", "-d").code).toBe(0); // what the restart policy does after a reboot
+    expect(dc("up", "-d").code).toBe(0); // re-applies depends_on ordering
     await waitHealthy();
+    expect(psql("select v from survive").out.trim()).toBe("kept");
+    expect(run(["docker", "inspect", "-f", "{{.State.Running}}", "cerebro-ollama"]).out.trim()).toBe("true");
+  }, 300_000);
+
+  // A real reboot has no `compose up`: Docker's restart policy starts all three at once.
+  dockerTest("the restart policy alone brings the stack back, with the db coming up late", async () => {
+    for (const n of ["cerebro-server", "cerebro-ollama", "cerebro-db"]) crash(n);
+    // No `compose up`: wait for the restart policy alone.
+    await waitHealthy(180_000);
     expect(psql("select v from survive").out.trim()).toBe("kept");
     expect(run(["docker", "inspect", "-f", "{{.State.Running}}", "cerebro-ollama"]).out.trim()).toBe("true");
   }, 300_000);
