@@ -26,6 +26,8 @@ const HEALTH_TIMEOUT_MS = 1500;
 const RESOLVE_TIMEOUT_MS = 1500;
 const MAX_RESOLVES = 50;
 const REVERIFY_AFTER_MS = 30_000;
+/** A cached binding (active or declined) older than this is asked about again. */
+const BINDING_RECHECK_MS = 24 * 60 * 60_000;
 /** A file touched this recently may still be written to, so its cursor stays open for sweeps. */
 const LIVE_WINDOW_MS = 10 * 60_000;
 
@@ -170,7 +172,8 @@ export async function syncAllSources(
 }
 
 /**
- * Asks the server about folders not known to be bound or declined (opting in happens elsewhere), at most
+ * Asks the server about folders not known to be bound or declined (opting in happens elsewhere), and about
+ * known ones whose answer is a day old (a binding may have been added, moved or declined since), at most
  * `limit` of them, those checked longest ago first, so over several runs every folder gets its turn.
  */
 async function refreshBindings(
@@ -181,7 +184,7 @@ async function refreshBindings(
     const key = `${ident.repo}|${ident.subpath}`;
     if (due.has(key)) continue;
     const cached = store.cachedBinding(ident.repo, ident.subpath);
-    if (cached?.binding) continue;
+    if (cached?.binding && Date.now() - Date.parse(cached.at) < BINDING_RECHECK_MS) continue;
     due.set(key, { ident, at: cached?.at ?? "" }); // never asked sorts first
   }
   const order = [...due.values()].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(0, limit);
@@ -198,9 +201,9 @@ async function refreshBindings(
     } catch (e) {
       logError(`sync resolve ${ident.repo}`, e);
       if (e instanceof ApiError && (e.status === 0 || e.status >= 500)) return { asked, reachable: false };
-      // Refused (4xx): note it as not bound as of now, so never-asked folders go ahead of it next run.
-      // Only identities with no binding reach here, so nothing bound or declined is overwritten.
-      store.cacheBinding(ident.repo, ident.subpath, null);
+      // Refused (4xx): keep what is known (nothing, or the old binding) but as of now, so the others go
+      // ahead of it next run.
+      store.cacheBinding(ident.repo, ident.subpath, store.cachedBinding(ident.repo, ident.subpath)?.binding ?? null);
     }
   }
   return { asked, reachable: true };

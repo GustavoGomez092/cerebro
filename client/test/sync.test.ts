@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -221,6 +222,67 @@ test("the 50-resolve cap never starves a folder: the oldest-checked identities g
   await syncAllSources(store, counting, "test-mac", { home, sources: [genericSource] });
   expect(asked).toHaveLength(50);
   for (const r of missed) expect(asked).toContain(r);
+  store.close();
+});
+
+test("a cached binding is asked about again once it is a day old, so a newer subfolder binding is picked up", async () => {
+  const home = tmp();
+  const r = repo("aging");
+  const web = join(r.root, "apps", "web");
+  mkdirSync(web, { recursive: true });
+  const wide = await bind(r.remote, "Wide");
+  /** Drops a cerebro-jsonl session recorded in apps/web into the inbox; returns its session id. */
+  const drop = (name: string) => {
+    const run = `run-${crypto.randomUUID()}`;
+    write(join(home, ".cerebro", "inbox", `${name}.jsonl`), fixture("generic.jsonl").replace("run-0001", run)
+      .replace("/Users/dev/projects/demo", web).replace("https://github.com/example/demo.git", `https://${r.remote}.git`));
+    return `my-agent:${run}`;
+  };
+  const d = tmp();
+  process.env.CEREBRO_HOME = d;
+  const store = new Store(join(d, "cerebro.db"));
+  const first = drop("first");
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [genericSource] });
+  expect(store.cachedBinding(r.remote, "apps/web")?.binding?.id).toBe(wide.id); // the server answers with the wider binding
+
+  const c = await h.api.createClient(`Narrow-${crypto.randomUUID()}`);
+  const narrow = (await h.api.putBinding({ repo: r.remote, subpath: "apps/web", status: "active", clientId: c.id, projectId: null })).binding;
+  const aged = new Database(join(d, "cerebro.db"));
+  aged.query("update bindings set at = ?").run(new Date(Date.now() - 25 * 60 * 60_000).toISOString());
+  aged.close();
+
+  const second = drop("second");
+  await syncAllSources(store, h.clientFor(store), "test-mac", { home, sources: [genericSource] });
+  expect(store.cachedBinding(r.remote, "apps/web")?.binding?.id).toBe(narrow.id);
+  const rows = await h.sql`select id, binding_id from sessions where id = any(${h.sql.array([first, second], "text")})`;
+  expect(Object.fromEntries(rows.map((x: { id: string; binding_id: string }) => [x.id, x.binding_id]))).toEqual({ [first]: wide.id, [second]: narrow.id });
+  store.close();
+});
+
+test("a day-old binding the server refuses to look up again (4xx) is kept, as of now", async () => {
+  const home = tmp();
+  const r = repo("kept");
+  const b = await bind(r.remote, "Kept");
+  write(join(home, ".cerebro", "inbox", "kept.jsonl"), fixture("generic.jsonl").replace("run-0001", `run-${crypto.randomUUID()}`)
+    .replace("/Users/dev/projects/demo", r.root).replace("https://github.com/example/demo.git", `https://${r.remote}.git`));
+  const d = tmp();
+  process.env.CEREBRO_HOME = d;
+  const store = new Store(join(d, "cerebro.db"));
+  store.cacheBinding(r.remote, "", b);
+  const old = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+  const aged = new Database(join(d, "cerebro.db"));
+  aged.query("update bindings set at = ?").run(old);
+  aged.close();
+  const refusing = new Proxy(h.clientFor(store), {
+    get(target, prop, recv) {
+      if (prop !== "resolve") return Reflect.get(target, prop, recv);
+      return () => Promise.reject(new ApiError(400, "invalid_request", "bad identity"));
+    },
+  });
+  await syncAllSources(store, refusing, "test-mac", { home, sources: [genericSource] });
+  const cached = store.cachedBinding(r.remote, "");
+  expect(cached?.binding?.id).toBe(b.id);
+  expect(cached!.at > old).toBe(true);
   store.close();
 });
 
