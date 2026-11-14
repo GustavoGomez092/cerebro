@@ -35,6 +35,8 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
 
   let locked = false;
   try {
+    // Persist the end first: the lock, the network or this process may all fail below, and a later flush delivers it.
+    if (opts.end) store.addPendingEnd(opts.end.sessionId, opts.end.endedAt);
     if (!store.tryLock("flush", LOCK_TTL_MS)) return finish("locked");
     locked = true;
 
@@ -75,10 +77,20 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
       throw e;
     }
 
-    let maxEvents = opts.maxEvents ?? 2000;
-    let maxBytes = opts.maxBytes ?? 8 * 1024 * 1024;
+    const configuredEvents = opts.maxEvents ?? 2000;
+    const configuredBytes = opts.maxBytes ?? 8 * 1024 * 1024;
+    // Size is judged against the configured cap only; the working limits below shrink after 4xx answers.
+    const eventCap = Math.max(0, configuredBytes - HEADROOM_BYTES);
+    let maxEvents = configuredEvents;
+    let maxBytes = configuredBytes;
     let maxSessions = MAX_SESSIONS;
-    let drained = false;
+    const quarantineOne = (event: IngestEvent, code: string) => {
+      store.quarantineEvents([{ event, code }]);
+      result.quarantined++;
+      maxEvents = configuredEvents;
+      maxBytes = configuredBytes;
+      maxSessions = MAX_SESSIONS;
+    };
 
     while (now() - start < deadlineMs) {
       const allUnsent = store.unsentSessions(10_000);
@@ -86,18 +98,15 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
       const inBatch = new Set(sessions.map((s) => s.id));
       const waiting = new Set(allUnsent.slice(maxSessions).map((s) => s.id));
       const sessionBytes = sessions.reduce((a, s) => a + Buffer.byteLength(JSON.stringify(s)), 0);
-      const eventCap = Math.max(0, maxBytes - HEADROOM_BYTES);
-
-      let events = store.nextEvents(maxEvents, Math.max(0, eventCap - sessionBytes));
+      let events = store.nextEvents(maxEvents, Math.max(0, maxBytes - HEADROOM_BYTES - sessionBytes));
       // An event whose session row has not been sent yet would be rejected as unknown; wait for the next round.
       const blockedAt = events.findIndex((e) => waiting.has(e.sessionId) && !inBatch.has(e.sessionId));
       if (blockedAt >= 0) events = events.slice(0, blockedAt);
 
-      if (sessions.length === 0 && events.length === 0) { drained = true; break; }
+      if (sessions.length === 0 && events.length === 0) break;
 
       if (events.length === 1 && byteLength(events[0]) > eventCap) {
-        store.quarantineEvents([{ event: events[0], code: "too_large" }]);
-        result.quarantined++;
+        quarantineOne(events[0], "too_large");
         continue;
       }
 
@@ -107,20 +116,21 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
       } catch (e) {
         if (!(e instanceof ApiError)) throw e;
         if (e.status === 401) return block(e);
-        if (e.status === 413) {
-          if (events.length === 1) {
-            store.quarantineEvents([{ event: events[0], code: "too_large" }]);
-            result.quarantined++;
-            continue;
-          }
-          if (events.length <= 1 && sessions.length <= 1) return fail();
-          maxEvents = Math.max(1, Math.floor(events.length / 2));
+        if (e.status >= 500 || e.code === "network" || e.code === "timeout") return fail();
+        if (e.status < 400 || e.status >= 500) throw e;
+        // 413 or any other whole-batch 4xx (422 data errors, proxy 403/429...): split until the culprit is alone.
+        if (events.length > 1) {
+          maxEvents = Math.floor(events.length / 2);
           maxBytes = Math.max(HEADROOM_BYTES + 1, Math.floor(maxBytes / 2));
-          maxSessions = Math.max(1, Math.floor(sessions.length / 2));
           continue;
         }
-        if (e.status >= 500 || e.code === "network" || e.code === "timeout") return fail();
-        throw e;
+        if (sessions.length > 1) { maxSessions = Math.floor(sessions.length / 2); continue; }
+        if (events.length === 1) { quarantineOne(events[0], e.status === 413 ? "too_large" : e.code); continue; }
+        // A lone session row the server refuses: retire it (retrying cannot help) and record why.
+        store.markSessionsSent(sessions);
+        store.set(`sessionRejected:${sessions[0].id}`, e.code);
+        maxSessions = MAX_SESSIONS;
+        continue;
       }
 
       result.sent += res.inserted;
@@ -133,22 +143,33 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
     store.set("backoffMs", null);
     store.set("backoffUntil", null);
 
-    // Only close the session once everything queued has gone up.
-    if (opts.end && drained) {
+    // Deliver session ends whose session row is on the server. Queued events of an ended session all predate
+    // its end, and the server only reopens a session for events newer than ended_at, so they need not be drained.
+    const stillUnsent = new Set(store.unsentSessions(10_000).map((s) => s.id));
+    for (const pe of store.pendingEnds()) {
+      if (stillUnsent.has(pe.sessionId)) continue;
       try {
-        await api.endSession(opts.end.sessionId, opts.end.endedAt, { timeoutMs: REQUEST_TIMEOUT_MS });
+        await api.endSession(pe.sessionId, pe.endedAt, { timeoutMs: REQUEST_TIMEOUT_MS });
       } catch (e) {
         if (!(e instanceof ApiError)) throw e;
         if (e.status === 401) return block(e);
-        if (e.status === 404) { /* the server never saw this session (not bound/captured): nothing to end */ }
-        else if (e.status >= 500 || e.code === "network" || e.code === "timeout") return fail();
-        else throw e;
+        // 404: the server never saw this session (not bound or never captured), so there is nothing to end.
+        if (e.status !== 404) {
+          if (e.status >= 500 || e.code === "network" || e.code === "timeout") return fail();
+          throw e;
+        }
       }
+      store.removePendingEnd(pe.sessionId, pe.endedAt);
     }
 
+    store.set("lastError", null);
     store.set("lastFlushAt", new Date(now()).toISOString());
     return finish(result.sent + result.duplicates + result.quarantined > 0 ? "done" : "nothing");
-  } catch {
+  } catch (e) {
+    try {
+      const err = e as { name?: string; code?: string; message?: string };
+      store.set("lastError", `${err.name ?? "Error"}${err.code ? `:${err.code}` : ""}: ${err.message ?? e}`.slice(0, 300));
+    } catch { /* recording the error is best effort */ }
     return finish("error");
   } finally {
     if (locked) { try { store.unlock("flush"); } catch { /* lock expires by TTL */ } }

@@ -38,6 +38,7 @@ create table if not exists bindings (
   repo text not null, subpath text not null, json text, at text not null, primary key (repo, subpath)
 );
 create table if not exists state (key text primary key, value text);
+create table if not exists pending_ends (session_id text primary key, ended_at text not null);
 create table if not exists locks (name text primary key, owner_pid integer not null, until integer not null);
 `;
 
@@ -174,6 +175,25 @@ export class Store {
   cachedBinding(repo: string, subpath: string): { binding: Binding | null; at: string } | undefined {
     const r = this.db.query("select json, at from bindings where repo = ? and subpath = ?").get(repo, subpath) as { json: string | null; at: string } | null;
     return r ? { binding: r.json ? JSON.parse(r.json) : null, at: r.at } : undefined;
+  }
+
+  // session ends not yet delivered to the server
+  /** Records that a session ended; a later time replaces an earlier one. */
+  addPendingEnd(sessionId: string, endedAt: string): void {
+    this.db.query(
+      `insert into pending_ends (session_id, ended_at) values (?, ?)
+       on conflict(session_id) do update set ended_at = excluded.ended_at where excluded.ended_at > pending_ends.ended_at`,
+    ).run(sessionId, endedAt);
+  }
+
+  pendingEnds(): { sessionId: string; endedAt: string }[] {
+    return (this.db.query("select session_id, ended_at from pending_ends order by rowid").all() as { session_id: string; ended_at: string }[])
+      .map((r) => ({ sessionId: r.session_id, endedAt: r.ended_at }));
+  }
+
+  /** Removes the end only if it still has the delivered time, so a newer end is kept. */
+  removePendingEnd(sessionId: string, endedAt: string): void {
+    this.db.query("delete from pending_ends where session_id = ? and ended_at = ?").run(sessionId, endedAt);
   }
 
   // key/value state
