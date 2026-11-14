@@ -83,6 +83,42 @@ test("slow: times out and kills the child", async () => {
   expect(Date.now() - t0).toBeLessThan(5000);
 });
 
+test("API-key env vars are stripped from the child; CLAUDE_CONFIG_DIR passes through", async () => {
+  const r = await runClaude(
+    input,
+    base("echo", {
+      ANTHROPIC_API_KEY: "sk-leak",
+      ANTHROPIC_AUTH_TOKEN: "tok-leak",
+      ANTHROPIC_BASE_URL: "http://leak",
+      CLAUDE_CONFIG_DIR: "/tmp/cfg",
+    }),
+  );
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  const echo = r.output as Record<string, unknown>;
+  expect(echo.apiKey).toBeUndefined();
+  expect(echo.authToken).toBeUndefined();
+  expect(echo.baseUrl).toBeUndefined();
+  expect(echo.configDir).toBe("/tmp/cfg");
+});
+
+test("api_error_status 401 is auth even when the text is unrelated", async () => {
+  const r = await runClaude(input, base("status401"));
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.kind).toBe("auth");
+});
+
+test("newer limit wording is usage_limit; 'resets <time>' without an epoch gives null resetAt", async () => {
+  for (const mode of ["hitlimit", "limitreached"]) {
+    const r = await runClaude(input, base(mode));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.kind).toBe("usage_limit");
+      expect(r.resetAt).toBeNull();
+    }
+  }
+});
+
 test("missing binary is failed, not a throw", async () => {
   const r = await runClaude(input, { ...process.env, SUMMARISER_CMD: "/nonexistent/claude-bin" } as NodeJS.ProcessEnv);
   expect(r.ok).toBe(false);

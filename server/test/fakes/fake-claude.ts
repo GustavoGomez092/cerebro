@@ -41,8 +41,29 @@ switch (mode) {
     emit(envelope({ result: "", structured_output: summaryFor(stdin) }));
     break;
   case "echo":
-    emit(envelope({ result: JSON.stringify({ argv, stdin, headless: process.env.CEREBRO_HEADLESS }) }));
+    emit(
+      envelope({
+        result: JSON.stringify({
+          argv,
+          stdin,
+          headless: process.env.CEREBRO_HEADLESS,
+          apiKey: process.env.ANTHROPIC_API_KEY,
+          authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+          baseUrl: process.env.ANTHROPIC_BASE_URL,
+          configDir: process.env.CLAUDE_CONFIG_DIR,
+        }),
+      }),
+    );
     break;
+  case "status401":
+    emit({ ...failure("Something unrelated went wrong"), api_error_status: 401 });
+    process.exit(1);
+  case "hitlimit":
+    emit(failure("You've hit your limit · resets 3pm (America/Chicago)"));
+    process.exit(1);
+  case "limitreached":
+    emit(failure("5-hour limit reached"));
+    process.exit(1);
   case "limit":
     emit(failure(`Claude AI usage limit reached|${process.env.FAKE_CLAUDE_RESET_EPOCH ?? "1900000000"}`));
     process.exit(1);

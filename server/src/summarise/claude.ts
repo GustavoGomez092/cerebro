@@ -35,10 +35,12 @@ function parseResetAt(text: string): Date | null {
   return null;
 }
 
-function classify(text: string): ClaudeRun {
+function classify(text: string, status?: unknown): ClaudeRun {
   const message = text.trim().slice(0, 500) || "claude failed";
-  if (/usage limit|rate limit/i.test(text)) return fail("usage_limit", message, parseResetAt(text));
-  if (/login|auth|credential|401/i.test(text)) return fail("auth", message);
+  if (/usage limit|rate limit|hit your limit|limit reached/i.test(text)) {
+    return fail("usage_limit", message, parseResetAt(text));
+  }
+  if (status === 401 || status === 403 || /login|auth|credential|401/i.test(text)) return fail("auth", message);
   return fail("failed", message);
 }
 
@@ -70,8 +72,9 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
     "--strict-mcp-config",
     "--no-session-persistence",
   ];
+  // Subscription login only: an API key in the env would make the CLI bill the API instead.
   const childEnv: Record<string, string | undefined> = { ...env, CEREBRO_HEADLESS: "1" };
-  if (env.CLAUDE_CONFIG_DIR) childEnv.CLAUDE_CONFIG_DIR = env.CLAUDE_CONFIG_DIR;
+  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]) delete childEnv[k];
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -114,7 +117,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
 
     if (parsed.is_error !== false) {
       const text = typeof parsed.result === "string" ? parsed.result : err || `claude error (exit ${code})`;
-      return classify(text);
+      return classify(text, parsed.api_error_status);
     }
 
     const structured = parseStructured(parsed);
