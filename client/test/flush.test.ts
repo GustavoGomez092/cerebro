@@ -94,7 +94,7 @@ test("an impostor server never receives the token or data", async () => {
 
 test("unreachable server backs off and keeps everything", async () => {
   const { store } = seeded(3);
-  const api = new ApiClient({ serverUrl: TEST_URL, token: "t" }, (async () => { throw new TypeError("down"); }) as typeof fetch);
+  const api = new ApiClient({ serverUrl: TEST_URL, token: "t" }, (async () => { throw new TypeError("down"); }) as unknown as typeof fetch);
   const t = 1_000_000;
   const r = await flush(store, api, { now: () => t });
   expect(r.outcome).toBe("unreachable");
