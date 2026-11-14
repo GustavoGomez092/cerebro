@@ -141,6 +141,45 @@ test("an unbound folder imports nothing", async () => {
   expect(r).toMatchObject({ sessions: 0, events: 0, skipped: 1 });
 });
 
+test("a failed resolve leaves the imported marker unset and the next run finishes the job", async () => {
+  const home = tmp();
+  const { root, remote } = repo("flaky");
+  await bind(remote, "", "FlakyTop");
+  await bind(remote, "packages/a", "FlakySub");
+  transcript(home, root);
+  transcript(home, join(root, "packages", "a"));
+
+  let failed = false;
+  const flaky = new Proxy(h.api, {
+    get(target, prop, recv) {
+      if (prop !== "resolve") return Reflect.get(target, prop, recv);
+      return (...args: Parameters<typeof target.resolve>) => {
+        if (!failed) { failed = true; return Promise.reject(new Error("network down")); }
+        return target.resolve(...args);
+      };
+    },
+  });
+  const store = newStore();
+  const first = await importFolder(store, flaky, root, "mac", { home });
+  expect(first.sessions).toBe(1);
+  expect(store.get(`imported:${remote}|`)).toBeUndefined();
+
+  const second = await importFolder(store, h.api, root, "mac", { home });
+  expect(second.sessions).toBe(1);
+  expect(store.get(`imported:${remote}|`)).toBeTruthy();
+});
+
+test("a child directory named like '..foo' is still inside the folder", async () => {
+  const home = tmp();
+  const { root, remote } = repo("dots");
+  mkdirSync(join(root, "..foo"));
+  await bind(remote, "", "DotsTop");
+  const t = transcript(home, join(root, "..foo"));
+  const r = await importFolder(newStore(), h.api, root, "mac", { home });
+  expect(r.sessions).toBe(1);
+  expect((await serverSession(t.sid)).imported).toBe(true);
+});
+
 test("a held import lock returns zeros", async () => {
   const home = tmp();
   const { root, remote } = repo("locked");

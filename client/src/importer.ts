@@ -31,7 +31,7 @@ const real = (p: string): string => {
 function within(root: string, dir: string): string | null {
   const rel = relative(root, dir);
   if (rel === "") return "";
-  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) return null;
   return rel.split("\\").join("/");
 }
 
@@ -51,6 +51,8 @@ export async function importFolder(
   try {
     const root = real(ident.root);
     const home = opts.home ?? homedir();
+    /** Set when a discover or resolve call failed, so a later import retries the missed history. */
+    let incomplete = false;
     const subfolders = new Map<string, Promise<FolderIdentity | null>>();
 
     /** The folder identity (with its binding cached) for a subpath, resolved once per subpath. */
@@ -59,7 +61,7 @@ export async function importFolder(
       if (!p) {
         p = api.resolve(ident.repo, subpath).then(
           (r) => { store.cacheBinding(ident.repo, subpath, r.binding); return { ...ident, subpath }; },
-          (e) => { logError(`import resolve ${subpath}`, e); return null; },
+          (e) => { incomplete = true; logError(`import resolve ${subpath}`, e); return null; },
         );
         subfolders.set(subpath, p);
       }
@@ -68,7 +70,7 @@ export async function importFolder(
 
     for (const source of opts.sources ?? allSources()) {
       let files: SourceFile[] = [];
-      try { files = await source.discover({ home }); } catch (e) { logError(`import discover ${source.id}`, e); continue; }
+      try { files = await source.discover({ home }); } catch (e) { incomplete = true; logError(`import discover ${source.id}`, e); continue; }
 
       for (const file of files) {
         try {
@@ -101,7 +103,7 @@ export async function importFolder(
       }
     }
 
-    store.set(`imported:${ident.repo}|${ident.subpath}`, new Date().toISOString());
+    if (!incomplete) store.set(`imported:${ident.repo}|${ident.subpath}`, new Date().toISOString());
     const f = await flush(store, api);
     logInfo("import finished", { ...out, flush: f.outcome });
     return out;
