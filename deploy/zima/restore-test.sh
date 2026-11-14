@@ -22,12 +22,14 @@ SERVER_CONTAINER=${CEREBRO_SERVER_CONTAINER:-cerebro-server}
 log() { echo "restore-test: $*"; }
 psql_in() { docker exec "$DB_CONTAINER" psql -U "$DB_USER" -v ON_ERROR_STOP=1 -tA -d "$1" -c "$2"; }
 
-latest=$(ls -1 "$ROOT/nightly" 2>/dev/null | grep '\.dump$' | sort | tail -n 1 || true)
-if [ -z "$latest" ]; then
+dump=""
+for f in "$ROOT"/nightly/*.dump; do # names are dates: the glob's order is oldest first
+  if [ -f "$f" ]; then dump=$f; fi
+done
+if [ -z "$dump" ]; then
   log "no nightly dump found in $ROOT/nightly"
   exit 1
 fi
-dump="$ROOT/nightly/$latest"
 SCRATCH_DB=${CEREBRO_SCRATCH_DB:-cerebro_restoretest_$(date +%s)_$$}
 export SCRATCH_DB
 if [ "$SCRATCH_DB" = "$DB_NAME" ]; then
@@ -54,7 +56,9 @@ trap cleanup EXIT
 start=$(date +%s)
 log "restoring $dump into $SCRATCH_DB"
 docker exec "$DB_CONTAINER" createdb -U "$DB_USER" "$SCRATCH_DB"
-docker exec -i "$DB_CONTAINER" pg_restore -U "$DB_USER" -d "$SCRATCH_DB" --exit-on-error < "$dump"
+# Inside production's 2 GB container: index builds get a small, serial maintenance budget (the conf allows 256 MB x 3).
+docker exec -i -e PGOPTIONS='-c maintenance_work_mem=64MB -c max_parallel_maintenance_workers=0' "$DB_CONTAINER" \
+  pg_restore -U "$DB_USER" -d "$SCRATCH_DB" --exit-on-error < "$dump"
 log "restored in $(( $(date +%s) - start ))s"
 
 tables=(clients projects bindings sessions events chunks)

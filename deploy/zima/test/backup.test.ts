@@ -279,6 +279,9 @@ describe("restore-test.sh", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("chunks: production 40, restored 40");
     const hostArgs = readFileSync(SHIM_LOG, "utf8");
+    // The restore shares production's 2 GB container: index builds get a small, serial maintenance budget.
+    const restoreCall = hostArgs.split("\n").find((l) => l.includes("pg_restore -U")) ?? "<no pg_restore>";
+    expect(restoreCall).toContain("PGOPTIONS=-c maintenance_work_mem=64MB -c max_parallel_maintenance_workers=0");
     expect(hostArgs).toContain("requeue-missing-embeddings"); // the shim did see the server call...
     expect(hostArgs).not.toContain(PW); // ...and the production URL (with its password) never reached host args
     expect(hostArgs).not.toContain("postgres://");
@@ -319,6 +322,15 @@ describe("restore-test.sh", () => {
     const same = run(["bash", join(ZIMA, "restore-test.sh")], senv(target, { CEREBRO_SCRATCH_DB: "cerebro" }));
     expect(same.code).toBe(1);
     expect(same.out + same.err).toMatch(/equals the production database/);
+  }, 180_000);
+
+  dockerTest("restore-test restores the newest nightly", () => {
+    const target = join(root, "t10");
+    expect(backup(target, { CEREBRO_BACKUP_DATE: "2026-11-12", CEREBRO_BACKUP_DOW: "4" }).code).toBe(0);
+    writeFileSync(join(target, "nightly", "2026-11-01.dump"), "not an archive"); // older: never picked
+    const r = restoreTest(target);
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("nightly/2026-11-12.dump");
   }, 180_000);
 
   dockerTest("restore-test refuses when there is no nightly dump", () => {
