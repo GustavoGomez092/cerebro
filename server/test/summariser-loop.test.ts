@@ -394,6 +394,48 @@ test("a scope invalidated by a re-bind is rebuilt before imported jobs, after li
   }
 });
 
+test("N2: imports stop at three quarters of the share, so dirty rebuilds and live work are never starved by them", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli();
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  try {
+    const { binding: imp } = await boundFolder(t, { client: "Importer", project: "Big", repo: "github.com/acme/big" });
+    for (let i = 1; i <= 6; i++) await endedSession(t, imp.id, `imp${i}`, `import${i}`, { imported: true });
+    const { binding: other } = await boundFolder(t, { client: "Other", project: "Moved", repo: "github.com/acme/moved" });
+    const scope = await dirtyScope(t, other, "Zanzibar");
+    const kind = (c: ClaudeInput) =>
+      c.prompt.includes("Zanzibar") ? "rebuild" : summaryCalls([c]).length ? (c.prompt.includes("heron") ? "live" : "import") : "state";
+
+    // An import has kept spend at 80% of the share (limit 400k; three quarters is 300k).
+    await record(t.sql, 320_000, "summary");
+    await loop.tick();
+    // Imports wait at 75%, without pausing the loop or counting an attempt.
+    expect(cli.calls.map(kind)).toEqual([]);
+    expect(state.paused).toBeNull();
+    expect(await t.sql`select 1 from summary_jobs where attempts > 0 or dead`).toHaveLength(0);
+    expect(await t.sql`select 1 from summary_jobs where priority > 0`).toHaveLength(6);
+    // Live work still has the last quarter.
+    const { binding: live } = await boundFolder(t, { client: "Live", project: "Now", repo: "github.com/acme/now" });
+    await endedSession(t, live.id, "live1", "heron");
+    await loop.tick();
+    expect(cli.calls.map(kind).filter((k) => k !== "state")).toEqual(["live"]);
+
+    // Spend drops below three quarters: the dirty scope's rebuild goes before any import.
+    await t.sql`delete from usage_ledger`;
+    await record(t.sql, 250_000, "summary");
+    await t.sql`update summary_jobs set due_at = now()`;
+    const before = cli.calls.length;
+    await loop.tick();
+    const after = cli.calls.slice(before).map(kind);
+    expect(after.indexOf("rebuild")).toBeGreaterThanOrEqual(0);
+    expect(after.indexOf("import")).toBeGreaterThan(after.indexOf("rebuild"));
+    expect((await t.sql`select dirty from project_states where scope = ${scope}`)[0].dirty).toBe(false);
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
 test("an import of many sessions folds its summaries into the state in batches, not one call per summary", async () => {
   const { t, state } = await setup();
   const cli = fakeCli();

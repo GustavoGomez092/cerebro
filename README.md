@@ -44,7 +44,9 @@ Tokens are input + output + cache creation, as the ledger counts them. With the 
 400 000 tokens per 5 hours: about 11 such sessions (summary + state) per window, 50+ a day, above a busy
 day's volume across the Macs. When the budget runs out, live jobs wait until the window frees up
 (`/v1/status` `summariser.paused.reason: "budget"`), so nothing is lost. If your plan allows more, raise
-`SUBSCRIPTION_TOKENS_PER_5H`; to spend less, lower `SUMMARY_SHARE`.
+`SUBSCRIPTION_TOKENS_PER_5H`; to spend less, lower `SUMMARY_SHARE`. Imported history and project-state
+rebuilds use at most three quarters of the budget (rebuilds first); the last quarter is kept for live
+sessions, so a long import never holds back live summaries or a re-bound folder's state.
 
 #### Summariser status and recovery
 

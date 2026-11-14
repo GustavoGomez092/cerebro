@@ -74,7 +74,10 @@ const STOP_SETTLE_MS = 2_000;
 /** Jobs per tick before dirty scopes get their turn (the next tick then follows at once). */
 const JOBS_PER_TICK = 10;
 const DIRTY_PER_TICK = 2;
-/** Share of the budget window that dirty-scope rebuilds leave for live summaries. */
+/**
+ * Share of the budget window that dirty-scope rebuilds and imported history leave for live summaries. Imports
+ * and rebuilds share the rest; dirty scopes go first each tick, so an import never starves them (N2).
+ */
 const LIVE_RESERVE = 0.25;
 const SCOPE_BACKOFF_MIN_MS = 5 * 60_000;
 const SCOPE_BACKOFF_MAX_MS = 6 * 3600_000;
@@ -86,9 +89,10 @@ const OUTAGE_MAX_MS = 30 * 60_000;
 /**
  * Runs the summariser in the background: every 30 s it queues growing sessions, then claims and
  * summarises jobs one at a time (live before imported), folds each new live summary into its scope's
- * state, and updates up to two dirty scopes (re-binds, histories, imported summaries, batched), which may
- * use at most three quarters of the budget window. Dirty scopes are updated before the first imported
- * job of a tick, so imports never starve them. Single-flight throughout: one Claude call at a time, ever.
+ * state, and updates up to two dirty scopes (re-binds, histories, imported summaries, batched). Dirty
+ * scopes and imported jobs may use at most three quarters of the budget window; the last quarter is for
+ * live summaries. Dirty scopes are updated before the first imported job of a tick, so imports never
+ * starve them. Single-flight throughout: one Claude call at a time, ever.
  *
  * Pauses (reported in `state.paused`): over budget until the window frees up; a usage limit until the
  * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds; an outage
@@ -311,14 +315,18 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
         if (state.paused) return false;
         continue;
       }
-      const res = await summariseJob(sql, embedder, job, { run, budget, signal });
+      const imported = job.priority > 0;
+      const res = await summariseJob(sql, embedder, job, { run, budget: imported ? dirtyBudget : budget, signal });
       noteRun(res);
+      // Imported history stops at three quarters of the window without pausing the loop: the job is due again
+      // when spend drops below that, and the last quarter stays for live summaries.
+      if (imported && res.status === "deferred" && res.reason === "budget") break;
       if (res.status === "deferred" && (res.reason === "login" || res.reason === "unavailable")) probeDeferred.add(job.sessionId);
       if (res.status === "done") outageMs = OUTAGE_MIN_MS;
       if (handle("summary", res)) return false;
       // Imported history waits for the dirty-scope pass, which folds up to 10 summaries per call:
       // one state call per imported summary would spend a whole window on a single opt-in.
-      if (job.priority > 0) continue;
+      if (imported) continue;
       for (const scope of res.scopes) {
         const r = await updateState(sql, scope, [], { run, budget, signal });
         noteRun(r);
