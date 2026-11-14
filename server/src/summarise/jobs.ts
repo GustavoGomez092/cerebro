@@ -101,6 +101,11 @@ export async function completeSummaryJob(
   });
 }
 
+/** Releases the lease without recording anything (work stopped part-way, e.g. on shutdown): due as before. */
+export async function releaseSummaryJob(sql: SQL, sessionId: string): Promise<void> {
+  await sql`update summary_jobs set locked_until = null where session_id = ${sessionId}`;
+}
+
 /**
  * Releases the lease after a failure. Retryable failures (budget, usage limit, login) do not count
  * as attempts (and use `dueAt` when given); the others back off exponentially and dead-letter after five.

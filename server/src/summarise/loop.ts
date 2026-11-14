@@ -2,7 +2,7 @@ import type { SQL } from "bun";
 import type { Config } from "../config";
 import { pgState } from "../db";
 import type { Embedder } from "../embed/embedder";
-import { budgetState, record } from "./budget";
+import { budgetState, estimateTokens, record } from "./budget";
 import { runClaude, type ClaudeInput } from "./claude";
 import { claimSummaryJob, scheduleGrowingSessions } from "./jobs";
 import { updateState, type StateResult } from "./state";
@@ -41,6 +41,8 @@ export interface SummariserDeps {
   tickMs?: number;
   /** No timer: ticks run only when `tick()` is called (tests). */
   manual?: boolean;
+  /** How long stop() lets a Claude call in flight finish before killing it (default 20 s). */
+  stopDeadlineMs?: number;
   log?: (line: string) => void;
 }
 
@@ -48,7 +50,10 @@ export interface Summariser {
   state: SummariserState;
   /** Runs one tick now (after the one in progress, if any). */
   tick(): Promise<void>;
-  /** Stops ticking; resolves once the job in progress (if any) is finished. */
+  /**
+   * Stops ticking: work stops at the next piece or batch; a Claude call still running after the deadline
+   * is killed (its job is freed, or its lease expires, and it is redone later).
+   */
   stop(): Promise<void>;
 }
 
@@ -58,6 +63,14 @@ const PROBE_MS = 15 * 60_000;
 /** Summaries left without an embedding (embedder down when they were stored) are retried this often. */
 const SWEEP_MS = 10 * 60_000;
 const SWEEP_BATCH = 8;
+/** A summary whose embedding fails is skipped by the sweep for this long (doubling up to a day). */
+const SWEEP_BACKOFF_MIN_MS = 60 * 60_000;
+const SWEEP_BACKOFF_MAX_MS = 24 * 3600_000;
+/** Known-good text: if it fails too, the embedder is down and no summary is to blame. */
+const EMBED_CANARY = "cerebro embedder health check";
+const STOP_DEADLINE_MS = 20_000;
+/** After killing the call in flight, how long stop() waits for the job to record that it stopped. */
+const STOP_SETTLE_MS = 2_000;
 /** Jobs per tick before dirty scopes get their turn (the next tick then follows at once). */
 const JOBS_PER_TICK = 10;
 const DIRTY_PER_TICK = 2;
@@ -86,7 +99,13 @@ const LOGIN_PROBE: ClaudeInput = {
  */
 export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserConfig, deps: SummariserDeps = {}): Summariser {
   const state = deps.state ?? newSummariserState(cfg.enabled);
-  const run = deps.run ?? ((input: ClaudeInput) => runClaude(input, { ...process.env, SUMMARISER_CMD: cfg.cmd }));
+  const baseRun = deps.run ?? ((input: ClaudeInput) => runClaude(input, { ...process.env, SUMMARISER_CMD: cfg.cmd }));
+  /** Graceful stop: jobs and state updates check it between calls. */
+  const stopping = new AbortController();
+  /** Hard stop at the deadline: kills the call in flight. */
+  const killing = new AbortController();
+  const run = (input: ClaudeInput) => baseRun({ ...input, signal: killing.signal });
+  const signal = stopping.signal;
   const clock = deps.now ?? (() => new Date());
   const log = deps.log ?? ((l: string) => console.log(l));
   const budget = { share: cfg.share, windowTokens: cfg.windowTokens };
@@ -98,6 +117,8 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
   /** Jobs deferred by a login failure: due again as soon as the login works. */
   const loginDeferred = new Set<string>();
   const scopeBackoff = new Map<string, { until: number; ms: number }>();
+  /** Summaries whose embedding failed, skipped by the sweep until `until`. */
+  const sweepBackoff = new Map<string, { until: number; ms: number }>();
 
   const pause = (reason: PauseReason, until: Date | null) => {
     state.paused = { reason, until: until ? until.toISOString() : null };
@@ -115,13 +136,15 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
 
   /**
    * Acts on a job or state result: pauses for budget, usage limit or login (true when it did); records
-   * other failures in lastError. Timeouts, bad output and inactive bindings never stop the loop.
+   * other failures in lastError. Timeouts, bad output and inactive bindings never stop the loop; a stop
+   * request ends the pass (true) without an error.
    */
   const handle = (where: "summary" | "state", r: SummariseResult | StateResult): boolean => {
     if (r.status !== "deferred" && r.status !== "failed") return false;
     const reason = r.reason ?? "failed";
+    if (reason === "stopped") return true;
     if (reason === "budget") {
-      pause("budget", r.until ?? new Date(Date.now() + RETRY_LATER_MS));
+      pause("budget", r.until ?? new Date(clock().getTime() + RETRY_LATER_MS));
       return true;
     }
     if (reason === "binding") return false;
@@ -156,6 +179,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     const probe = await run(LOGIN_PROBE);
     // Any answer from the model (even one off-schema) means the login works.
     if (!probe.ok && probe.kind !== "bad_output") {
+      if (probe.kind === "timeout") await record(sql, estimateTokens(LOGIN_PROBE.systemPrompt.length + LOGIN_PROBE.prompt.length), "summary");
       if (probe.kind === "usage_limit") {
         pause("usage_limit", probe.resetAt ?? new Date(now + RETRY_LATER_MS));
       } else if (probe.kind !== "auth") {
@@ -177,20 +201,33 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     return true;
   };
 
-  /** Embeds a few summaries that have no vector yet (stored while the embedder was down). */
+  /**
+   * Embeds a few summaries that have no vector yet (stored while the embedder was down). When one fails
+   * and a known-good text embeds fine, that summary is to blame: it is skipped for an hour (doubling up to
+   * a day), so it never holds back newer ones. When the known-good text fails too, the embedder is down:
+   * the sweep ends and everything is retried next time.
+   */
   const sweepEmbeddings = async () => {
     const now = clock().getTime();
     if (lastSweepAt !== null && now - lastSweepAt < SWEEP_MS) return;
     lastSweepAt = now;
+    const skip = [...sweepBackoff].filter(([, b]) => now < b.until).map(([id]) => id);
     // Older than a minute: a summary stored just now is still being embedded by whoever stored it.
     const rows = await sql`
-      select s.id, s.title, s.body from summaries s
+      select s.id::text as id, s.title, s.body from summaries s
       where not exists (select 1 from summary_embeddings e where e.summary_id = s.id)
         and s.created_at < now() - interval '1 minute'
+        and s.id <> all(${skip}::bigint[])
       order by s.id limit ${SWEEP_BATCH}`;
     for (const r of rows) {
       if (stopped) return;
-      if (!(await embedSummary(sql, embedder, r.id, summaryEmbedText(r)))) return; // embedder still failing
+      if (await embedSummary(sql, embedder, r.id, summaryEmbedText(r))) {
+        sweepBackoff.delete(r.id);
+        continue;
+      }
+      if (!(await embedder.embed([EMBED_CANARY]).then(() => true, () => false))) return;
+      const ms = Math.min(SWEEP_BACKOFF_MAX_MS, Math.max(SWEEP_BACKOFF_MIN_MS, (sweepBackoff.get(r.id)?.ms ?? 0) * 2));
+      sweepBackoff.set(r.id, { until: now + ms, ms });
     }
   };
 
@@ -208,7 +245,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       if (backoff && now < backoff.until) continue;
       if ((await budgetState(sql, dirtyBudget)).remaining <= 0) return;
       done++;
-      const r = await updateState(sql, scope, [], { run, budget: dirtyBudget });
+      const r = await updateState(sql, scope, [], { run, budget: dirtyBudget, signal });
       noteRun(r);
       if (r.status === "updated") {
         scopeBackoff.delete(scope);
@@ -243,12 +280,12 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       }
       const job = await claimSummaryJob(sql);
       if (!job) break;
-      const res = await summariseJob(sql, embedder, job, { run, budget });
+      const res = await summariseJob(sql, embedder, job, { run, budget, signal });
       noteRun(res);
       if (res.status === "deferred" && res.reason === "login") loginDeferred.add(job.sessionId);
       if (handle("summary", res)) return false;
       for (const scope of res.scopes) {
-        const r = await updateState(sql, scope, [], { run, budget });
+        const r = await updateState(sql, scope, [], { run, budget, signal });
         noteRun(r);
         if (handle("state", r)) return false;
       }
@@ -281,7 +318,15 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     async stop() {
       stopped = true;
       clearTimeout(timer);
-      await current;
+      stopping.abort();
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<"late">((r) => { deadline = setTimeout(() => r("late"), deps.stopDeadlineMs ?? STOP_DEADLINE_MS); });
+      const outcome = await Promise.race([current, late]);
+      clearTimeout(deadline);
+      if (outcome !== "late") return;
+      killing.abort();
+      log(JSON.stringify({ level: "info", msg: "summariser stop deadline: call in flight killed" }));
+      await Promise.race([current, Bun.sleep(STOP_SETTLE_MS)]);
     },
   };
 }

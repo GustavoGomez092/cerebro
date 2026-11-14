@@ -498,8 +498,9 @@ test("every state call stays within 60 000 input characters", async () => {
   try {
     const { client, project, binding } = await boundFolder(t, { project: "Web" });
     const scope = scopeKey(client.id, project.id);
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
     const all: bigint[] = [];
-    for (let i = 1; i <= 6; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: i, big: true }));
+    for (let i = 1; i <= 6; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: i, big: true, sessionId: "s1" }));
 
     // Maximal state back from every call, maximal summaries in: each call still fits.
     const prompts: string[] = [];
@@ -521,7 +522,7 @@ test("every state call stays within 60 000 input characters", async () => {
     }
 
     rmSync(rec);
-    const more = await addSummary(t, binding, { title: "Big 7", day: 7, big: true });
+    const more = await addSummary(t, binding, { title: "Big 7", day: 7, big: true, sessionId: "s1" });
     expect((await updateState(t.sql, scope, [more], { run: maxRun(), budget: BUDGET })).status).toBe("updated");
     expect(calls()).toHaveLength(1);
     expect(calls()[0]).toBeLessThanOrEqual(60_000);
@@ -769,5 +770,71 @@ test("an update folds a history outside the newest 40", async () => {
     expect(ids(st)).toContain(history);
     expect(st.doc.facts).toContain("Started as a weekend prototype");
     expect(st.dirty).toBe(false);
+  } finally { await t.drop(); }
+});
+
+test("histories too big for the window keep the seed and the newest, and stay out afterwards", async () => {
+  const t = await authedApp();
+  const rec = join(tmpdir(), `cerebro-state-calls-${crypto.randomUUID()}.jsonl`);
+  const calls = () => (existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").filter(Boolean).length : 0);
+  try {
+    const SMALL = { share: 1, windowTokens: 200_000 };
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const histories: bigint[] = [];
+    for (let i = 0; i < 8; i++) histories.push(await addSummary(t, binding, { title: `History ${i}`, day: 1 + i, big: true }));
+    const run = fakeRun("maxstate", { FAKE_CLAUDE_TOKENS: "input", FAKE_CLAUDE_RECORD: rec });
+
+    expect((await rebuildState(t.sql, scope, { run, budget: SMALL })).status).toBe("updated");
+    expect((await budgetState(t.sql, SMALL)).used).toBeLessThanOrEqual(100_000); // at most half the window
+    const st = await stateRow(t, scope);
+    const used = ids(st);
+    expect(used[0]).toBe(histories[0]); // the seed
+    expect(used.length).toBeGreaterThan(1);
+    expect(used.length).toBeLessThan(8);
+    expect(used.slice(1)).toEqual(histories.slice(8 - (used.length - 1))); // then the newest
+    expect(sortedIds(st.excluded_summary_ids)).toEqual(histories.slice(1, 8 - (used.length - 1)));
+
+    // The histories left out are not folded back in one costly call at a time.
+    const n = calls();
+    expect((await updateState(t.sql, scope, [], { run, budget: SMALL })).status).toBe("updated");
+    expect(calls()).toBe(n);
+  } finally {
+    if (existsSync(rec)) rmSync(rec);
+    await t.drop();
+  }
+});
+
+test("a state call that times out is charged its estimated spend", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await addSummary(t, binding, { title: "One", day: 1, facts: ["fact one"] });
+    const slow = (input: ClaudeInput) => fakeRun("slow")({ ...input, timeoutMs: 200 });
+    expect(await rebuildState(t.sql, scope, { run: slow, budget: BUDGET })).toMatchObject({ status: "deferred", reason: "timeout" });
+    const rows = await t.sql`select tokens, kind from usage_ledger`;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("state");
+    expect(rows[0].tokens).toBeGreaterThan(4000);
+  } finally { await t.drop(); }
+});
+
+test("a stop signal ends a rebuild between calls without committing", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
+    for (let i = 0; i < 15; i++) await addSummary(t, binding, { title: `S${i}`, day: 1 + i, sessionId: "s1" });
+    const stop = new AbortController();
+    let calls = 0;
+    const run = async (input: ClaudeInput) => { calls++; stop.abort(); return fakeRun("ok")(input); };
+    expect(await rebuildState(t.sql, scope, { run, budget: BUDGET, signal: stop.signal }))
+      .toMatchObject({ status: "deferred", reason: "stopped" });
+    expect(calls).toBe(1);
+    const st = await stateRow(t, scope);
+    expect(ids(st)).toHaveLength(0);
+    expect(st.dirty).toBe(true);
   } finally { await t.drop(); }
 });

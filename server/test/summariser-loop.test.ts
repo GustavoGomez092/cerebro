@@ -121,7 +121,7 @@ test("usage limit pauses the loop and live work resumes first after reset", asyn
 
     // After the reset (the database's due dates travel with the clock), live work goes first.
     c.advance(31 * MIN);
-    await t.sql`update summary_jobs set due_at = due_at - interval '61 minutes'`;
+    await t.sql`update summary_jobs set due_at = now() - interval '1 second'`;
     cli.mode = "ok";
     await loop.tick();
     expect(state.paused).toBeNull();
@@ -353,15 +353,15 @@ test("summaries left without an embedding are retried every 10 minutes", async (
     const embedded = async () => (await t.sql`select 1 from summary_embeddings`).length;
 
     await loop.tick();
-    expect(embedCalls).toBe(1);
+    expect(embedCalls).toBe(2); // the summary, then a known-good text: the embedder is down
     expect(await embedded()).toBe(0);
     up = true;
     c.advance(5 * MIN);
     await loop.tick();
-    expect(embedCalls).toBe(1);
+    expect(embedCalls).toBe(2);
     c.advance(6 * MIN);
     await loop.tick();
-    expect(embedCalls).toBe(2);
+    expect(embedCalls).toBe(3); // not held back: the embedder was to blame, not the summary
     expect(await embedded()).toBe(1);
   } finally {
     await loop.stop();
@@ -399,6 +399,59 @@ test("stop waits for the job in flight and runs nothing after it", async () => {
     expect(cli.calls.length).toBe(n);
   } finally {
     release();
+    await loop.stop();
+    await t.drop();
+  }
+});
+
+test("stop kills a call still running at the deadline and charges no attempt", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli("slow");
+  let started!: () => void;
+  const inFlight = new Promise<void>((r) => { started = r; });
+  const run = (input: ClaudeInput) => { started(); return cli.run(input); };
+  const { binding } = await boundFolder(t, { project: "Web" });
+  await endedSession(t, binding.id, "s1", "osprey");
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run, state, tickMs: 20, stopDeadlineMs: 300, log: quiet });
+  try {
+    await inFlight;
+    const begun = Date.now();
+    await loop.stop();
+    expect(Date.now() - begun).toBeLessThan(5000);
+    const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ attempts: 0, dead: false });
+    expect(await t.sql`select 1 from summaries`).toHaveLength(0);
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
+test("a summary that never embeds does not hold back newer ones", async () => {
+  const base = fakeEmbedder();
+  const picky: Embedder = {
+    dims: 1024,
+    embed: async (texts, signal) => {
+      if (texts.some((x) => x.includes("Poison"))) throw new EmbedderError("rejected");
+      return base.embed(texts, signal);
+    },
+  };
+  const { t, state } = await setup(CFG, { embedder: picky });
+  const c = clock();
+  const loop = startSummariser(t.sql, picky, CFG, { run: fakeCli().run, state, now: c.now, manual: true, log: quiet });
+  try {
+    const { binding } = await boundFolder(t, { project: "Web" });
+    for (const [i, title] of ["Poison", "Kingfisher"].entries()) {
+      await t.sql`
+        insert into summaries (kind, binding_id, client_id, project_id, ts_from, ts_to, title, body, text, model, created_at)
+        values ('history', ${binding.id}, ${binding.clientId}, ${binding.projectId}, now() - interval '2 days' + ${i} * interval '1 hour',
+          now() - interval '1 day', ${title}, ${JSON.stringify({ title, overview: `About ${title}`, facts: [] })}::text::jsonb,
+          ${`About ${title}`}, 'client', now() - interval '5 minutes')`;
+    }
+    await loop.tick();
+    const embedded = await t.sql`select s.title from summary_embeddings e join summaries s on s.id = e.summary_id`;
+    expect(embedded.map((r: any) => r.title)).toEqual(["Kingfisher"]);
+  } finally {
     await loop.stop();
     await t.drop();
   }

@@ -10,6 +10,8 @@ export interface ClaudeInput {
   prompt: string;
   schema: object;
   timeoutMs?: number;
+  /** Aborting kills the call; it then fails like a timeout (a killed call, its spend unknown). */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_TIMEOUT_MS = 180_000;
@@ -76,6 +78,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
   const childEnv: Record<string, string | undefined> = { ...env, CEREBRO_HEADLESS: "1" };
   for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]) delete childEnv[k];
 
+  if (input.signal?.aborted) return fail("timeout", "claude call aborted");
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: childEnv });
@@ -84,10 +87,16 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
   }
 
   let timedOut = false;
+  let aborted = false;
   const timer = setTimeout(() => {
     timedOut = true;
     proc.kill("SIGKILL");
   }, input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const onAbort = () => {
+    aborted = true;
+    proc.kill("SIGKILL");
+  };
+  input.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     const stdout = new Response(proc.stdout as ReadableStream).text();
@@ -100,6 +109,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
       // child may exit before reading stdin; its output still tells us why
     }
     const [out, err, code] = await Promise.all([stdout, stderr, proc.exited]);
+    if (aborted) return fail("timeout", "claude call aborted");
     if (timedOut) return fail("timeout", `claude timed out after ${input.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`);
 
     let parsed: Record<string, unknown> | null = null;
@@ -136,6 +146,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
     };
   } finally {
     clearTimeout(timer);
+    input.signal?.removeEventListener("abort", onAbort);
     if (proc.exitCode === null) proc.kill("SIGKILL");
   }
 }
