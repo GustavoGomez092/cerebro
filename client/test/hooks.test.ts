@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Binding } from "@cerebro/shared";
@@ -75,6 +75,7 @@ function setup(): Env {
   const home = tmp();
   process.env.CEREBRO_HOME = home;
   const store = new Store(join(home, "cerebro.db"));
+  store.set("lastSyncAt", new Date().toISOString()); // a recent sync, so SessionStart does not schedule another
   const { dir, repo } = gitRepo();
   const sid = crypto.randomUUID();
   const transcript = join(tmp(), `${sid}.jsonl`);
@@ -140,6 +141,77 @@ test("bound folder: SessionStart returns a brief under 1500 chars and schedules 
   e.calls.length = 0;
   await handleHook("SessionStart", e.input({ source: "resume" }), e.deps());
   expect(e.calls).toEqual([["flush"]]);
+  e.store.close();
+});
+
+test("SessionStart schedules `cerebro sync` when the last sync is over an hour old", async () => {
+  const e = setup();
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).not.toContainEqual(["sync"]);
+
+  e.store.set("lastSyncAt", new Date(Date.now() - 61 * 60_000).toISOString());
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).toContainEqual(["sync"]);
+
+  e.store.set("lastSyncAt", null);
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).toContainEqual(["sync"]);
+
+  // not configured or headless: no sync
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps(null));
+  await handleHook("SessionStart", e.input(), { ...e.deps(), env: { CEREBRO_HEADLESS: "1" } });
+  expect(e.calls).not.toContainEqual(["sync"]);
+  e.store.close();
+});
+
+test("SessionStart keeps ~/.cerebro/config.json equal to the plugin settings it was started with", async () => {
+  const e = setup();
+  const home = process.env.CEREBRO_HOME!;
+  const file = join(home, "config.json");
+  const plugin = { CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://zima:8787", CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_first" };
+  const run = (env: Record<string, string>) => handleHook("SessionStart", e.input(), { ...e.deps(), env });
+  const saved = () => JSON.parse(readFileSync(file, "utf8"));
+  const mode = () => statSync(file).mode & 0o777;
+
+  // no file yet: written, owner-only
+  await run(plugin);
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_first" });
+  expect(mode()).toBe(0o600);
+
+  // equal: left alone
+  const old = (Date.now() - 3600_000) / 1000;
+  utimesSync(file, old, old);
+  const before = statSync(file).mtimeMs;
+  await run(plugin);
+  expect(statSync(file).mtimeMs).toBe(before);
+
+  // the token was rotated in the plugin settings: replaced
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_rotated" });
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_rotated" });
+  expect(mode()).toBe(0o600);
+
+  // an older, world-readable file ends owner-only (same content or not)
+  chmodSync(file, 0o644);
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_rotated" });
+  expect(mode()).toBe(0o600);
+  writeFileSync(file, JSON.stringify({ serverUrl: "http://old", token: "cbr_old" }));
+  chmodSync(file, 0o644);
+  await run(plugin);
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_first" });
+  expect(mode()).toBe(0o600);
+  expect(readdirSync(home).filter((n) => n.startsWith("config.json") && n !== "config.json")).toEqual([]); // no temp files left
+
+  // headless, or settings not complete in the env: untouched
+  writeFileSync(file, JSON.stringify({ serverUrl: "http://keep", token: "cbr_keep" }));
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_headless", CEREBRO_HEADLESS: "1" });
+  await run({ CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://half" });
+  expect(saved()).toEqual({ serverUrl: "http://keep", token: "cbr_keep" });
+  rmSync(file);
+  await run({});
+  expect(existsSync(file)).toBe(false);
   e.store.close();
 });
 
@@ -247,9 +319,34 @@ test("a server that is not the pinned instance never sees the token, and the bri
   const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps(spy)));
   expect(authed).toEqual([]);
   expect(ctx).toContain("Acme / App");
-  expect(ctx).toContain("reset-instance");
+  expect(ctx).toContain("run `~/.cerebro/bin/cerebro reset-instance`");
   expect(e.store.get("blocked")).toBe("instance_mismatch");
   e.store.close();
+});
+
+test("problem lines name the CLI by its stable path, which works without cerebro on PATH", async () => {
+  for (const reason of ["token_revoked", "unauthorized"] as const) {
+    const e = setup();
+    await bind(e.repo);
+    e.store.set("blocked", reason);
+    const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps()));
+    expect(ctx, reason).toContain("run `~/.cerebro/bin/cerebro status --retry`");
+    expect(ctx, reason).not.toMatch(/(^|[^/])`?cerebro (status|reset-instance|retention|schedule|sync|import)/m);
+    e.store.close();
+  }
+  const binding: Binding = { id: "b", repo: "r", subpath: "", status: "active", clientId: "c", projectId: "p" };
+  const brief = buildBrief(binding, "Acme", [], { pending: 0, quarantined: 2 }, []);
+  expect(brief).toContain("(see `~/.cerebro/bin/cerebro status`)");
+});
+
+test("no message in client/src or plugin/ tells anyone to run a bare `cerebro <command>`", async () => {
+  const root = join(import.meta.dir, "..", "..");
+  const files = [...new Bun.Glob("client/src/**/*.ts").scanSync(root), ...new Bun.Glob("plugin/**/*.{md,json}").scanSync(root)];
+  const bare = /\b(run|see|use|try)\s+\(?`?cerebro\s+(status|retention|schedule|sync|import|reset-instance|flush)\b/i;
+  for (const f of files) {
+    const code = readFileSync(join(root, f), "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*\*)/.test(l));
+    for (const l of code) expect(bare.test(l), `${f}: ${l.trim()}`).toBe(false);
+  }
 });
 
 test("Stop captures then schedules a flush; SessionEnd does no network I/O", async () => {

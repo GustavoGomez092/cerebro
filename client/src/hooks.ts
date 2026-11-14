@@ -2,10 +2,12 @@ import type { Binding, SessionView } from "@cerebro/shared";
 import type { ApiClient } from "./api";
 import { buildBrief } from "./brief";
 import { captureTranscript, type CaptureResult } from "./capture";
+import { syncConfigFile } from "./config";
 import { folderIdentity, type FolderIdentity } from "./identity";
 import { checkInstance } from "./instance";
 import { logError } from "./log";
 import { claudeCodeSource } from "./sources/claude-code";
+import { ensureCliLink } from "./schedule";
 import { spawnDetached } from "./spawn";
 import type { BlockedReason, Store } from "./store";
 
@@ -39,6 +41,8 @@ export interface HookDeps {
 const NETWORK_BUDGET_MS = 1500;
 /** Not worth starting a request with less time than this left. */
 const MIN_CALL_MS = 50;
+/** SessionStart starts a background `cerebro sync` (other agents' history) when the last one is older than this. */
+const SYNC_EVERY_MS = 60 * 60_000;
 
 export const UNKNOWN_FOLDER_CONTEXT =
   "Cerebro memory is installed but this folder is not set up. Before starting the user's task, use the cerebro skill to ask whether to use Cerebro here.";
@@ -48,12 +52,12 @@ export const NOT_CONFIGURED_CONTEXT =
 
 const PROBLEMS: Record<BlockedReason, string> = {
   token_revoked:
-    "uploads are stopped: this Mac's Cerebro token was revoked. Ask the owner for a new token, put it in the plugin's settings, then run `cerebro status --retry`.",
+    "uploads are stopped: this Mac's Cerebro token was revoked. Ask the owner for a new token, put it in the plugin's settings, then run `~/.cerebro/bin/cerebro status --retry`.",
   unauthorized:
-    "uploads are stopped: the server does not accept this Mac's token. Check the token in the plugin's settings, then run `cerebro status --retry`.",
+    "uploads are stopped: the server does not accept this Mac's token. Check the token in the plugin's settings, then run `~/.cerebro/bin/cerebro status --retry`.",
   instance_mismatch:
     "uploads are stopped: the server answering at the configured URL is not the Cerebro instance this Mac was set up with. " +
-    "Check the server URL; if the server was reinstalled, run `cerebro reset-instance`.",
+    "Check the server URL; if the server was reinstalled, run `~/.cerebro/bin/cerebro reset-instance`.",
 };
 
 /**
@@ -123,7 +127,11 @@ type Left = () => number;
 
 async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: string[]) => void): Promise<string> {
   const { store, api } = deps;
+  ensureCliLink(); // keeps ~/.cerebro/bin/cerebro (used by launchd and the skill) on the current binary
+  // launchd's sync and commands Claude runs through Bash never see the plugin settings; they read config.json.
+  try { syncConfigFile(deps.env); } catch (e) { logError("SessionStart config file", e); }
   if (!api) return context(NOT_CONFIGURED_CONTEXT);
+  if (!(Date.now() - Date.parse(store.get("lastSyncAt") ?? "") < SYNC_EVERY_MS)) spawn(["sync"]);
   const cwd = input.cwd;
   if (!cwd) return "";
 

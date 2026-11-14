@@ -120,8 +120,12 @@ test("the skill file has the required frontmatter and names every MCP tool it us
   expect(m![1]).toContain("name: cerebro");
   expect(m![1]).toContain("description: Use when Cerebro says this folder is not set up, or when the user wants to change which client/project this folder belongs to, stop recording here, or check Cerebro's status.");
   const body = m![2];
-  for (const t of ["cerebro_folder", "cerebro_bind", "cerebro_decline", "cerebro_adopt", "rebind", "AskUserQuestion", "cerebro schedule", "Codex", "Gemini"]) {
+  expect(m![1]).toContain("this folder is not set up");
+  for (const t of ["cerebro_folder", "cerebro_bind", "cerebro_decline", "cerebro_adopt", "rebind", "AskUserQuestion", "Codex", "Gemini"]) {
     expect(body).toContain(t);
   }
+  // the CLI is run through the stable link, which exists wherever the plugin has started once
+  for (const cmd of ["status", "retention", "schedule"]) expect(body).toContain(`~/.cerebro/bin/cerebro ${cmd}`);
+  expect(body).not.toMatch(/(^|[^/])`cerebro (status|retention|schedule)/m);
   expect(existsSync(join(import.meta.dir, "../../plugin/skills/cerebro"))).toBe(true);
 });

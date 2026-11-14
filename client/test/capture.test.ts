@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { Binding } from "@cerebro/shared";
 import { captureTranscript, sweepOpenCursors } from "../src/capture";
 import type { FolderIdentity } from "../src/identity";
+import { codexSource } from "../src/sources/codex";
+import { geminiSource } from "../src/sources/gemini";
 import { Store } from "../src/store";
 
 let prev: string | undefined;
@@ -124,5 +126,30 @@ test("sweep picks up lines written after the last hook", () => {
   expect(sweepOpenCursors(store)).toBe(1);
   expect(store.pendingCount()).toBe(2);
   expect(sweepOpenCursors(store)).toBe(0);
+  store.close();
+});
+
+test("sweep re-reads every agent's open cursors through its own adapter", () => {
+  const { store } = setup();
+  store.cacheBinding(ident.repo, "", binding());
+  const codexPath = join(tmp(), "rollout-2026-01-05T10-00-07-x.jsonl");
+  const msg = (text: string) => JSON.stringify({
+    timestamp: "2026-01-05T10:00:10.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+  }) + "\n";
+  writeFileSync(codexPath, JSON.stringify({ timestamp: "2026-01-05T10:00:00.000Z", type: "session_meta", payload: { id: "x", cwd: "/work/app" } }) + "\n" + msg("a"));
+  const input = { sessionId: "codex:x", transcriptPath: codexPath, cwd: "/work/app", source: codexSource };
+  expect(captureTranscript(store, input, ident).events).toBe(1);
+  appendFileSync(codexPath, msg("b"));
+  expect(sweepOpenCursors(store)).toBe(1);
+  expect(store.nextEvents(10, 1e6).map((e) => [e.sessionId, e.text])).toEqual([["codex:x", "a"], ["codex:x", "b"]]);
+
+  // a Gemini cursor names one session inside a shared logs.json (`<file>#<session>`)
+  const logs = join(tmp(), "logs.json");
+  const rec = (i: number) => ({ sessionId: "g1", messageId: i, type: "user", message: `p${i}`, timestamp: "2026-01-05T10:00:00.000Z" });
+  writeFileSync(logs, JSON.stringify([rec(0)]));
+  const g = captureTranscript(store, { sessionId: "gemini:g1", transcriptPath: `${logs}#g1`, cwd: "/work/app", source: geminiSource }, ident);
+  expect(g).toMatchObject({ status: "recorded", events: 1 });
+  writeFileSync(logs, JSON.stringify([rec(0), rec(1)]));
+  expect(sweepOpenCursors(store)).toBe(1);
   store.close();
 });

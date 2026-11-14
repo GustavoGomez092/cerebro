@@ -26,7 +26,7 @@ export function buildBrief(
 
   // Problems go first so that clipping a long brief only ever cuts the session list.
   if (queue.quarantined > 0) {
-    lines.push(`Problem: ${queue.quarantined} event${queue.quarantined === 1 ? " was" : "s were"} rejected by the server and set aside (see cerebro status).`);
+    lines.push(`Problem: ${queue.quarantined} event${queue.quarantined === 1 ? " was" : "s were"} rejected by the server and set aside (see \`~/.cerebro/bin/cerebro status\`).`);
   }
   for (const p of problems) lines.push(`Problem: ${clip(p, 300)}`);
 

@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 
 export const MAX_READ_BYTES = 16 * 1024 * 1024;
 
@@ -46,6 +46,40 @@ export function readCompleteLines(path: string, fromOffset: number, fromLine: nu
     return { lines, nextOffset: fromOffset + start, nextLine: lineNo };
   } catch {
     return none;
+  } finally {
+    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+const HEAD_CHUNK = 16 * 1024;
+const HEAD_MAX = MAX_READ_BYTES;
+
+/**
+ * The first `count` complete lines of a file (fewer when the file has fewer), for reading a header cheaply.
+ * Reads in growing chunks, so a short header costs one small read and a long one (up to 16 MB) is still found.
+ * Never throws.
+ */
+export function headLines(path: string, count = 1): string[] {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    let buf = Buffer.alloc(0);
+    let chunk = HEAD_CHUNK;
+    for (;;) {
+      const more = Buffer.alloc(Math.min(chunk, size - buf.length, HEAD_MAX - buf.length));
+      const n = more.length ? readFully(fd, more, buf.length) : 0;
+      buf = Buffer.concat([buf, more.subarray(0, n)]);
+      let lines = 0;
+      for (let i = buf.indexOf(10); i >= 0 && lines < count; i = buf.indexOf(10, i + 1)) lines++;
+      if (lines >= count || n === 0 || buf.length >= size || buf.length >= HEAD_MAX) break;
+      chunk *= 2;
+    }
+    const end = buf.lastIndexOf(10);
+    if (end < 0) return [];
+    return buf.toString("utf8", 0, end).split("\n").slice(0, count).map((l) => l.replace(/\r$/, ""));
+  } catch {
+    return [];
   } finally {
     if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
   }
