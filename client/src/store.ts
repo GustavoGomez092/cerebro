@@ -92,6 +92,11 @@ export class Store {
     return (this.db.query("select * from cursors where done = 0 order by rowid").all() as Row[]).map(toCursor);
   }
 
+  /** Working directories of every transcript ever captured for a binding. */
+  boundFolders(): string[] {
+    return (this.db.query("select distinct cwd from cursors where binding_id is not null").all() as { cwd: string }[]).map((r) => r.cwd);
+  }
+
   markDone(path: string): void { this.db.query("update cursors set done = 1 where transcript_path = ?").run(path); }
 
   // sessions

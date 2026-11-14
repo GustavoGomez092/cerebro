@@ -70,7 +70,7 @@ export async function importFolder(
 
     for (const source of opts.sources ?? allSources()) {
       let files: SourceFile[] = [];
-      try { files = await source.discover({ home }); } catch (e) { incomplete = true; logError(`import discover ${source.id}`, e); continue; }
+      try { files = await source.discover({ home, folders: [root, real(cwd)] }); } catch (e) { incomplete = true; logError(`import discover ${source.id}`, e); continue; }
 
       for (const file of files) {
         try {

@@ -38,6 +38,8 @@ export interface HookDeps {
 const NETWORK_BUDGET_MS = 1500;
 /** Not worth starting a request with less time than this left. */
 const MIN_CALL_MS = 50;
+/** SessionStart starts a background `cerebro sync` (other agents' history) when the last one is older than this. */
+const SYNC_EVERY_MS = 60 * 60_000;
 
 export const UNKNOWN_FOLDER_CONTEXT =
   "Cerebro memory is installed but this folder is not set up. Before starting the user's task, use the cerebro skill to ask whether to use Cerebro here.";
@@ -111,6 +113,7 @@ async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: stri
   const { store, api, env } = deps;
   if (env.CEREBRO_HEADLESS === "1") return "";
   if (!api) return context(NOT_CONFIGURED_CONTEXT);
+  if (!(Date.now() - Date.parse(store.get("lastSyncAt") ?? "") < SYNC_EVERY_MS)) spawn(["sync"]);
   const cwd = input.cwd;
   if (!cwd) return "";
 

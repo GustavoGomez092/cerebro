@@ -27,7 +27,7 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v !== 
  * Makes text storable and redacts secrets FIRST, then truncates, so a secret straddling the cut
  * (e.g. a PEM key losing its END line) can never survive unredacted.
  */
-function clean(text: string): string {
+export function clean(text: string): string {
   const t = redactSecrets(storable(text));
   if (t.length * 3 > MAX_TEXT_BYTES) {
     const bytes = Buffer.byteLength(t);
@@ -39,7 +39,7 @@ function clean(text: string): string {
 }
 
 /** Cleans every string value (keys go through `storable` only). */
-function cleanDeep(v: unknown): unknown {
+export function cleanDeep(v: unknown): unknown {
   if (typeof v === "string") return clean(v);
   if (Array.isArray(v)) return v.map(cleanDeep);
   if (isObj(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [storable(k), cleanDeep(x)]));

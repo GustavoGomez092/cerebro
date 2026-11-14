@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 
 export const MAX_READ_BYTES = 16 * 1024 * 1024;
 
@@ -46,6 +46,23 @@ export function readCompleteLines(path: string, fromOffset: number, fromLine: nu
     return { lines, nextOffset: fromOffset + start, nextLine: lineNo };
   } catch {
     return none;
+  } finally {
+    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+/** The complete lines in the first `maxBytes` of a file, for reading a header cheaply. Never throws. */
+export function headLines(path: string, maxBytes = 256 * 1024): string[] {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(Math.min(maxBytes, fstatSync(fd).size));
+    const got = readFully(fd, buf, 0);
+    const end = buf.subarray(0, got).lastIndexOf(10);
+    if (end < 0) return [];
+    return buf.toString("utf8", 0, end).split("\n").map((l) => l.replace(/\r$/, ""));
+  } catch {
+    return [];
   } finally {
     if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
   }

@@ -115,6 +115,18 @@ test("cursors round-trip, list open ones, and markDone closes them", () => {
   s.close();
 });
 
+test("boundFolders lists the distinct folders of cursors that have a binding, done or not", () => {
+  const s = fresh();
+  const c = { source: "codex", sessionId: "s", offset: 0, line: 0, state: null, cwd: "/a", repo: "r", subpath: "" };
+  s.setCursor("/1.jsonl", { ...c, bindingId: "b1" });
+  s.setCursor("/2.jsonl", { ...c, bindingId: "b1" });
+  s.setCursor("/3.jsonl", { ...c, bindingId: "b2", cwd: "/b" });
+  s.setCursor("/4.jsonl", { ...c, bindingId: null, cwd: "/unbound" });
+  s.markDone("/3.jsonl");
+  expect(s.boundFolders().sort()).toEqual(["/a", "/b"]);
+  s.close();
+});
+
 test("sessions: upsert re-marks unsent only when changed", () => {
   const s = fresh();
   s.upsertSession(sess("a"));

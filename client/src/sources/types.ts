@@ -1,6 +1,16 @@
 import type { IngestEvent } from "@cerebro/shared";
 
-export interface SourceFile { source: string; path: string; sessionId: string; cwd: string | null; modifiedMs: number }
+export interface SourceFile {
+  source: string;
+  path: string;
+  sessionId: string;
+  cwd: string | null;
+  modifiedMs: number;
+  /** Git remote recorded by the agent itself; used as the folder identity when present. */
+  repo?: string | null;
+  /** Cursor offset at which everything currently in the file has been read (bytes, or records for Gemini). */
+  endOffset?: number;
+}
 
 export interface SourceRead {
   events: IngestEvent[];
@@ -20,6 +30,7 @@ export interface HistorySource {
   id: string;
   /** True only for claude-code (captured by hooks). */
   live: boolean;
-  discover(roots?: { home?: string }): Promise<SourceFile[]>;
+  /** `folders`: project folders known to Cerebro (Gemini names its logs by a hash of the folder path). */
+  discover(roots?: { home?: string; folders?: string[] }): Promise<SourceFile[]>;
   read(file: SourceFile, cursor: { offset: number; line: number; state?: unknown }): SourceRead;
 }

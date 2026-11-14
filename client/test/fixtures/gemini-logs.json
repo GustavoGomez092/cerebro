@@ -1,0 +1,30 @@
+[
+  {
+    "sessionId": "00000000-0000-4000-8000-000000000001",
+    "messageId": 0,
+    "type": "user",
+    "message": "placeholder message 1",
+    "timestamp": "2026-01-05T10:00:07.000Z"
+  },
+  {
+    "sessionId": "00000000-0000-4000-8000-000000000002",
+    "messageId": 0,
+    "type": "user",
+    "message": "placeholder message 2",
+    "timestamp": "2026-01-05T10:00:14.000Z"
+  },
+  {
+    "sessionId": "00000000-0000-4000-8000-000000000002",
+    "messageId": 1,
+    "type": "user",
+    "message": "placeholder message 3",
+    "timestamp": "2026-01-05T10:00:21.000Z"
+  },
+  {
+    "sessionId": "00000000-0000-4000-8000-000000000002",
+    "messageId": 2,
+    "type": "user",
+    "message": "placeholder message 4",
+    "timestamp": "2026-01-05T10:00:28.000Z"
+  }
+]

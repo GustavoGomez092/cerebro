@@ -8,6 +8,11 @@ function selfArgs(): string[] {
   return runtime === "bun" || runtime === "bun-debug" ? [join(import.meta.dir, "cli.ts")] : [];
 }
 
+/** The command line that runs this cerebro (the compiled binary, or bun plus cli.ts). */
+export function selfCommand(): string[] {
+  return [process.execPath, ...selfArgs()];
+}
+
 /** Starts `cerebro <args>` in the background, detached from this process. Never throws. */
 export function spawnDetached(args: string[]): void {
   try {

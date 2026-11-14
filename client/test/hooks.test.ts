@@ -75,6 +75,7 @@ function setup(): Env {
   const home = tmp();
   process.env.CEREBRO_HOME = home;
   const store = new Store(join(home, "cerebro.db"));
+  store.set("lastSyncAt", new Date().toISOString()); // a recent sync, so SessionStart does not schedule another
   const { dir, repo } = gitRepo();
   const sid = crypto.randomUUID();
   const transcript = join(tmp(), `${sid}.jsonl`);
@@ -140,6 +141,29 @@ test("bound folder: SessionStart returns a brief under 1500 chars and schedules 
   e.calls.length = 0;
   await handleHook("SessionStart", e.input({ source: "resume" }), e.deps());
   expect(e.calls).toEqual([["flush"]]);
+  e.store.close();
+});
+
+test("SessionStart schedules `cerebro sync` when the last sync is over an hour old", async () => {
+  const e = setup();
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).not.toContainEqual(["sync"]);
+
+  e.store.set("lastSyncAt", new Date(Date.now() - 61 * 60_000).toISOString());
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).toContainEqual(["sync"]);
+
+  e.store.set("lastSyncAt", null);
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps());
+  expect(e.calls).toContainEqual(["sync"]);
+
+  // not configured or headless: no sync
+  e.calls.length = 0;
+  await handleHook("SessionStart", e.input(), e.deps(null));
+  await handleHook("SessionStart", e.input(), { ...e.deps(), env: { CEREBRO_HEADLESS: "1" } });
+  expect(e.calls).not.toContainEqual(["sync"]);
   e.store.close();
 });
 
