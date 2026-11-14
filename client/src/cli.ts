@@ -1,10 +1,15 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { ApiClient } from "./api";
-import { loadClientConfig } from "./config";
-import { flush, type FlushOptions } from "./flush";
+import { loadClientConfig, saveClientConfig, type ClientConfig } from "./config";
+import { flush, type FlushOptions, type FlushResult } from "./flush";
 import { handleHook, HOOK_EVENTS, type HookEvent } from "./hooks";
 import { importFolder } from "./importer";
+import { checkInstance } from "./instance";
 import { logError } from "./log";
-import { installSchedule, removeSchedule } from "./schedule";
+import { startMcpServer } from "./mcp";
+import { ensureCliLink, installSchedule, removeSchedule } from "./schedule";
 import { addToInbox } from "./sources/generic";
 import { Store } from "./store";
 import { syncAllSources } from "./sync";
@@ -59,15 +64,7 @@ const flushCommand: Command = {
         const api = new ApiClient(config);
         const r = await flush(store, api, opts);
         if (r.outcome === "error") logError("flush", "flush ended with an unexpected error");
-        // "done"/"nothing" mean /health matched the pinned instance, so the token may be sent.
-        if ((r.outcome === "done" || r.outcome === "nothing") && !store.get("machine")) {
-          try {
-            const { machine } = await api.status({ timeoutMs: MACHINE_TIMEOUT_MS });
-            if (machine) store.set("machine", machine);
-          } catch (e) {
-            logError("flush status", e);
-          }
-        }
+        await learnMachineName(store, api);
         await Bun.write(Bun.stdout, JSON.stringify(r) + "\n");
       } finally {
         store.close();
@@ -78,20 +75,127 @@ const flushCommand: Command = {
   },
 };
 
-/** The server's name for this Mac (cached in state `machine`), or null when it cannot be had. */
-async function machineName(store: Store, api: ApiClient | null): Promise<string | null> {
-  const cached = store.get("machine");
-  if (cached || !api) return cached ?? null;
+/** Caches the server's name for this Mac (state `machine`), asking only a pinned, unblocked, verified instance. */
+async function learnMachineName(store: Store, api: ApiClient): Promise<void> {
+  if (store.get("machine") || !store.get("instanceId") || store.get("blocked")) return;
   try {
+    if ((await checkInstance(store, api, { timeoutMs: MACHINE_TIMEOUT_MS })) !== "ok") return;
     const { machine } = await api.status({ timeoutMs: MACHINE_TIMEOUT_MS });
-    if (typeof machine !== "string" || !machine) return null;
-    store.set("machine", machine);
-    return machine;
+    if (machine) store.set("machine", machine);
   } catch (e) {
-    logError("machine name", e);
-    return null;
+    logError("flush status", e);
   }
 }
+
+const mcp: Command = {
+  usage: "mcp   (stdio MCP server: recall and setup tools)",
+  async run() {
+    try {
+      await startMcpServer();
+    } catch (e) {
+      logError("mcp", e);
+    }
+  },
+};
+
+/** The status report. Never includes the token. */
+export function statusText(store: Store, config: ClientConfig | null): string {
+  if (!config) {
+    return [
+      "Cerebro: not configured",
+      "Set the plugin options server_url and token (Claude Code: /plugin, then configure cerebro),",
+      "or set CEREBRO_SERVER_URL and CEREBRO_TOKEN.",
+      "",
+    ].join("\n");
+  }
+  return [
+    `server: ${config.serverUrl}`,
+    `machine: ${store.get("machine") ?? "(unknown)"}`,
+    `instance: ${store.get("instanceId") ?? "(not pinned yet)"}`,
+    `queue: ${store.pendingCount()} pending, ${store.quarantineCount()} quarantined`,
+    `pending session ends: ${store.pendingEnds().length}`,
+    `last flush: ${store.get("lastFlushAt") ?? "never"}`,
+    `blocked: ${store.get("blocked") ?? "no"}`,
+    `last error: ${store.get("lastError") ?? "none"}`,
+    `open cursors: ${store.openCursors().length}`,
+    "",
+  ].join("\n");
+}
+
+/** Lifts a block and any backoff, then runs one flush. */
+export async function retryAfterBlock(store: Store, api: ApiClient): Promise<FlushResult> {
+  store.set("blocked", null);
+  store.set("backoffUntil", null);
+  store.set("backoffMs", null);
+  return flush(store, api);
+}
+
+const status: Command = {
+  usage: "status [--retry]   (show upload state; --retry clears a block and flushes once)",
+  async run(args) {
+    const config = loadClientConfig();
+    const store = new Store();
+    try {
+      if (config && args.includes("--retry")) {
+        const r = await retryAfterBlock(store, new ApiClient(config));
+        await Bun.write(Bun.stdout, `retry: ${r.outcome}\n`);
+      }
+      await Bun.write(Bun.stdout, statusText(store, config));
+    } finally {
+      store.close();
+    }
+  },
+};
+
+const DEFAULT_RETENTION_DAYS = 36500;
+
+const retention: Command = {
+  usage: `retention [--days N]   (set Claude Code's cleanupPeriodDays, default ${DEFAULT_RETENTION_DAYS}, so transcripts outlive the upload)`,
+  async run(args) {
+    const i = args.indexOf("--days");
+    const days = i >= 0 ? Number(args[i + 1]) : DEFAULT_RETENTION_DAYS;
+    if (!Number.isInteger(days) || days < 1) {
+      await Bun.write(Bun.stdout, "--days needs a positive whole number\n");
+      return;
+    }
+    const path = join(process.env.HOME || homedir(), ".claude", "settings.json");
+    let settings: Record<string, unknown> = {};
+    if (existsSync(path)) {
+      try {
+        const parsed = JSON.parse(readFileSync(path, "utf8"));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+        settings = parsed;
+      } catch {
+        await Bun.write(Bun.stdout, `${path} is not valid JSON; left untouched. Fix it, then run this again.\n`);
+        return;
+      }
+    }
+    const current = settings.cleanupPeriodDays;
+    await Bun.write(Bun.stdout, `cleanupPeriodDays is currently ${current === undefined ? "unset (Claude Code default: 30)" : String(current)}\n`);
+    if (current === days) {
+      await Bun.write(Bun.stdout, "Already set; nothing to change.\n");
+      return;
+    }
+    settings.cleanupPeriodDays = days;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+    await Bun.write(Bun.stdout, `Set cleanupPeriodDays to ${days} in ${path}\n`);
+  },
+};
+
+const resetInstance: Command = {
+  usage: "reset-instance   (forget the pinned server instance, for a reinstalled server)",
+  async run() {
+    const store = new Store();
+    try {
+      store.set("instanceId", null);
+      if (store.get("blocked") === "instance_mismatch") store.set("blocked", null);
+    } finally {
+      store.close();
+    }
+    await Bun.write(Bun.stdout, "Cleared the pinned instance; the next upload pins whichever server it reaches.\n");
+  },
+};
 
 const say = (out: unknown) => Bun.write(Bun.stdout, (typeof out === "string" ? out : JSON.stringify(out)) + "\n");
 const complain = (msg: string) => Bun.write(Bun.stderr, `cerebro: ${msg}\n`);
@@ -107,8 +211,8 @@ const importCommand: Command = {
     const store = new Store();
     try {
       const api = new ApiClient(config);
-      const machine = await machineName(store, api);
-      await say(await importFolder(store, api, cwd, machine ?? ""));
+      await learnMachineName(store, api);
+      await say(await importFolder(store, api, cwd, store.get("machine") ?? ""));
     } finally {
       store.close();
     }
@@ -121,8 +225,8 @@ async function runSync(): Promise<void> {
   const store = new Store();
   try {
     const api = config ? new ApiClient(config) : null;
-    const machine = await machineName(store, api);
-    await say(await syncAllSources(store, api, machine ?? ""));
+    if (api) await learnMachineName(store, api);
+    await say(await syncAllSources(store, api, store.get("machine") ?? ""));
   } finally {
     store.close();
   }
@@ -157,17 +261,37 @@ const scheduleCommand: Command = {
       await say(removeSchedule() ? "removed the sync schedule" : "no sync schedule was installed");
       return;
     }
+    // launchd starts sync without the plugin's environment, so it reads the server settings from config.json.
+    const config = loadClientConfig();
+    if (config) saveClientConfig(config);
     try {
-      await say(`cerebro sync scheduled every 30 minutes: ${installSchedule()}`);
+      await say(`cerebro sync scheduled every 30 minutes: ${installSchedule({ program: scheduledProgram() })}`);
     } catch (e) {
       await complain((e as Error).message);
+      return;
+    }
+    if (!config) {
+      await say(
+        "Cerebro is not configured, so scheduled syncs only record locally. Set the plugin options server_url and token " +
+        "(Claude Code: /plugin, then configure cerebro) and run `cerebro schedule` again, or set CEREBRO_SERVER_URL and CEREBRO_TOKEN.",
+      );
     }
   },
 };
 
-export const COMMANDS: Record<string, Command> = {
+/** The stable ~/.cerebro/bin/cerebro link for the compiled binary; under `bun cli.ts` (development), bun itself. */
+function scheduledProgram(): string[] {
+  const link = ensureCliLink();
+  return link ? [link] : [process.execPath, join(import.meta.dir, "cli.ts")];
+}
+
+export const COMMANDS:Record<string, Command> = {
   hook,
   flush: flushCommand,
+  mcp,
+  status,
+  retention,
+  "reset-instance": resetInstance,
   import: importCommand,
   sync: syncCommand,
   "import-file": importFileCommand,

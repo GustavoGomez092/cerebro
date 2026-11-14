@@ -8,7 +8,7 @@ import { createApp } from "../../server/src/http/app";
 import { fakeEmbedder } from "../../server/src/embed/fake";
 import { freshDb } from "../../server/test/helpers";
 import { ApiClient } from "../src/api";
-import { buildBrief } from "../src/brief";
+import { buildBrief, TOOLS_LINE } from "../src/brief";
 import { handleHook, type HookInput } from "../src/hooks";
 import { Store } from "../src/store";
 import { liveServer, TEST_URL, type LiveServer } from "./harness";
@@ -175,10 +175,60 @@ test("declined folder: SessionStart prints nothing", async () => {
   e.store.close();
 });
 
-test("headless sessions get no context", async () => {
+const HEADLESS_ENVS: Record<string, string>[] = [
+  { CEREBRO_HEADLESS: "1" },
+  { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" },
+  { CLAUDE_CODE_ENTRYPOINT: "sdk-ts" },
+  { CLAUDE_CODE_SESSION_ATTENDED: "0" },
+];
+
+test("headless runs (CEREBRO_HEADLESS, sdk entrypoint, unattended): SessionStart does nothing at all", async () => {
+  for (const env of HEADLESS_ENVS) {
+    const e = setup();
+    await bind(e.repo);
+    let fetched = 0;
+    const counting = new ApiClient({ serverUrl: TEST_URL, token: h.token }, ((i: RequestInfo | URL, init?: RequestInit) => { fetched++; return h.fetch(i, init); }) as typeof fetch);
+    expect(await handleHook("SessionStart", e.input(), { ...e.deps(counting), env })).toBe("");
+    expect({ env, fetched, calls: e.calls, cursor: e.store.getCursor(e.transcript) }).toEqual({ env, fetched: 0, calls: [], cursor: undefined });
+    e.store.close();
+  }
+});
+
+test("headless runs capture nothing on Stop, PreCompact or SessionEnd", async () => {
+  for (const env of HEADLESS_ENVS) {
+    const e = setup();
+    await bind(e.repo);
+    await handleHook("SessionStart", e.input(), e.deps()); // registered while interactive: binding cached, cursor open
+    writeFileSync(e.transcript, line(e.sid, e.dir, "user", "hello") + line(e.sid, e.dir, "assistant", "hi"));
+    for (const event of ["Stop", "PreCompact", "SessionEnd"] as const) {
+      expect(await handleHook(event, e.input({ hook_event_name: event, reason: "other" }), { ...e.deps(), env })).toBe("");
+    }
+    expect({ env, pending: e.store.pendingCount(), sessions: e.store.unsentSessions(10).length }).toEqual({ env, pending: 0, sessions: 0 });
+    e.store.close();
+  }
+});
+
+test("interactive Claude Code env still records", async () => {
   const e = setup();
-  const deps = { ...e.deps(), env: { CEREBRO_HEADLESS: "1" } };
-  expect(await handleHook("SessionStart", e.input(), deps)).toBe("");
+  await bind(e.repo);
+  const env = { CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ATTENDED: "1" };
+  expect(contextOf(await handleHook("SessionStart", e.input(), { ...e.deps(), env }))).toContain("cerebro_search");
+  writeFileSync(e.transcript, line(e.sid, e.dir, "user", "hello"));
+  await handleHook("Stop", e.input({ hook_event_name: "Stop" }), { ...e.deps(), env });
+  expect(e.store.pendingCount()).toBe(1);
+  e.store.close();
+});
+
+test("SessionEnd still ends a bound session whose transcript is gone", async () => {
+  const e = setup();
+  const b = await bind(e.repo);
+  await handleHook("SessionStart", e.input(), e.deps());
+  rmSync(e.transcript);
+  e.calls.length = 0;
+  await handleHook("SessionEnd", e.input({ hook_event_name: "SessionEnd", reason: "logout" }), e.deps());
+  expect(e.store.getCursor(e.transcript)?.bindingId).toBe(b.id);
+  expect(e.calls).toHaveLength(1);
+  expect(e.calls[0].slice(0, 3)).toEqual(["flush", "--end", e.sid]);
   e.store.close();
 });
 
@@ -285,6 +335,18 @@ test("the brief stays under 1500 characters whatever it is given", () => {
   const brief = buildBrief(binding, "S".repeat(2000), recent, { pending: 12, quarantined: 3 }, Array(20).fill("p".repeat(400)));
   expect(brief.length).toBeLessThanOrEqual(1500);
   expect(brief).toContain("cerebro_search");
+  expect(brief).toContain("rejected by the server");
+
+  // Problems come before the session list, so clipping a long brief can never cut them.
+  const long = "w".repeat(250);
+  const crowded = buildBrief({ ...binding, repo: long }, long, recent.slice(0, 5).map((s) => ({ ...s, machine: long })),
+    { pending: 1, quarantined: 2 }, ["the pinned instance does not match", "q".repeat(300), "r".repeat(300)]);
+  expect(crowded.endsWith(`…\n${TOOLS_LINE}`)).toBe(true); // it really was clipped
+  expect(crowded.length).toBeLessThanOrEqual(1500);
+  expect(crowded).toContain("the pinned instance does not match");
+  expect(crowded.indexOf("rejected by the server")).toBeLessThan(crowded.indexOf("Recent sessions"));
+  expect(crowded.indexOf("the pinned instance")).toBeLessThan(crowded.indexOf("Recent sessions"));
+
   const plain = buildBrief(binding, "Acme / App", recent.slice(0, 2), { pending: 12, quarantined: 0 }, []);
   expect(plain).toContain("12");
   expect(plain).toContain("cerebro_sessions");
@@ -293,33 +355,53 @@ test("the brief stays under 1500 characters whatever it is given", () => {
 
 // ---- the CLI, as Claude Code runs it ----
 
+const NO_SPAWN = { CEREBRO_NO_SPAWN: "1" };
+
+/** The test's own env minus anything Cerebro or Claude Code reads, as an interactive session would see it. */
 function cliEnv(home: string, extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined || k.startsWith("CLAUDE_PLUGIN_OPTION_") || k.startsWith("CEREBRO_")) continue;
+    if (v === undefined || k.startsWith("CLAUDE_PLUGIN_OPTION_") || k.startsWith("CEREBRO_") || k.startsWith("CLAUDE_CODE_")) continue;
     env[k] = v;
   }
-  return { ...env, CEREBRO_HOME: home, ...extra };
+  return { ...env, CEREBRO_HOME: home, CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ATTENDED: "1", ...extra };
 }
 
 test("hook CLI never exits non-zero, even on garbage stdin", () => {
   const home = tmp();
   for (const [args, stdin] of [[["hook", "Stop"], "not json"], [["hook", "SessionEnd"], ""], [["hook", "Bogus"], "{}"], [["hook"], ""]] as const) {
-    const r = Bun.spawnSync(["bun", CLI, ...args], { stdin: Buffer.from(stdin), env: cliEnv(home) });
+    const r = Bun.spawnSync(["bun", CLI, ...args], { stdin: Buffer.from(stdin), env: cliEnv(home, NO_SPAWN) });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.toString()).toBe("");
   }
-  const unknown = Bun.spawnSync(["bun", CLI, "frobnicate"], { env: cliEnv(home) });
+  const unknown = Bun.spawnSync(["bun", CLI, "frobnicate"], { env: cliEnv(home, NO_SPAWN) });
   expect(unknown.exitCode).toBe(0);
   expect(unknown.stdout.toString()).toContain("usage");
 });
+
+test("CEREBRO_NO_SPAWN=1 turns the detached flush off", async () => {
+  const stdin = Buffer.from(JSON.stringify({ session_id: crypto.randomUUID(), transcript_path: "/nonexistent.jsonl", cwd: tmpdir(), hook_event_name: "Stop" }));
+  // An unreachable server: a flush that runs leaves a backoff behind in state.
+  const backoffAfter = async (extra: Record<string, string>, waitMs: number) => {
+    const home = tmp();
+    const r = Bun.spawnSync(["bun", CLI, "hook", "Stop"], { stdin, env: cliEnv(home, { CEREBRO_SERVER_URL: "http://127.0.0.1:1", CEREBRO_TOKEN: "t", ...extra }) });
+    expect(r.exitCode).toBe(0);
+    const s = new Store(join(home, "cerebro.db"));
+    try {
+      for (const t0 = Date.now(); Date.now() - t0 < waitMs && !s.get("backoffMs");) await Bun.sleep(50);
+      return s.get("backoffMs");
+    } finally { s.close(); }
+  };
+  expect(await backoffAfter({}, 5000)).toBe("30000");
+  expect(await backoffAfter({ CEREBRO_NO_SPAWN: "1" }, 1500)).toBeUndefined();
+}, 15_000);
 
 test("hook CLI prints the SessionStart JSON when not configured", () => {
   const home = tmp();
   const { dir } = gitRepo();
   const r = Bun.spawnSync(["bun", CLI, "hook", "SessionStart"], {
     stdin: Buffer.from(JSON.stringify({ session_id: crypto.randomUUID(), transcript_path: join(dir, "t.jsonl"), cwd: dir, hook_event_name: "SessionStart", source: "startup" })),
-    env: cliEnv(home),
+    env: cliEnv(home, NO_SPAWN),
   });
   expect(r.exitCode).toBe(0);
   expect(contextOf(r.stdout.toString())).toContain("not configured");
@@ -365,6 +447,33 @@ test("end to end: hooks over HTTP, and the detached flush uploads the session", 
     }
     expect(count).toBe(2);
     expect(store.get("machine")).toBe("e2e-mac");
+
+    // `cerebro flush` learns the machine name, but only from a verified, unblocked instance.
+    const flushCli = async () => {
+      const p = Bun.spawn(["bun", CLI, "flush"], { stdout: "ignore", env: { ...env, CEREBRO_NO_SPAWN: "1" } });
+      expect(await p.exited).toBe(0);
+    };
+    store.set("machine", null);
+    await flushCli();
+    expect(store.get("machine")).toBe("e2e-mac");
+
+    // A flush that never reached the server (backing off) still lets a verified instance name the machine.
+    store.set("machine", null);
+    store.set("backoffUntil", String(Date.now() + 60_000));
+    await flushCli();
+    expect(store.get("machine")).toBe("e2e-mac");
+    store.set("backoffUntil", null);
+
+    store.set("machine", null);
+    store.set("blocked", "token_revoked");
+    await flushCli();
+    expect(store.get("machine")).toBeUndefined();
+
+    store.set("blocked", null);
+    store.set("instanceId", crypto.randomUUID()); // some other server answers now
+    await flushCli();
+    expect(store.get("machine")).toBeUndefined();
+    expect(store.get("blocked")).toBe("instance_mismatch");
     store.close();
   } finally {
     server.stop(true);
@@ -388,7 +497,7 @@ test("Stop hook latency: median under 300 ms over 20 runs on a 5,000-line transc
   const times: number[] = [];
   for (let i = 0; i < 20; i++) {
     const t0 = performance.now();
-    const r = Bun.spawnSync(["bun", CLI, "hook", "Stop"], { stdin, env: cliEnv(home) });
+    const r = Bun.spawnSync(["bun", CLI, "hook", "Stop"], { stdin, env: cliEnv(home, NO_SPAWN) });
     times.push(performance.now() - t0);
     expect(r.exitCode).toBe(0);
   }

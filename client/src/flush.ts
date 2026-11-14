@@ -1,6 +1,7 @@
 import type { IngestEvent, IngestRejection, IngestSession } from "@cerebro/shared";
 import { ApiError, type ApiClient } from "./api";
 import { sweepOpenCursors } from "./capture";
+import { checkInstance } from "./instance";
 import type { BlockedReason, Store } from "./store";
 
 export type FlushOutcome = "done" | "nothing" | "locked" | "backoff" | "unreachable" | "blocked" | "instance_mismatch" | "error";
@@ -63,19 +64,9 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
     sweepOpenCursors(store);
 
     // Preflight on an unauthenticated route, so an impostor never sees the token or any data.
-    try {
-      const health = await api.health({ timeoutMs: HEALTH_TIMEOUT_MS });
-      if (!health.ok || !health.instanceId) return fail();
-      const pinned = store.get("instanceId");
-      if (pinned === undefined) store.set("instanceId", health.instanceId);
-      else if (pinned !== health.instanceId) {
-        store.set("blocked", "instance_mismatch");
-        return finish("instance_mismatch");
-      }
-    } catch (e) {
-      if (e instanceof ApiError) return fail();
-      throw e;
-    }
+    const instance = await checkInstance(store, api, { timeoutMs: HEALTH_TIMEOUT_MS });
+    if (instance === "unreachable") return fail();
+    if (instance === "mismatch") return finish("instance_mismatch");
 
     const configuredEvents = opts.maxEvents ?? 2000;
     const configuredBytes = opts.maxBytes ?? 8 * 1024 * 1024;
@@ -167,9 +158,14 @@ export async function flush(store: Store, api: ApiClient, opts: FlushOptions = {
         if (e.status === 401) return block(e);
         if (isTransient(e)) return fail();
         // 404: the server never saw this session (not bound or never captured), so there is nothing to end.
-        // Any other 4xx will not heal by retrying: drop this end, note why, and carry on with the rest.
+        // A 4xx that names the data will not heal by retrying: drop this end, note why, and carry on with the rest.
+        // Any other 4xx (proxy/WAF 403, 405...) is system-wide: keep the end and back off.
         if (e.status !== 404) {
           if (e.status < 400 || e.status >= 500) throw e;
+          if (!namesTheData(e)) {
+            recordError(store, `http_${e.status}:${e.code}`);
+            return fail();
+          }
           store.set(`endRejected:${pe.sessionId}`, `${e.status}:${e.code}`);
         }
       }
@@ -199,7 +195,7 @@ function recordError(store: Store, text: string): void {
   try { store.set("lastError", text.slice(0, 300)); } catch { /* best effort */ }
 }
 
-const byteLength =(e: IngestEvent) => Buffer.byteLength(JSON.stringify(e));
+const byteLength = (e: IngestEvent) => Buffer.byteLength(JSON.stringify(e));
 const evKey = (sessionId: string | null, key: string | null) => `${sessionId}\u0000${key}`;
 
 /** Acks accepted events, quarantines rejected ones, and retires sessions the server refused. Returns the quarantined count. */

@@ -3,7 +3,7 @@ import type { Binding, SessionView } from "@cerebro/shared";
 export const BRIEF_MAX_CHARS = 1500;
 const MAX_SESSIONS = 5;
 
-const TOOLS_LINE =
+export const TOOLS_LINE =
   "Recall: cerebro_search finds past conversations, cerebro_sessions lists sessions by date, cerebro_read opens a session's conversation.";
 
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + "…" : s);
@@ -24,6 +24,12 @@ export function buildBrief(
   const folder = binding.repo + (binding.subpath ? `/${binding.subpath}` : "");
   const lines = [`Cerebro memory is on for this folder: bound to ${clip(scopeName, 120)} (${clip(folder, 200)}).`];
 
+  // Problems go first so that clipping a long brief only ever cuts the session list.
+  if (queue.quarantined > 0) {
+    lines.push(`Problem: ${queue.quarantined} event${queue.quarantined === 1 ? " was" : "s were"} rejected by the server and set aside (see cerebro status).`);
+  }
+  for (const p of problems) lines.push(`Problem: ${clip(p, 300)}`);
+
   const where = binding.projectId ? "this project" : binding.clientId ? "this client" : "all clients";
   if (recent.length === 0) lines.push(`No sessions recorded yet in ${where}.`);
   else {
@@ -32,12 +38,7 @@ export function buildBrief(
       lines.push(`- ${when(s.startedAt)} on ${clip(s.machine, 60)}${s.imported ? " (imported)" : ""}`);
     }
   }
-
   if (queue.pending > 0) lines.push(`${queue.pending} event${queue.pending === 1 ? "" : "s"} from this Mac waiting to upload.`);
-  if (queue.quarantined > 0) {
-    lines.push(`Problem: ${queue.quarantined} event${queue.quarantined === 1 ? " was" : "s were"} rejected by the server and set aside (see cerebro status).`);
-  }
-  for (const p of problems) lines.push(`Problem: ${clip(p, 300)}`);
 
   const room = BRIEF_MAX_CHARS - TOOLS_LINE.length - 1;
   return clip(lines.join("\n"), room) + "\n" + TOOLS_LINE;
