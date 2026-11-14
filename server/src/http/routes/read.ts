@@ -3,12 +3,14 @@ import { z } from "zod";
 import type { AppDeps, Env } from "../app";
 import { getEvents, listSessions } from "../../read";
 import { scopeFor, ScopeError } from "../../search";
+import type { Binding, SearchScope } from "@cerebro/shared";
 import { BindingError } from "../../bindings";
 import { uuid } from "../validate";
 
-const iso = z.string().datetime({ offset: true });
-const int = (min: number, max: number) => z.coerce.number().int().min(min).max(max);
-const scopeParams = {
+export const iso = z.string().datetime({ offset: true });
+export const int = (min: number, max: number) => z.coerce.number().int().min(min).max(max);
+/** Query parameters that pick a read's scope (see scopeFor). */
+export const scopeParams = {
   repo: z.string().max(1000).optional(),
   subpath: z.string().max(1000).optional(),
   scope: z.literal("open").optional(),
@@ -24,18 +26,24 @@ const listQuery = z.object({
 }).refine((q) => !q.from || !q.to || Date.parse(q.from) <= Date.parse(q.to), { message: "from must not be after to" });
 const eventsQuery = z.object({ ...scopeParams, afterSeq: int(-1, 2_147_483_647).optional(), limit: int(1, 1000).optional(), full: z.literal("1").optional() });
 
+/** Resolves the request's scope and runs `fn` in it; a missing scope or a bad subpath is a 400. */
+export async function withScope(
+  sql: AppDeps["sql"], c: any, q: Parameters<typeof scopeFor>[1],
+  fn: (scope: SearchScope, active: Binding | null) => Promise<Response>,
+): Promise<Response> {
+  try {
+    const { scope, active } = await scopeFor(sql, q);
+    return await fn(scope, active);
+  } catch (e) {
+    if (e instanceof ScopeError) return c.json({ error: "scope_required", message: e.message }, 400);
+    if (e instanceof BindingError) return c.json({ error: "invalid_subpath", message: e.message }, 400);
+    throw e;
+  }
+}
+
 export function readRoutes({ sql }: AppDeps) {
   const r = new Hono<Env>();
-  const scoped = async (c: any, q: any, fn: (scope: any) => Promise<Response>) => {
-    try {
-      const { scope } = await scopeFor(sql, q);
-      return await fn(scope);
-    } catch (e) {
-      if (e instanceof ScopeError) return c.json({ error: "scope_required", message: e.message }, 400);
-      if (e instanceof BindingError) return c.json({ error: "invalid_subpath", message: e.message }, 400);
-      throw e;
-    }
-  };
+  const scoped = (c: any, q: any, fn: (scope: SearchScope) => Promise<Response>) => withScope(sql, c, q, fn);
   r.get("/sessions", async (c) => {
     const q = listQuery.safeParse(c.req.query());
     if (!q.success) return c.json({ error: "invalid_query", message: q.error.issues[0]?.message ?? "invalid query" }, 400);

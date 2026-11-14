@@ -59,6 +59,8 @@ export interface SearchRequest {
   from?: string;
   to?: string;
   limit?: number;
+  /** What to search: summaries and raw chunks (default), only summaries, or only raw chunks. */
+  include?: "all" | "summaries" | "raw";
 }
 
 export type SearchScope =
@@ -66,10 +68,15 @@ export type SearchScope =
   | { kind: "open"; clientId?: string; projectId?: string };
 
 export interface SearchHit {
-  chunkId: number;
-  sessionId: string;
-  firstSeq: number;
-  lastSeq: number;
+  kind: "chunk" | "summary";
+  /** Set on chunk hits. */
+  chunkId?: number;
+  /** Set on summary hits. */
+  summaryId?: number;
+  /** Null for an initial-history summary (it covers a folder, not a session). */
+  sessionId: string | null;
+  firstSeq: number | null;
+  lastSeq: number | null;
   tsFrom: string;
   tsTo: string;
   snippet: string;
@@ -106,5 +113,41 @@ export interface SearchResponse {
   binding: Binding | null;
   hits: (SearchHit & { matched: ("fts" | "vec")[]; distance: number | null })[];
   degraded: boolean;
-  degradedReasons: ("embedder" | "vector_timeout" | "fts_timeout")[];
+  degradedReasons: ("embedder" | "vector_timeout" | "fts_timeout" | "summary_vector_timeout" | "summary_fts_timeout")[];
+}
+
+/** A stored summary: one session range (`session`) or a client-written initial history (`history`). */
+export interface SummaryView {
+  id: number;
+  kind: "session" | "history";
+  sessionId: string | null;
+  firstSeq: number | null;
+  lastSeq: number | null;
+  tsFrom: string;
+  tsTo: string;
+  title: string;
+  overview: string;
+  facts: string[];
+  clientName: string | null;
+  projectName: string | null;
+}
+
+/** `POST /v1/summaries`: an initial project history the client's own Claude wrote. */
+export interface HistoryRequest {
+  repo: string;
+  subpath?: string;
+  title: string;
+  text: string;
+  tsFrom: string;
+  tsTo: string;
+}
+
+/** Limits for `POST /v1/summaries`. */
+export const HISTORY_LIMITS = { maxTitle: 200, maxText: 20_000 } as const;
+
+export interface StateResponse {
+  /** `project:<id>` or `client:<id>`; null when the request names no single project or client. */
+  scope: string | null;
+  /** Null until a state has been built for the scope. */
+  state: { doc: unknown; text: string; version: number; updatedAt: string } | null;
 }

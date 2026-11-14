@@ -16,6 +16,7 @@ const schema = z.object({
   from: iso.optional(),
   to: iso.optional(),
   limit: z.number().int().min(1).max(50).optional(),
+  include: z.enum(["all", "summaries", "raw"]).optional(),
 }).refine((b) => !b.from || !b.to || Date.parse(b.from) <= Date.parse(b.to), { message: "from must not be after to" });
 
 export function searchRoutes({ sql, embedder, gate }: AppDeps) {

@@ -11,6 +11,7 @@ import { bindingRoutes } from "./routes/bindings";
 import { ingestRoutes } from "./routes/ingest";
 import { searchRoutes } from "./routes/search";
 import { readRoutes } from "./routes/read";
+import { summaryRoutes } from "./routes/summaries";
 
 export const API_VERSION = 1;
 const SMALL_BODY = 64 * 1024;
@@ -51,7 +52,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     }
   });
   app.use("/v1/*", bearerAuth(deps.sql));
-  for (const routes of [statusRoutes, catalogRoutes, bindingRoutes, ingestRoutes, searchRoutes, readRoutes]) app.route("/v1", routes(deps));
+  for (const routes of [statusRoutes, catalogRoutes, bindingRoutes, ingestRoutes, searchRoutes, readRoutes, summaryRoutes]) app.route("/v1", routes(deps));
 
   app.notFound((c) => c.json({ error: "not_found", message: "no such route" }, 404));
   app.onError((err, c) => {
