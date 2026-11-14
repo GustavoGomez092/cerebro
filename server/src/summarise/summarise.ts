@@ -1,10 +1,10 @@
 import type { SQL } from "bun";
-import { redactSecrets } from "@cerebro/shared";
+import { redactSecrets, storable } from "@cerebro/shared";
 import { toVector, type Embedder } from "../embed/embedder";
 import { budgetState, canSpend, estimateTokens, record } from "./budget";
 import type { runClaude } from "./claude";
 import { completeSummaryJob, failSummaryJob } from "./jobs";
-import { SUMMARY_SCHEMA, SUMMARY_SYSTEM_PROMPT, summaryPrompt } from "./prompts";
+import { SUMMARY_SCHEMA, summaryRequest } from "./prompts";
 import { renderRange, type EventRow } from "./render";
 import { markScopesDirty, scopeKey } from "./state";
 
@@ -28,6 +28,22 @@ export interface SummariseDeps {
   budget: { share: number; windowTokens: number };
   /** Characters of transcript per model call (default 60 000). */
   maxChars?: number;
+  /** Events loaded per job (default 2000); a job stopped at the cap is due again at once. */
+  maxEvents?: number;
+}
+
+export type SummariseReason = "budget" | "usage_limit" | "login" | "timeout" | "binding" | "bad_output" | "failed";
+
+export interface SummariseResult {
+  status: "done" | "deferred" | "failed";
+  /** Why the job was deferred or failed. */
+  reason?: SummariseReason;
+  /** When a deferred job is due again. */
+  until?: Date | null;
+  /** From the last successful Claude call, when there was one. */
+  credentialExpiresAt?: string | null;
+  /** State scope keys marked dirty by summaries stored in this run. */
+  scopes: string[];
 }
 
 type Props = (typeof SUMMARY_SCHEMA)["properties"];
@@ -36,8 +52,11 @@ const LIST_LABELS: Record<(typeof LISTS)[number], string> = {
   decisions: "Decisions", changes: "Changes", facts: "Facts", open_threads: "Open threads", resolved_threads: "Resolved threads",
 };
 
-/** Model output is untrusted: redacted first (so a cut never leaves half a secret), then capped. */
-const clean = (s: string, max: number) => redactSecrets(s).trim().slice(0, max);
+/**
+ * Model output is untrusted: redacted first (so a cut never leaves half a secret), then capped, then made
+ * storable (no NUL, no unpaired surrogate — including one left by the cut).
+ */
+const clean = (s: string, max: number) => storable(redactSecrets(s).trim().slice(0, max)).trim();
 
 /**
  * Checks model output against SUMMARY_SCHEMA: every field present with the right type, else null.
@@ -103,79 +122,109 @@ async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: str
 }
 
 /**
- * Summarises a claimed job's uncovered events (up to 2000), one model call per rendered piece.
+ * Summarises a claimed job's uncovered events (up to `maxEvents`), one model call per rendered piece.
  * Each piece's summary is stored (with the session's current binding scope) before the job is
  * completed, so a crash or a later deferral resumes after the last stored piece.
  *
- * - "done": everything loaded is covered; the job is completed.
- * - "deferred": over budget, usage limit, login or timeout; the job waits without losing an attempt.
- * - "failed": bad model output or another failure; counts towards dead-lettering.
+ * - "done": everything loaded is covered; the job is completed (due again now if the event cap was hit).
+ * - "deferred": budget, usage limit, login, timeout or an inactive binding; no attempt is counted.
+ * - "failed": bad model output or another failure (including a store error); counts towards dead-lettering.
  */
 export async function summariseJob(
   sql: SQL,
   embedder: Embedder,
   job: { sessionId: string; priority: number; coveredSeq: number },
   deps: SummariseDeps,
-): Promise<"done" | "deferred" | "failed"> {
+): Promise<SummariseResult> {
   const { sessionId } = job;
+  const scopes = new Set<string>();
+  let credentialExpiresAt: string | null | undefined;
+  const result = (status: SummariseResult["status"], extra: Partial<SummariseResult> = {}): SummariseResult => ({
+    status,
+    ...extra,
+    ...(credentialExpiresAt !== undefined ? { credentialExpiresAt } : {}),
+    scopes: [...scopes],
+  });
+  const defer = async (reason: SummariseReason, error: string, until: Date | null) => {
+    await failSummaryJob(sql, sessionId, error, { retryable: true, ...(until ? { dueAt: until } : {}) });
+    const [j] = await sql`select due_at from summary_jobs where session_id = ${sessionId}`;
+    return result("deferred", { reason, until: until ?? j?.due_at ?? null });
+  };
+  const fail = async (reason: SummariseReason, error: string) => {
+    await failSummaryJob(sql, sessionId, error, { retryable: false });
+    return result("failed", { reason });
+  };
+  const bindingActive = async () =>
+    (await sql`
+      select 1 from sessions s join bindings b on b.id = s.binding_id
+      where s.id = ${sessionId} and b.status = 'active'`).length > 0;
+
+  const maxEvents = deps.maxEvents ?? MAX_EVENTS;
   const events: EventRow[] = await sql`
     select seq, ts, kind, text, tool_name, tool_input, meta from events
     where session_id = ${sessionId} and seq > ${job.coveredSeq}
-    order by seq limit ${MAX_EVENTS}`;
+    order by seq limit ${maxEvents}`;
   if (!events.length) {
     await completeSummaryJob(sql, sessionId, job.coveredSeq);
-    return "done";
+    return result("done");
   }
 
   for (const piece of renderRange(events, deps.maxChars)) {
+    // Checked before every call, so nothing is spent on a folder that was declined meanwhile.
+    if (!(await bindingActive())) return defer("binding", "binding is not active", null);
+
     const state = await budgetState(sql, deps.budget);
     if (!canSpend(state, estimateTokens(piece.text.length))) {
-      await failSummaryJob(sql, sessionId, "over budget", {
-        retryable: true, dueAt: state.resumesAt ?? new Date(Date.now() + RETRY_LATER_MS),
-      });
-      return "deferred";
+      return defer("budget", "over budget", state.resumesAt ?? new Date(Date.now() + RETRY_LATER_MS));
     }
 
-    const run = await deps.run({ systemPrompt: SUMMARY_SYSTEM_PROMPT, prompt: summaryPrompt(piece), schema: SUMMARY_SCHEMA });
+    const run = await deps.run({ ...summaryRequest(piece), schema: SUMMARY_SCHEMA });
     if (!run.ok) {
       const error = `${run.kind}: ${run.message}`;
-      if (run.kind === "usage_limit" || run.kind === "auth" || run.kind === "timeout") {
-        await failSummaryJob(sql, sessionId, error, { retryable: true, dueAt: run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS) });
-        return "deferred";
-      }
-      await failSummaryJob(sql, sessionId, error, { retryable: false });
-      return "failed";
+      const later = run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS);
+      if (run.kind === "usage_limit") return defer("usage_limit", error, later);
+      if (run.kind === "auth") return defer("login", error, later);
+      if (run.kind === "timeout") return defer("timeout", error, later);
+      return fail(run.kind === "bad_output" ? "bad_output" : "failed", error);
     }
+    credentialExpiresAt = run.credentialExpiresAt;
     await record(sql, run.tokens, "summary");
 
     const body = parseSummary(run.output);
-    if (!body) {
-      await failSummaryJob(sql, sessionId, "bad_output: model output does not match the summary schema", { retryable: false });
-      return "failed";
-    }
+    if (!body) return fail("bad_output", "bad_output: model output does not match the summary schema");
 
-    const stored = await sql.begin(async (tx) => {
-      const [b] = await tx`
-        select b.id, b.client_id, b.project_id from sessions s join bindings b on b.id = s.binding_id
-        where s.id = ${sessionId} and b.status = 'active'`;
-      if (!b) return "inactive" as const;
-      const [row] = await tx`
-        insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq,
-          ts_from, ts_to, title, body, text, model)
-        values (${sessionId}, 'session', ${b.id}, ${b.client_id}, ${b.project_id}, ${piece.firstSeq}, ${piece.lastSeq},
-          ${piece.tsFrom}, ${piece.tsTo}, ${body.title}, ${JSON.stringify(body)}::text::jsonb, ${bodyText(body)}, ${run.model})
-        on conflict (session_id, first_seq, last_seq) do nothing
-        returning id`;
-      if (row) await markScopesDirty(tx, [scopeKey(b.client_id, b.project_id)]);
-      return row?.id ?? null;
-    });
-    if (stored === "inactive") {
-      await failSummaryJob(sql, sessionId, "binding is not active", { retryable: true });
-      return "deferred";
+    let stored: { id: unknown; scope: string } | "inactive" | null;
+    try {
+      stored = await sql.begin(async (tx) => {
+        const [b] = await tx`
+          select b.id, b.client_id, b.project_id from sessions s join bindings b on b.id = s.binding_id
+          where s.id = ${sessionId} and b.status = 'active'`;
+        if (!b) return "inactive" as const;
+        const [row] = await tx`
+          insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq,
+            ts_from, ts_to, title, body, text, model)
+          values (${sessionId}, 'session', ${b.id}, ${b.client_id}, ${b.project_id}, ${piece.firstSeq}, ${piece.lastSeq},
+            ${piece.tsFrom}, ${piece.tsTo}, ${body.title}, ${JSON.stringify(body)}::text::jsonb, ${bodyText(body)},
+            ${storable(run.model)})
+          on conflict (session_id, first_seq, last_seq) do nothing
+          returning id`;
+        if (!row) return null;
+        const scope = scopeKey(b.client_id, b.project_id);
+        await markScopesDirty(tx, [scope]);
+        return { id: row.id, scope };
+      });
+    } catch (e) {
+      // A store that keeps failing must dead-letter, not re-spend tokens on every lease.
+      return fail("failed", `store failed: ${(e as Error).message}`.slice(0, 500));
     }
-    if (stored !== null) await embedSummary(sql, embedder, stored, summaryEmbedText({ title: body.title, body }));
+    if (stored === "inactive") return defer("binding", "binding is not active", null);
+    if (stored) {
+      scopes.add(stored.scope);
+      await embedSummary(sql, embedder, stored.id, summaryEmbedText({ title: body.title, body }));
+    }
   }
 
-  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq);
-  return "done";
+  const hitCap = events.length >= maxEvents;
+  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, hitCap ? { dueAt: new Date() } : {});
+  return result("done");
 }

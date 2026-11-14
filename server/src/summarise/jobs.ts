@@ -75,10 +75,12 @@ export async function claimSummaryJob(
 
 /**
  * Records coverage up to `coveredSeq`. Done (job deleted) when no user/assistant events remain beyond
- * it; else re-dued. The job row is locked first, so an enqueue racing with this either lands before
- * the count (and is seen) or waits and re-creates the job afterwards.
+ * it; else re-dued at `opts.dueAt` (default in 2 h). The job row is locked first, so an enqueue racing
+ * with this either lands before the count (and is seen) or waits and re-creates the job afterwards.
  */
-export async function completeSummaryJob(sql: SQL, sessionId: string, coveredSeq: number): Promise<void> {
+export async function completeSummaryJob(
+  sql: SQL, sessionId: string, coveredSeq: number, opts: { dueAt?: Date } = {},
+): Promise<void> {
   await sql.begin(async (tx) => {
     await tx`select 1 from summary_jobs where session_id = ${sessionId} for update`;
     const [{ n }] = await tx`
@@ -89,7 +91,8 @@ export async function completeSummaryJob(sql: SQL, sessionId: string, coveredSeq
     }
     await tx`
       update summary_jobs set covered_seq = greatest(covered_seq, ${coveredSeq}), attempts = 0, last_error = null,
-        locked_until = null, due_at = now() + make_interval(hours => ${REDUE_HOURS})
+        locked_until = null,
+        due_at = coalesce(${opts.dueAt?.toISOString() ?? null}::timestamptz, now() + make_interval(hours => ${REDUE_HOURS}))
       where session_id = ${sessionId}`;
   });
 }

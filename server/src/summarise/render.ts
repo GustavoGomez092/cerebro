@@ -33,7 +33,8 @@ function line(e: EventRow, toolName: string | null): string | null {
     case "assistant": {
       // Thinking blocks arrive as assistant events with empty text (the thinking lives in meta).
       const text = e.text.trim();
-      return text ? `${e.kind === "user" ? "User" : "Assistant"}: ${text}` : null;
+      // Continuation lines are indented, so message text can never pose as a new transcript line.
+      return text ? `${e.kind === "user" ? "User" : "Assistant"}: ${text.replace(/\r\n|\r|\n/g, "\n  ")}` : null;
     }
     case "tool_call": {
       if (toolName?.startsWith(CEREBRO_TOOL)) return null;
