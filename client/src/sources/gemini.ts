@@ -55,9 +55,10 @@ export const geminiSource: HistorySource = {
         const sessions = new Set<string>();
         for (const r of records) if (isObj(r) && typeof r.sessionId === "string" && r.sessionId) sessions.add(r.sessionId);
         for (const session of sessions) {
+          if (roots?.unchanged?.(`${file}#${session}`, st.size, st.mtimeMs)) continue;
           out.push({
             source: "gemini-cli", path: `${file}#${session}`, sessionId: `gemini:${storable(session)}`, cwd: folder,
-            modifiedMs: st.mtimeMs, endOffset: records.length,
+            modifiedMs: st.mtimeMs, endOffset: records.length, size: st.size,
           });
         }
       } catch { /* vanished */ }

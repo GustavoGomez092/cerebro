@@ -49,7 +49,7 @@ function parseEvent(line: string, sessionId: string, seq: number): IngestEvent |
   if (e.meta !== undefined && !isObj(e.meta)) return null;
   return {
     key: storable(e.key), sessionId, seq, ts, kind: e.kind as EventKind, text: clean(e.text),
-    ...(typeof e.toolName === "string" ? { toolName: storable(e.toolName) } : {}),
+    ...(typeof e.toolName === "string" ? { toolName: clean(e.toolName) } : {}),
     ...(e.toolInput !== undefined ? { toolInput: cleanDeep(e.toolInput) } : {}),
     ...(isObj(e.meta) ? { meta: cleanDeep(e.meta) as Obj } : {}),
   };
@@ -124,12 +124,12 @@ export const genericSource: HistorySource = {
       const path = join(dir, name);
       try {
         const st = statSync(path);
-        if (!st.isFile()) continue;
+        if (!st.isFile() || roots?.unchanged?.(path, st.size, st.mtimeMs)) continue;
         const header = parseHeader(headLines(path)[0] ?? "");
         if (!isHeader(header)) continue; // left in the inbox; `cerebro import-file` explains what is wrong
         out.push({
           source: "generic", path, sessionId: sessionIdOf(header), cwd: storable(header.cwd), repo: header.repo,
-          modifiedMs: st.mtimeMs, endOffset: st.size,
+          modifiedMs: st.mtimeMs, endOffset: st.size, size: st.size,
         });
       } catch { /* vanished */ }
     }

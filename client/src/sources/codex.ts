@@ -39,10 +39,10 @@ function parseMeta(line: string): CodexMeta | null {
   const originator = str(p.originator);
   const launchedBy = str(p.source);
   const sessionMeta: Obj = {};
-  if (originator) sessionMeta.originator = storable(originator);
+  if (originator) sessionMeta.originator = clean(originator);
   const cliVersion = str(p.cli_version);
-  if (cliVersion) sessionMeta.cliVersion = storable(cliVersion);
-  if (launchedBy) sessionMeta.launchedBy = storable(launchedBy);
+  if (cliVersion) sessionMeta.cliVersion = clean(cliVersion);
+  if (launchedBy) sessionMeta.launchedBy = clean(launchedBy);
   const branch = str(git.branch);
   // Branch names are free-form and can embed a token.
   if (branch) sessionMeta.gitBranch = clean(branch);
@@ -72,6 +72,9 @@ function messageText(content: unknown): string {
     .filter((t) => t !== "")
     .join("\n");
 }
+
+/** Context Codex injects as a "user" message (environment, AGENTS.md instructions); not something the user typed. */
+const INJECTED = /^\s*<(environment_context|user_instructions)>/;
 
 function outputText(output: unknown): string {
   if (typeof output === "string") return output;
@@ -110,13 +113,13 @@ export const codexSource: HistorySource = {
       const path = join(dir, rel);
       try {
         const st = statSync(path);
-        if (!st.isFile()) continue;
+        if (!st.isFile() || roots?.unchanged?.(path, st.size, st.mtimeMs)) continue;
         const meta = parseMeta(headLines(path)[0] ?? "");
         const id = meta?.id ?? UUID_IN_NAME.exec(name)?.[1];
         if (!id) continue;
         out.push({
           source: "codex", path, sessionId: `codex:${id}`, cwd: meta?.cwd ?? null, repo: meta?.repo ?? null,
-          modifiedMs: st.mtimeMs, endOffset: st.size,
+          modifiedMs: st.mtimeMs, endOffset: st.size, size: st.size,
         });
       } catch { /* vanished between listing and stat */ }
     }
@@ -157,17 +160,20 @@ export const codexSource: HistorySource = {
           events.push({ key: `${lineNo}:0`, sessionId: file.sessionId, seq: lineNo * 16, ts, kind, text: body, ...extra });
         };
         switch (p.type) {
-          case "message":
+          case "message": {
             if (p.role !== "user" && p.role !== "assistant") { skipped++; break; }
-            push(p.role, clean(messageText(p.content)));
+            const body = messageText(p.content);
+            if (p.role === "user" && INJECTED.test(body)) { skipped++; break; }
+            push(p.role, clean(body));
             break;
+          }
           case "function_call":
           case "custom_tool_call": {
             const name = str(p.name);
             if (!name) { skipped++; break; }
             const callId = str(p.call_id);
             if (callId) toolNames.set(callId, name);
-            push("tool_call", "", { toolName: storable(name), toolInput: cleanDeep(toolInputOf(p)), ...(callId ? { meta: { callId: storable(callId) } } : {}) });
+            push("tool_call", "", { toolName: storable(name), toolInput: cleanDeep(toolInputOf(p)), ...(callId ? { meta: { callId: clean(callId) } } : {}) });
             break;
           }
           case "function_call_output":
@@ -176,7 +182,7 @@ export const codexSource: HistorySource = {
             const name = callId ? toolNames.get(callId) : undefined;
             push("tool_result", clean(outputText(p.output)), {
               ...(name ? { toolName: storable(name) } : {}),
-              ...(callId ? { meta: { callId: storable(callId) } } : {}),
+              ...(callId ? { meta: { callId: clean(callId) } } : {}),
             });
             break;
           }

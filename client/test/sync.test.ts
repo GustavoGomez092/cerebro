@@ -1,12 +1,16 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installSchedule, removeSchedule } from "../src/schedule";
+import { ApiClient } from "../src/api";
+import { ensureCliLink, installSchedule, removeSchedule, setUpSchedule } from "../src/schedule";
+import { codexSource } from "../src/sources/codex";
+import { genericSource } from "../src/sources/generic";
+import type { HistorySource } from "../src/sources/types";
 import { Store } from "../src/store";
 import { syncAllSources } from "../src/sync";
-import { liveServer, type LiveServer } from "./harness";
+import { liveServer, TEST_URL, type LiveServer } from "./harness";
 
 let h: LiveServer;
 let prevHome: string | undefined;
@@ -171,6 +175,101 @@ test("a held sync lock returns no work", async () => {
   store.close();
 });
 
+test("a new inbox file under a finished file's name is judged by its own folder, not the old one's binding", async () => {
+  const home = tmp();
+  const bound = repo("redrop-bound");
+  const unbound = repo("redrop-unbound");
+  await bind(bound.remote, "RedropBound");
+  const drop = (root: string, remote: string, id: string) => write(join(home, ".cerebro", "inbox", "export.jsonl"),
+    fixture("generic.jsonl").replace("run-0001", id).replace("/Users/dev/projects/demo", root).replace("https://github.com/example/demo.git", `https://${remote}.git`));
+  const store = newStore();
+  const first = drop(bound.root, bound.remote, `first-${crypto.randomUUID()}`);
+  await syncAllSources(store, h.api, "test-mac", { home, sources: [genericSource] });
+  expect(existsSync(first)).toBe(false); // recorded and moved to done/
+
+  const secondId = `second-${crypto.randomUUID()}`;
+  drop(unbound.root, unbound.remote, secondId);
+  const out = await syncAllSources(store, h.api, "test-mac", { home, sources: [genericSource] });
+  expect(out.bySource.generic).toMatchObject({ files: 0, events: 0, skipped: 1 });
+  expect(await serverSessions([`my-agent:${secondId}`])).toEqual([]);
+  expect(existsSync(first)).toBe(true); // left in the inbox for when its folder opts in
+  expect(store.getCursor(first)?.bindingId ?? null).toBeNull();
+  store.close();
+});
+
+test("the 50-resolve cap never starves a folder: the oldest-checked identities go first", async () => {
+  const home = tmp();
+  const tag = crypto.randomUUID().slice(0, 8);
+  const remotes = Array.from({ length: 60 }, (_, i) => `github.com/acme/starve-${tag}-${i}`);
+  remotes.forEach((remote, i) => write(join(home, ".cerebro", "inbox", `s${i}.jsonl`),
+    fixture("generic.jsonl").replace("run-0001", `s${i}`).replace("/Users/dev/projects/demo", `/nonexistent/starve/${i}`)
+      .replace("https://github.com/example/demo.git", `https://${remote}.git`)));
+  const asked: string[] = [];
+  const counting = new Proxy(h.api, {
+    get(target, prop, recv) {
+      if (prop !== "resolve") return Reflect.get(target, prop, recv);
+      return (...args: Parameters<typeof target.resolve>) => { asked.push(args[0]); return target.resolve(...args); };
+    },
+  });
+  const store = newStore();
+  await syncAllSources(store, counting, "test-mac", { home, sources: [genericSource] });
+  expect(new Set(asked).size).toBe(50);
+  const missed = remotes.filter((r) => !asked.includes(r));
+  expect(missed).toHaveLength(10);
+
+  asked.length = 0;
+  await syncAllSources(store, counting, "test-mac", { home, sources: [genericSource] });
+  expect(asked).toHaveLength(50);
+  for (const r of missed) expect(asked).toContain(r);
+  store.close();
+});
+
+test("sync checks the pinned instance first and never sends the token to another one", async () => {
+  const home = tmp();
+  const r = repo("impostor");
+  await bind(r.remote, "Impostor");
+  agentHistory(home, r.root, r.remote);
+  const store = newStore();
+  store.set("instanceId", crypto.randomUUID());
+  const authed: string[] = [];
+  const spy = new ApiClient({ serverUrl: TEST_URL, token: h.token }, (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.headers.get("authorization")) authed.push(new URL(req.url).pathname);
+    return h.fetch(req);
+  }) as typeof fetch);
+  await syncAllSources(store, spy, "test-mac", { home });
+  expect(authed).toEqual([]);
+  expect(store.get("blocked")).toBe("instance_mismatch");
+  store.close();
+});
+
+test("a finished file remembers its size and time, so later syncs tell discover to skip it", async () => {
+  const home = tmp();
+  const r = repo("unchanged");
+  await bind(r.remote, "Unchanged");
+  const t = agentHistory(home, r.root, r.remote);
+  const old = (Date.now() - 60 * 60_000) / 1000;
+  utimesSync(t.codexPath, old, old);
+  const store = newStore();
+  await syncAllSources(store, h.api, "test-mac", { home, sources: [codexSource] });
+  expect(store.getCursor(t.codexPath)?.done).toBe(true);
+
+  const verdicts: boolean[] = [];
+  const spy: HistorySource = {
+    ...codexSource,
+    discover: (roots) => {
+      const st = statSync(t.codexPath);
+      verdicts.push(roots?.unchanged?.(t.codexPath, st.size, st.mtimeMs) ?? false);
+      return codexSource.discover(roots);
+    },
+  };
+  await syncAllSources(store, h.api, "test-mac", { home, sources: [spy] });
+  appendFileSync(t.codexPath, "\n");
+  await syncAllSources(store, h.api, "test-mac", { home, sources: [spy] });
+  expect(verdicts).toEqual([true, false]);
+  store.close();
+});
+
 test("schedule writes a launchd plist running `cerebro sync` every 1800 s and --off removes it", () => {
   const home = tmp();
   process.env.CEREBRO_HOME = join(home, ".cerebro");
@@ -192,6 +291,36 @@ test("schedule writes a launchd plist running `cerebro sync` every 1800 s and --
   expect(existsSync(path)).toBe(false);
   expect(calls).toEqual([["bootout", "gui/501", path]]);
   expect(removeSchedule({ home, launchctl, uid: 501 })).toBe(false);
+});
+
+test("the schedule runs the stable ~/.cerebro/bin/cerebro link, which follows the current binary", () => {
+  const home = tmp();
+  process.env.CEREBRO_HOME = join(home, ".cerebro");
+  const link = join(home, ".cerebro", "bin", "cerebro");
+  expect(ensureCliLink({ compiled: false })).toBeNull(); // under `bun cli.ts` there is no binary to point at
+  expect(existsSync(link)).toBe(false);
+  expect(ensureCliLink({ compiled: true, target: "/plugins/cerebro/1.0.0/bin/cerebro-darwin-arm64" })).toBe(link);
+  expect(readlinkSync(link)).toBe("/plugins/cerebro/1.0.0/bin/cerebro-darwin-arm64");
+  expect(ensureCliLink({ compiled: true, target: "/plugins/cerebro/1.1.0/bin/cerebro-darwin-arm64" })).toBe(link);
+  expect(readlinkSync(link)).toBe("/plugins/cerebro/1.1.0/bin/cerebro-darwin-arm64");
+
+  const path = installSchedule({ home, launchctl: () => 0, uid: 501 });
+  expect(readFileSync(path, "utf8")).toMatch(new RegExp(`<array>\\s*<string>${link}</string>\\s*<string>sync</string>\\s*</array>`));
+});
+
+test("scheduling saves the server settings to config.json so launchd's sync can upload", () => {
+  const home = tmp();
+  process.env.CEREBRO_HOME = join(home, ".cerebro");
+  const config = join(home, ".cerebro", "config.json");
+  const unconfigured = setUpSchedule({ config: null, home, program: ["/x/cerebro"], launchctl: () => 0, uid: 501 });
+  expect(unconfigured.configured).toBe(false);
+  expect(existsSync(unconfigured.path)).toBe(true);
+  expect(existsSync(config)).toBe(false);
+
+  const r = setUpSchedule({ config: { serverUrl: "http://zima:8787", token: "cbr_test" }, home, program: ["/x/cerebro"], launchctl: () => 0, uid: 501 });
+  expect(r.configured).toBe(true);
+  expect(JSON.parse(readFileSync(config, "utf8"))).toEqual({ serverUrl: "http://zima:8787", token: "cbr_test" });
+  expect(statSync(config).mode & 0o777).toBe(0o600);
 });
 
 test("cerebro import-file copies a valid file into the inbox and syncs; an invalid one is refused", () => {

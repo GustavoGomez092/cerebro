@@ -2,14 +2,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ApiClient } from "./api";
-import { loadClientConfig, saveClientConfig, type ClientConfig } from "./config";
+import { loadClientConfig, type ClientConfig } from "./config";
 import { flush, type FlushOptions, type FlushResult } from "./flush";
 import { handleHook, HOOK_EVENTS, type HookEvent } from "./hooks";
 import { importFolder } from "./importer";
 import { checkInstance } from "./instance";
 import { logError } from "./log";
 import { startMcpServer } from "./mcp";
-import { ensureCliLink, installSchedule, removeSchedule } from "./schedule";
+import { ensureCliLink, removeSchedule, setUpSchedule } from "./schedule";
 import { addToInbox } from "./sources/generic";
 import { Store } from "./store";
 import { syncAllSources } from "./sync";
@@ -261,19 +261,18 @@ const scheduleCommand: Command = {
       await say(removeSchedule() ? "removed the sync schedule" : "no sync schedule was installed");
       return;
     }
-    // launchd starts sync without the plugin's environment, so it reads the server settings from config.json.
-    const config = loadClientConfig();
-    if (config) saveClientConfig(config);
+    let r: { path: string; configured: boolean };
     try {
-      await say(`cerebro sync scheduled every 30 minutes: ${installSchedule({ program: scheduledProgram() })}`);
+      r = setUpSchedule({ config: loadClientConfig(), program: scheduledProgram() });
     } catch (e) {
       await complain((e as Error).message);
       return;
     }
-    if (!config) {
+    await say(`cerebro sync scheduled every 30 minutes: ${r.path}`);
+    if (!r.configured) {
       await say(
         "Cerebro is not configured, so scheduled syncs only record locally. Set the plugin options server_url and token " +
-        "(Claude Code: /plugin, then configure cerebro) and run `cerebro schedule` again, or set CEREBRO_SERVER_URL and CEREBRO_TOKEN.",
+        "(Claude Code: /plugin, then configure cerebro) and run `~/.cerebro/bin/cerebro schedule` again, or set CEREBRO_SERVER_URL and CEREBRO_TOKEN.",
       );
     }
   },

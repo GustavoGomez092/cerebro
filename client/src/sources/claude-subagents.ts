@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { storable } from "@cerebro/shared";
-import { claudeCodeSource } from "./claude-code";
+import { claudeCodeSource, clean } from "./claude-code";
 import { headLines } from "./lines";
 import type { HistorySource, SourceFile, SourceRead } from "./types";
 
@@ -11,7 +11,7 @@ const isObj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.i
 
 /** The `cwd` of the first transcript entry that has one, read from the head of the file. */
 function firstCwd(path: string): string | null {
-  for (const line of headLines(path)) {
+  for (const line of headLines(path, 10)) {
     try {
       const e = JSON.parse(line);
       if (isObj(e) && typeof e.cwd === "string" && e.cwd) return storable(e.cwd);
@@ -29,7 +29,7 @@ const parentTranscript = (path: string): string => join(dirname(dirname(dirname(
 function agentType(path: string): string | null {
   try {
     const meta = JSON.parse(readFileSync(path.replace(/\.jsonl$/, ".meta.json"), "utf8"));
-    return isObj(meta) && typeof meta.agentType === "string" && meta.agentType ? storable(meta.agentType) : null;
+    return isObj(meta) && typeof meta.agentType === "string" && meta.agentType ? clean(meta.agentType) : null;
   } catch {
     return null;
   }
@@ -58,7 +58,7 @@ export const claudeSubagentsSource: HistorySource = {
           const path = join(subagents, name);
           try {
             const st = statSync(path);
-            if (!st.isFile()) continue;
+            if (!st.isFile() || roots?.unchanged?.(path, st.size, st.mtimeMs)) continue;
             const stem = basename(name, ".jsonl").replace(/^agent-/, "");
             let cwd = firstCwd(path);
             if (!cwd) {
@@ -67,7 +67,7 @@ export const claudeSubagentsSource: HistorySource = {
             }
             out.push({
               source: "claude-code-subagent", path, sessionId: `${parent}/agent-${stem}`, cwd,
-              modifiedMs: st.mtimeMs, endOffset: st.size,
+              modifiedMs: st.mtimeMs, endOffset: st.size, size: st.size,
             });
           } catch { /* vanished between listing and stat */ }
         }

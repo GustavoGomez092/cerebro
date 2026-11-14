@@ -105,6 +105,59 @@ test("codex: a growing rollout yields only the new lines; scripted runs are head
   expect(codexSource.read(f2!, start).headless).toBe(true);
 });
 
+test("codex: injected context sent as a user message is not a prompt", async () => {
+  const meta = fixture("codex-rollout.jsonl").split("\n")[0]!;
+  const user = (text: string, i: number) => JSON.stringify({
+    timestamp: `2026-01-05T10:00:1${i}.000Z`, type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+  });
+  const { home } = codexHome([
+    meta,
+    user("<environment_context>\n  <cwd>/x</cwd>\n</environment_context>", 1),
+    user("  <user_instructions>\nbe brief\n</user_instructions>", 2),
+    user("the real question", 3),
+  ].join("\n") + "\n");
+  const [file] = await codexSource.discover({ home });
+  const r = codexSource.read(file!, start);
+  expect(r.events.map((e) => e.text)).toEqual(["the real question"]);
+  expect(r.skipped).toBe(2);
+});
+
+test("codex: a session_meta line far longer than 256 KB is still read in discover", async () => {
+  const lines = fixture("codex-rollout.jsonl").split("\n");
+  const meta = JSON.parse(lines[0]!);
+  meta.payload.instructions = "x".repeat(600 * 1024);
+  const { home } = codexHome([JSON.stringify(meta), ...lines.slice(1)].join("\n"));
+  const [file] = await codexSource.discover({ home });
+  expect(file).toMatchObject({ cwd: "/Users/dev/projects/demo", repo: "https://github.com/example/demo.git" });
+});
+
+test("discover leaves out files sync reports unchanged since they were finished", async () => {
+  const codex = codexHome();
+  const sub = subagentHome();
+  const generic = tmp();
+  write(join(generic, ".cerebro", "inbox", "a.jsonl"), fixture("generic.jsonl"));
+  const gemini = tmp();
+  const project = tmp();
+  write(join(gemini, ".gemini", "tmp", sha(project), "logs.json"), fixture("gemini-logs.json"));
+  const cases: [HistorySource, string][] = [[codexSource, codex.home], [claudeSubagentsSource, sub.home], [genericSource, generic], [geminiSource, gemini]];
+  for (const [source, home] of cases) {
+    const seen: [string, number, number][] = [];
+    const all = await source.discover({ home, folders: [project] });
+    expect(all.length, source.id).toBeGreaterThan(0);
+    const none = await source.discover({ home, folders: [project], unchanged: (path, size, mtimeMs) => { seen.push([path, size, mtimeMs]); return true; } });
+    expect(none, source.id).toEqual([]);
+    expect(seen.map(([p]) => p).sort(), source.id).toEqual(all.map((f) => f.path).sort());
+    for (const [, size, mtimeMs] of seen) expect(size > 0 && mtimeMs > 0, source.id).toBe(true);
+  }
+});
+
+test("fixtures carry no real tool ids, home folders or hosts, not even as object keys", () => {
+  for (const name of ["codex-rollout.jsonl", "gemini-logs.json", "subagent.jsonl", "generic.jsonl"]) {
+    const text = fixture(name);
+    expect(text, name).not.toMatch(/toolu_[A-Za-z0-9]{8,}|call_[A-Za-z0-9]{16,}|\/Users\/(?!dev\/)|\.local\b|@(?!example\.com)[a-z0-9-]+\./i);
+  }
+});
+
 // --- Claude Code subagents -----------------------------------------------------------------------
 
 const PARENT = "11111111-1111-4111-8111-111111111111";
@@ -257,13 +310,17 @@ test("every adapter redacts secrets and never throws on drift", async () => {
     {
       source: codexSource,
       file: async () => {
-        const meta = fixture("codex-rollout.jsonl").split("\n")[0]!.replace('"branch":"main"', `"branch":"fix-${SECRET}"`);
+        const meta = fixture("codex-rollout.jsonl").split("\n")[0]!
+          .replace('"branch":"main"', `"branch":"fix-${SECRET}"`)
+          .replace('"originator":"codex_cli_rs"', `"originator":"codex_cli_rs ${SECRET}"`)
+          .replace('"cli_version":"0.58.0"', `"cli_version":"0.58.0 ${SECRET}"`)
+          .replace('"source":"cli"', `"source":"cli ${SECRET}"`);
         const { home } = codexHome([
           meta,
           garbage.trim(),
           JSON.stringify({ timestamp: "2026-01-05T10:00:10.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: `key ${SECRET}` }] } }),
-          JSON.stringify({ timestamp: "2026-01-05T10:00:11.000Z", type: "response_item", payload: { type: "function_call", name: "shell", arguments: JSON.stringify({ command: ["echo", SECRET] }), call_id: "c1" } }),
-          JSON.stringify({ timestamp: "2026-01-05T10:00:12.000Z", type: "response_item", payload: { type: "function_call_output", call_id: "c1", output: SECRET } }),
+          JSON.stringify({ timestamp: "2026-01-05T10:00:11.000Z", type: "response_item", payload: { type: "function_call", name: "shell", arguments: JSON.stringify({ command: ["echo", SECRET] }), call_id: `c1-${SECRET}` } }),
+          JSON.stringify({ timestamp: "2026-01-05T10:00:12.000Z", type: "response_item", payload: { type: "function_call_output", call_id: `c1-${SECRET}`, output: SECRET } }),
           JSON.stringify({ timestamp: "2026-01-05T10:00:13.000Z", type: "response_item", payload: { type: "reasoning", summary: [{ type: "summary_text", text: SECRET }] } }),
           JSON.stringify({ timestamp: "2026-01-05T10:00:14.000Z", type: "response_item", payload: "drifted" }),
         ].join("\n") + "\n");
@@ -275,6 +332,7 @@ test("every adapter redacts secrets and never throws on drift", async () => {
       file: async () => {
         const { home, path } = subagentHome();
         appendFileSync(path, garbage + JSON.stringify({ type: "user", uuid: "33333333-3333-4333-8333-333333333333", timestamp: "2026-01-05T10:05:00.000Z", message: { role: "user", content: `key ${SECRET}` } }) + "\n");
+        writeFileSync(path.replace(/\.jsonl$/, ".meta.json"), JSON.stringify({ agentType: `Explore ${SECRET}` }));
         return (await claudeSubagentsSource.discover({ home }))[0]!;
       },
     },
@@ -298,7 +356,7 @@ test("every adapter redacts secrets and never throws on drift", async () => {
           JSON.stringify({ type: "session", agent: "my-agent", id: "r1", cwd: "/w", startedAt: "2026-01-05T10:00:00.000Z", meta: { note: SECRET } }),
           garbage.trim(),
           JSON.stringify({ type: "event", key: "k1", ts: "2026-01-05T10:00:01.000Z", kind: "user", text: `key ${SECRET}` }),
-          JSON.stringify({ type: "event", key: "k2", ts: "2026-01-05T10:00:02.000Z", kind: "tool_call", text: "", toolName: "sh", toolInput: { cmd: SECRET }, meta: { m: SECRET } }),
+          JSON.stringify({ type: "event", key: "k2", ts: "2026-01-05T10:00:02.000Z", kind: "tool_call", text: "", toolName: `sh ${SECRET}`, toolInput: { cmd: SECRET }, meta: { m: SECRET } }),
           JSON.stringify({ type: "event", key: "k3", ts: "2026-01-05T10:00:03.000Z", kind: "nonsense", text: "x" }),
         ].join("\n") + "\n");
         return (await genericSource.discover({ home }))[0]!;

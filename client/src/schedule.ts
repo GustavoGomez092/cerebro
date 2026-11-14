@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { saveClientConfig, type ClientConfig } from "./config";
 import { logError } from "./log";
 import { cerebroHome } from "./paths";
 import { isCompiledBinary } from "./spawn";
@@ -98,4 +99,13 @@ export function removeSchedule(opts: Omit<ScheduleOptions, "program"> = {}): boo
   (opts.launchctl ?? runLaunchctl)(["bootout", `gui/${opts.uid ?? process.getuid!()}`, path]);
   rmSync(path, { force: true });
   return true;
+}
+
+/**
+ * `cerebro schedule`: launchd starts sync without the plugin's environment, so the server settings this command
+ * was run with are saved to ~/.cerebro/config.json (mode 0600) for it; then the agent is installed.
+ */
+export function setUpSchedule(opts: ScheduleOptions & { config: ClientConfig | null }): { path: string; configured: boolean } {
+  if (opts.config) saveClientConfig(opts.config);
+  return { path: installSchedule(opts), configured: opts.config !== null };
 }
