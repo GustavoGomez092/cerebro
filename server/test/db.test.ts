@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { readdirSync } from "node:fs";
 import { freshDb } from "./helpers";
 import { migrate, checkEmbedSettings } from "../src/db";
 import { loadConfig } from "../src/config";
@@ -24,7 +25,8 @@ test("concurrent migrations both succeed", async () => {
     const { connect } = await import("../src/db");
     const a = connect(url), b = connect(url);
     const [ra, rb] = await Promise.all([migrate(a), migrate(b)]);
-    expect([...ra, ...rb].sort()).toEqual(["001_init.sql"]);
+    const all = readdirSync(new URL("../migrations", import.meta.url).pathname).filter((f) => f.endsWith(".sql")).sort();
+    expect([...ra, ...rb].sort()).toEqual(all);
     await a.close(); await b.close();
   } finally { await drop(); }
 });
