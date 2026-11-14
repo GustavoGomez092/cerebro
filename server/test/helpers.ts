@@ -24,11 +24,13 @@ export async function freshDb(): Promise<{ sql: SQL; drop(): Promise<void> }> {
 import type { Hono } from "hono";
 import { createApp } from "../src/http/app";
 import { createToken } from "../src/auth";
+import { fakeEmbedder } from "../src/embed/fake";
+import type { Embedder } from "../src/embed/embedder";
 
-export async function authedApp(opts: { embedder?: any } = {}) {
+export async function authedApp(opts: { embedder?: Embedder } = {}) {
   const db = await freshDb();
   const { token, machineId } = await createToken(db.sql, "test-mac");
-  const app: Hono = createApp({ sql: db.sql, embedder: opts.embedder ?? null });
+  const app: Hono = createApp({ sql: db.sql, embedder: opts.embedder ?? fakeEmbedder() });
   const call = (method: string, path: string, body?: unknown, tok: string | null = token) =>
     app.request(path, {
       method,
