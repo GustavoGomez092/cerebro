@@ -4,7 +4,7 @@ import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
 import { claimSummaryJob } from "../src/summarise/jobs";
 import { runClaude, type ClaudeInput } from "../src/summarise/claude";
-import { summariseJob, summaryEmbedText } from "../src/summarise/summarise";
+import { loadEvents, summariseJob, summaryEmbedText } from "../src/summarise/summarise";
 import { SUMMARY_SCHEMA } from "../src/summarise/prompts";
 import { scopeKey } from "../src/summarise/state";
 
@@ -388,5 +388,71 @@ test("a failure the CLI survives (it answers a probe) is the job's fault and cou
       .toMatchObject({ status: "failed", reason: "failed" });
     const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
     expect(j).toEqual({ attempts: 1, dead: false });
+  } finally { await t.drop(); }
+});
+
+/** Characters of every string a loaded event holds (what a job keeps in memory). */
+const loadedChars = (events: any[]) => events.reduce((n, e) =>
+  n + JSON.stringify([e.text, e.tool_name, e.tool_input, e.tool_input_text ?? null, e.meta ?? null]).length, 0);
+
+test("a job loads oversized events trimmed in SQL: its working set stays a few MB", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t, { project: "Web" });
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [ev("s1", 1, "user", "Please read the big log")] });
+    const big = (c: string, n: number) => c.repeat(n);
+    // Tool output and input far larger than anything rendered (300-char previews), thinking in meta,
+    // and a pasted user message larger than a whole piece.
+    for (let i = 0; i < 6; i++) {
+      await t.sql`insert into events (session_id, key, seq, ts, kind, text, tool_name, tool_input, meta) values
+        ('s1', ${`c${i}`}, ${2 + i * 2}, now(), 'tool_call', '', 'Read', ${JSON.stringify({ path: "/x", blob: big("I", 1_000_000) })}::text::jsonb, '{}'),
+        ('s1', ${`r${i}`}, ${3 + i * 2}, now(), 'tool_result', ${big("R", 3_000_000)}, 'Read', null, '{}')`;
+    }
+    await t.sql`insert into events (session_id, key, seq, ts, kind, text, meta) values
+      ('s1', 'think', 20, now(), 'assistant', '', ${JSON.stringify({ thinking: big("T", 2_000_000) })}::text::jsonb),
+      ('s1', 'paste', 21, now(), 'user', ${big("P", 500_000)}, '{}'),
+      ('s1', 'meta', 22, now(), 'user', 'META-CAVEAT', '{"isMeta": true}'),
+      ('s1', 'done', 23, now(), 'assistant', 'Read it all', '{}')`;
+
+    const { events, hitCap } = await loadEvents(t.sql, "s1", -1);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 20, 21, 22, 23]);
+    expect(hitCap).toBe(false);
+    // ~24 MB of raw event data; what a job holds is bounded by the render caps.
+    expect(loadedChars(events)).toBeLessThan(200_000);
+
+    await endSession(t.sql, "s1", new Date().toISOString());
+    const job = (await claimSummaryJob(t.sql))!;
+    const prompts: string[] = [];
+    const run = async (input: ClaudeInput) => { prompts.push(input.prompt); return fakeRun("ok")(input); };
+    expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET })).toMatchObject({ status: "done" });
+    const text = prompts.join("\n");
+    expect(text).toContain("Tool Read: ");
+    expect(text).toContain("R".repeat(300));
+    expect(text).not.toContain("R".repeat(301));
+    expect(text).not.toContain("TTTT");
+    expect(text).not.toContain("META-CAVEAT");
+    expect(text).toContain("Read it all");
+  } finally { await t.drop(); }
+});
+
+test("a job loads at most a bounded amount of text; the rest is due at once", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t, { project: "Web" });
+    const events = Array.from({ length: 10 }, (_, i) => ev("s1", i + 1, i % 2 ? "assistant" : "user", `${i + 1} ${"w".repeat(995)}`));
+    await ingest(t, { sessions: [sess("s1", binding.id)], events });
+    const first = await loadEvents(t.sql, "s1", -1, { maxLoadChars: 3500 });
+    expect(first.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(first.hitCap).toBe(true);
+    const all = await loadEvents(t.sql, "s1", -1);
+    expect(all.events).toHaveLength(10);
+    expect(all.hitCap).toBe(false);
+
+    await endSession(t.sql, "s1", new Date().toISOString());
+    let job = (await claimSummaryJob(t.sql))!;
+    expect(await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET, maxLoadChars: 3500 }))
+      .toMatchObject({ status: "done" });
+    const [j] = await t.sql`select covered_seq, due_at <= now() as due from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ covered_seq: 4, due: true });
   } finally { await t.drop(); }
 });

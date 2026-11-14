@@ -9,6 +9,12 @@ import { renderRange, type EventRow } from "./render";
 import { markScopesDirty, scopeKey } from "./state";
 
 const MAX_EVENTS = 2000;
+/** Characters of event text a job loads at most (about 2 MB as JS strings); the rest is due at once. */
+const MAX_LOAD_CHARS = 1_000_000;
+/** Transcript characters per model call by default. */
+const MAX_PIECE_CHARS = 60_000;
+/** Tool output and input loaded per event: rendering shows 300 characters after collapsing whitespace. */
+const TOOL_TEXT_CHARS = 2000;
 const EMBED_TIMEOUT_MS = 30_000;
 const RETRY_LATER_MS = 30 * 60_000;
 /** A job deferred by an outage is due again after this (the loop pauses and probes meanwhile). */
@@ -32,6 +38,8 @@ export interface SummariseDeps {
   maxChars?: number;
   /** Events loaded per job (default 2000); a job stopped at the cap is due again at once. */
   maxEvents?: number;
+  /** Characters of event text loaded per job (default 1 000 000); likewise due again at once past it. */
+  maxLoadChars?: number;
   /**
    * Stop request (shutdown): checked between pieces. A call that fails once it is set (killed by the
    * caller's shutdown deadline) is not held against the job.
@@ -143,6 +151,44 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
 }
 
 /**
+ * The session's events after `coveredSeq` for summarising, in seq order: at most `maxEvents`, and only as
+ * many as start within `maxLoadChars` of loaded text. Values are trimmed in SQL to what rendering can use
+ * (messages to one piece, tool output and input to a little over their 300-character previews, `meta` to
+ * its isMeta flag), so a session full of multi-MB tool output costs a job a few MB at most.
+ * `hitCap` when more events may follow.
+ */
+export async function loadEvents(
+  sql: SQL, sessionId: string, coveredSeq: number,
+  opts: { maxEvents?: number; maxChars?: number; maxLoadChars?: number } = {},
+): Promise<{ events: EventRow[]; hitCap: boolean }> {
+  const maxEvents = opts.maxEvents ?? MAX_EVENTS;
+  const maxLoad = opts.maxLoadChars ?? MAX_LOAD_CHARS;
+  const rows = await sql`
+    select seq, ts, kind, text, tool_name, tool_input_text, meta, before from (
+      select *, sum(length(text) + coalesce(length(tool_input_text), 0)) over (order by seq) - length(text)
+          - coalesce(length(tool_input_text), 0) as before
+      from (
+        select seq, ts, kind,
+          case when kind in ('user', 'assistant') then left(text, ${opts.maxChars ?? MAX_PIECE_CHARS})
+               else left(text, ${TOOL_TEXT_CHARS}) end as text,
+          left(tool_name, ${TOOL_TEXT_CHARS}) as tool_name,
+          left(tool_input::text, ${TOOL_TEXT_CHARS}) as tool_input_text,
+          case when meta->'isMeta' = 'true'::jsonb then '{"isMeta": true}'::jsonb end as meta
+        from events
+        where session_id = ${sessionId} and seq > ${coveredSeq}
+        order by seq limit ${maxEvents}) trimmed) sized
+    where before < ${maxLoad}
+    order by seq`;
+  const events: EventRow[] = rows.map((r: any) => ({
+    seq: r.seq, ts: r.ts, kind: r.kind, text: r.text, tool_name: r.tool_name, tool_input: null,
+    tool_input_text: r.tool_input_text, meta: r.meta,
+  }));
+  const last = rows[rows.length - 1];
+  const loaded = last ? Number(last.before) + last.text.length + (last.tool_input_text?.length ?? 0) : 0;
+  return { events, hitCap: events.length >= maxEvents || loaded >= maxLoad };
+}
+
+/**
  * Summarises a claimed job's uncovered events (up to `maxEvents`), one model call per rendered piece.
  * Each piece's summary is stored (with the session's current binding scope) before the job is
  * completed, so a crash or a later deferral resumes after the last stored piece.
@@ -191,11 +237,7 @@ export async function summariseJob(
       select 1 from sessions s join bindings b on b.id = s.binding_id
       where s.id = ${sessionId} and b.status = 'active'`).length > 0;
 
-  const maxEvents = deps.maxEvents ?? MAX_EVENTS;
-  const events: EventRow[] = await sql`
-    select seq, ts, kind, text, tool_name, tool_input, meta from events
-    where session_id = ${sessionId} and seq > ${job.coveredSeq}
-    order by seq limit ${maxEvents}`;
+  const { events, hitCap } = await loadEvents(sql, sessionId, job.coveredSeq, deps);
   if (!events.length) {
     await completeSummaryJob(sql, sessionId, job.coveredSeq);
     return result("done");
@@ -293,7 +335,6 @@ export async function summariseJob(
     }
   }
 
-  const hitCap = events.length >= maxEvents;
   await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, { dueNow: hitCap });
   return result("done");
 }

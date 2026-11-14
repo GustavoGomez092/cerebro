@@ -8,6 +8,8 @@ export interface EventRow {
   text: string;
   tool_name: string | null;
   tool_input: unknown;
+  /** The tool input as JSON text, possibly cut short (as loaded for summarising); used before `tool_input`. */
+  tool_input_text?: string | null;
   meta?: Record<string, unknown> | null;
 }
 
@@ -49,7 +51,8 @@ function line(e: EventRow, toolName: string | null): string | null {
     }
     case "tool_call": {
       if (isCerebroTool(toolName)) return null;
-      const input = e.tool_input == null ? "" : oneLine(JSON.stringify(e.tool_input)).slice(0, PREVIEW);
+      const json = e.tool_input_text ?? (e.tool_input == null ? null : JSON.stringify(e.tool_input));
+      const input = json == null ? "" : oneLine(json).slice(0, PREVIEW);
       const name = toolName ? oneLine(toolName).slice(0, TOOL_NAME_MAX) : "";
       return `Tool ${name || "unknown"}: ${input}`;
     }
