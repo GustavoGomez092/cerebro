@@ -1,6 +1,6 @@
 import { loadConfig } from "./config";
 import { checkEmbedSettings, connect, migrate } from "./db";
-import { failoverEmbedder } from "./embed/failover";
+import { createEmbedRouter } from "./embed/failover";
 import { createApp } from "./http/app";
 import { EmbedGate, newWorkerState, startEmbedWorker } from "./worker";
 import { newSummariserState, startSummariser } from "./summarise/loop";
@@ -27,9 +27,10 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, waitMs: number, onRetry
 export async function buildServer(env: Record<string, string | undefined>, opts: { dbWaitMs?: number } = {}) {
   const config = loadConfig(env);
   if (!config.embedUrl) throw new Error("EMBED_URL is required (Ollama base URL for embeddings)");
-  // One embedder for the worker, search and summaries: EMBED_PRIMARY_URL first when set, else EMBED_URL alone.
-  const embedder = failoverEmbedder({
-    primaryUrl: config.embedPrimaryUrl, fallbackUrl: config.embedUrl, digest: config.embedModelDigest,
+  // One router for the worker, search and summaries: each machine's work on its own Ollama (EMBED_MACHINE_URLS),
+  // EMBED_URL for the rest and as the fallback. An empty map is EMBED_URL alone, as before.
+  const embedder = createEmbedRouter({
+    machineUrls: config.embedMachineUrls, fallbackUrl: config.embedUrl, digest: config.embedModelDigest,
     model: config.embedModel, dims: config.embedDims,
   });
   const sql = connect(config.databaseUrl);

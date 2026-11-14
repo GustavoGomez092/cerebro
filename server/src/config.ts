@@ -2,9 +2,12 @@ export interface Config {
   databaseUrl: string;
   port: number;
   embedUrl: string | null;
-  /** Ollama tried first (e.g. the Mac mini's Metal GPU); embedUrl is the fallback. Null: embedUrl only. */
-  embedPrimaryUrl: string | null;
-  /** Expected model digest on the primary (12-hex prefix or full sha256, lower case), or null for no check. */
+  /**
+   * Machine-token name → that machine's own Ollama (e.g. a Mac's Metal GPU): its chunks, summaries and queries
+   * embed there, with embedUrl as the fallback. Empty: embedUrl for everything.
+   */
+  embedMachineUrls: Record<string, string>;
+  /** Expected model digest on every machine endpoint (12-hex prefix or full sha256, lower case), or null. */
   embedModelDigest: string | null;
   embedModel: string;
   embedDims: number;
@@ -39,14 +42,36 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return n;
 }
 
+const isHttpUrl = (raw: string) => {
+  try {
+    const u = new URL(raw);
+    return ["http:", "https:"].includes(u.protocol) && !!u.hostname;
+  } catch {
+    return false;
+  }
+};
+
 /** An optional http(s) base URL; anything else is a startup error. */
 function urlEnv(env: Record<string, string | undefined>, name: string): string | null {
   const raw = (env[name] ?? "").trim();
   if (raw === "") return null;
-  let u: URL | null = null;
-  try { u = new URL(raw); } catch { /* reported below */ }
-  if (!u || !["http:", "https:"].includes(u.protocol) || !u.hostname) throw new Error(`${name} must be an http(s) URL`);
+  if (!isHttpUrl(raw)) throw new Error(`${name} must be an http(s) URL`);
   return raw;
+}
+
+/** `name=url,name=url` (spaces and a trailing comma allowed); each name once, each URL http(s). */
+function machineUrlsEnv(env: Record<string, string | undefined>, name: string): Record<string, string> {
+  const out = new Map<string, string>();
+  for (const pair of (env[name] ?? "").split(",").map((p) => p.trim()).filter(Boolean)) {
+    const eq = pair.indexOf("=");
+    const machine = eq > 0 ? pair.slice(0, eq).trim() : "";
+    const url = eq > 0 ? pair.slice(eq + 1).trim() : "";
+    if (!machine || !url) throw new Error(`${name} must be machine=url pairs separated by commas`);
+    if (!isHttpUrl(url)) throw new Error(`${name}: the URL for ${machine} must be an http(s) URL`);
+    if (out.has(machine)) throw new Error(`${name} names ${machine} twice`);
+    out.set(machine, url);
+  }
+  return Object.fromEntries(out);
 }
 
 /** An Ollama model digest: the 12-hex `ollama list` ID or the full sha256 (an optional `sha256:` prefix is dropped). */
@@ -64,7 +89,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     databaseUrl,
     port: intEnv(env, "PORT", 8790),
     embedUrl: urlEnv(env, "EMBED_URL"),
-    embedPrimaryUrl: urlEnv(env, "EMBED_PRIMARY_URL"),
+    embedMachineUrls: machineUrlsEnv(env, "EMBED_MACHINE_URLS"),
     embedModelDigest: digestEnv(env, "EMBED_MODEL_DIGEST"),
     embedModel: env.EMBED_MODEL || "bge-m3",
     embedDims: intEnv(env, "EMBED_DIMS", 1024),

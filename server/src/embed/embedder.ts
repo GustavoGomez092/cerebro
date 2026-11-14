@@ -2,17 +2,42 @@ export interface Embedder {
   dims: number;
   /** Embeds texts in order. `signal` lets a caller (e.g. a search timeout) cancel the request. */
   embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
-  /** Which endpoint embeds (failover embedder only), for /v1/status. */
-  routing?(): EmbedRouting;
+  /** EMBED_MACHINE_URLS routing: the embedder for work that belongs to `machine` (absent: this one serves all). */
+  forMachine?(machine: string | null): Embedder;
+  /** The mapped machines' own endpoints, one worker lane each (absent or empty: one lane, this embedder). */
+  lanes?(): EmbedLane[];
+  /** Per-endpoint state for /v1/status. */
+  status?(): EmbedStatus;
 }
 
-/** unset: no EMBED_PRIMARY_URL; unknown: not tried since the server started. */
-export type PrimaryState = "unset" | "unknown" | "up" | "down" | "digest_mismatch";
+/** The embedder for `machine`'s work: its own endpoint when routed, else `e` itself. */
+export const embedderFor = (e: Embedder, machine: string | null): Embedder => e.forMachine?.(machine) ?? e;
 
-export interface EmbedRouting {
-  primary: { url: string | null; state: PrimaryState; lastError: string | null; downUntil: string | null };
-  fallback: { url: string };
-  lastUsed: "primary" | "fallback" | null;
+/** unset: no endpoint configured; unknown: not tried since the server started. */
+export type EndpointState = "unset" | "unknown" | "up" | "down" | "digest_mismatch";
+
+export interface EndpointStatus {
+  machine: string | null;
+  url: string;
+  state: EndpointState;
+  lastError: string | null;
+  downUntil: string | null;
+  lastUsedAt: string | null;
+}
+
+export interface EmbedStatus {
+  endpoints: EndpointStatus[];
+  fallback: { url: string; lastUsedAt: string | null };
+}
+
+/**
+ * A mapped machine's endpoint as the worker sees it: `embed` uses that endpoint only (never the fallback) and
+ * throws a transient EmbedderError when it is down; `blocked` while it sits out its down window.
+ */
+export interface EmbedLane {
+  machine: string;
+  embedder: Embedder;
+  blocked(): boolean;
 }
 
 /**

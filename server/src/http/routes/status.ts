@@ -20,11 +20,9 @@ async function summariserStatus(sql: SQL, s: AppDeps["summariser"]) {
   };
 }
 
-/** Where embeddings are made (EMBED_PRIMARY_URL / EMBED_URL); URLs only, credentials already stripped. */
+/** Where embeddings are made: each machine's endpoint (EMBED_MACHINE_URLS) and the fallback (EMBED_URL). URLs only. */
 function routingStatus(embedder: AppDeps["embedder"]) {
-  return embedder.routing?.() ?? {
-    primary: { url: null, state: "unset", lastError: null, downUntil: null }, fallback: null, lastUsed: null,
-  };
+  return embedder.status?.() ?? { endpoints: [], fallback: null };
 }
 
 export function statusRoutes({ sql, embedder, workerState, summariser }: AppDeps) {

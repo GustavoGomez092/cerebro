@@ -80,7 +80,7 @@ test("a transiently failing primary falls back within the same call, then is ski
   const r = embedder.routing();
   expect(r).toMatchObject({ primary: { state: "down" }, lastUsed: "fallback" });
   expect(r.primary.lastError).toContain("503");
-  expect(logs.some((l) => l.level === "warn" && /primary embedder/.test(l.msg))).toBe(true);
+  expect(logs.some((l) => l.level === "warn" && /embedder unavailable/.test(l.msg))).toBe(true);
 
   primary.mode = "ok"; // back, but the 60 s window is not over: not contacted
   advance(PRIMARY_DOWN_MS - 1);

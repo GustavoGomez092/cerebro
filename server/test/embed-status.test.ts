@@ -1,95 +1,85 @@
-import { test, expect } from "bun:test";
+import { test, expect, afterEach } from "bun:test";
 import { authedApp, freshDb } from "./helpers";
 import { buildServer } from "../src/main";
-import { failoverEmbedder } from "../src/embed/failover";
+import { createEmbedRouter } from "../src/embed/failover";
 import { newWorkerState } from "../src/worker";
+import { fakeOllama } from "./fakes/ollama";
 
-/** A stand-in Ollama answering 1024-dim vectors, or 503 when `down`. */
-function fakeOllama() {
-  const s = { down: false };
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      if (new URL(req.url).pathname === "/api/tags") return Response.json({ models: [] });
-      const { input } = (await req.json()) as { input: string[] };
-      if (s.down) return new Response("busy", { status: 503 });
-      return Response.json({ embeddings: input.map(() => new Array(1024).fill(0.5)) });
-    },
+const live: { stop(): void }[] = [];
+afterEach(() => { for (const s of live.splice(0)) s.stop(); });
+
+test("/v1/status lists each machine endpoint's state and the fallback, keeping every existing field", async () => {
+  const mini = fakeOllama(1), mbp = fakeOllama(3), zima = fakeOllama(2);
+  live.push(mini, mbp, zima);
+  const embedder = createEmbedRouter({
+    machineUrls: { "mac-mini": mini.url, "macbook-pro": mbp.url }, fallbackUrl: zima.url, model: "bge-m3", dims: 1024, log: () => {},
   });
-  return Object.assign(s, { url: `http://127.0.0.1:${server.port}`, server });
-}
-
-test("/v1/status reports the primary's state and which endpoint embedded last, keeping every existing field", async () => {
-  const primary = fakeOllama();
-  const fallback = fakeOllama();
-  const embedder = failoverEmbedder({ primaryUrl: primary.url, fallbackUrl: fallback.url, model: "bge-m3", dims: 1024, log: () => {} });
   const workerState = { ...newWorkerState(), lastSuccessAt: "2026-11-14T10:00:00.000Z" };
   const t = await authedApp({ embedder, deps: { workerState } });
   try {
     const before = (await (await t.call("GET", "/v1/status")).json()).embedder;
     expect(before).toEqual({
       lastSuccessAt: "2026-11-14T10:00:00.000Z", lastError: null, pausedUntil: null,
-      primary: { url: primary.url, state: "unknown", lastError: null, downUntil: null },
-      fallback: { url: fallback.url },
-      lastUsed: null,
+      endpoints: [
+        { machine: "mac-mini", url: mini.url, state: "unknown", lastError: null, downUntil: null, lastUsedAt: null },
+        { machine: "macbook-pro", url: mbp.url, state: "unknown", lastError: null, downUntil: null, lastUsedAt: null },
+      ],
+      fallback: { url: zima.url, lastUsedAt: null },
     });
 
-    await embedder.embed(["a"]);
-    const up = (await (await t.call("GET", "/v1/status")).json()).embedder;
-    expect(up).toMatchObject({ primary: { state: "up" }, lastUsed: "primary" });
-
-    primary.down = true;
-    await embedder.embed(["b"]);
-    const down = (await (await t.call("GET", "/v1/status")).json()).embedder;
-    expect(down).toMatchObject({ primary: { url: primary.url, state: "down", lastError: expect.stringContaining("503") }, lastUsed: "fallback" });
-    expect(Date.parse(down.primary.downUntil)).toBeGreaterThan(Date.now());
+    mbp.mode = "503";
+    await embedder.forMachine("mac-mini").embed(["a"]);
+    await embedder.forMachine("macbook-pro").embed(["b"]);
+    const after = (await (await t.call("GET", "/v1/status")).json()).embedder;
+    expect(after.endpoints[0]).toMatchObject({ machine: "mac-mini", state: "up", lastUsedAt: expect.any(String) });
+    expect(after.endpoints[1]).toMatchObject({ machine: "macbook-pro", state: "down", lastError: expect.stringContaining("503") });
+    expect(Date.parse(after.endpoints[1].downUntil)).toBeGreaterThan(Date.now());
+    expect(after.fallback.lastUsedAt).toEqual(expect.any(String));
   } finally {
     await t.drop();
-    primary.server.stop(true);
-    fallback.server.stop(true);
   }
 });
 
-test("/v1/status with an embedder that has no routing reports the primary as unset", async () => {
+test("/v1/status with an embedder that reports no endpoints shows an empty list", async () => {
   const t = await authedApp();
   try {
     const e = (await (await t.call("GET", "/v1/status")).json()).embedder;
-    expect(e).toMatchObject({ lastSuccessAt: null, lastError: null, pausedUntil: null, primary: { url: null, state: "unset" }, lastUsed: null });
+    expect(e).toEqual({ lastSuccessAt: null, lastError: null, pausedUntil: null, endpoints: [], fallback: null });
   } finally {
     await t.drop();
   }
 });
 
-test("buildServer wires one failover embedder from EMBED_PRIMARY_URL / EMBED_MODEL_DIGEST / EMBED_URL", async () => {
+test("buildServer wires one router from EMBED_MACHINE_URLS / EMBED_MODEL_DIGEST / EMBED_URL", async () => {
   const db = await freshDb();
-  const primary = fakeOllama();
-  const fallback = fakeOllama();
+  const mini = fakeOllama(1), zima = fakeOllama(2);
+  live.push(mini, zima);
   const log = console.log;
   console.log = () => {};
   try {
     const built = await buildServer({
-      DATABASE_URL: db.url, EMBED_URL: fallback.url, EMBED_PRIMARY_URL: primary.url, EMBED_MODEL_DIGEST: "790764642607",
+      DATABASE_URL: db.url, EMBED_URL: zima.url, EMBED_MACHINE_URLS: `mac-mini=${mini.url}`, EMBED_MODEL_DIGEST: "790764642607",
       SUMMARISER_ENABLED: "false",
     });
     try {
-      // The fake primary lists no models: the digest check fails, the fallback embeds, nothing fails.
-      expect((await built.embedder.embed(["a"]))[0]).toHaveLength(1024);
-      expect(built.embedder.routing?.()).toMatchObject({
-        primary: { url: primary.url, state: "digest_mismatch" }, fallback: { url: fallback.url }, lastUsed: "fallback",
+      expect(built.embedder.lanes?.().map((l) => l.machine)).toEqual(["mac-mini"]);
+      expect((await built.embedder.forMachine!("mac-mini").embed(["a"]))[0][0]).toBe(1);
+      expect(mini.tagCalls).toBe(1); // the digest was checked
+      expect(built.embedder.status?.()).toMatchObject({
+        endpoints: [{ machine: "mac-mini", url: mini.url, state: "up" }], fallback: { url: zima.url },
       });
     } finally { await built.sql.close(); }
 
-    const plain = await buildServer({ DATABASE_URL: db.url, EMBED_URL: fallback.url, SUMMARISER_ENABLED: "false" });
+    const plain = await buildServer({ DATABASE_URL: db.url, EMBED_URL: zima.url, SUMMARISER_ENABLED: "false" });
     try {
-      await plain.embedder.embed(["a"]);
-      expect(plain.embedder.routing?.()).toMatchObject({ primary: { url: null, state: "unset" }, lastUsed: "fallback" });
+      expect(plain.embedder.lanes?.() ?? []).toEqual([]);
+      expect((await plain.embedder.embed(["a"]))[0][0]).toBe(2);
+      expect(plain.embedder.status?.()).toMatchObject({ endpoints: [], fallback: { url: zima.url } });
     } finally { await plain.sql.close(); }
 
-    await expect(buildServer({ DATABASE_URL: db.url, EMBED_URL: fallback.url, EMBED_PRIMARY_URL: "mac:11434" })).rejects.toThrow(/EMBED_PRIMARY_URL/);
+    await expect(buildServer({ DATABASE_URL: db.url, EMBED_URL: zima.url, EMBED_MACHINE_URLS: "mac-mini" })).rejects.toThrow(/EMBED_MACHINE_URLS/);
   } finally {
     console.log = log;
     await db.drop();
-    primary.server.stop(true);
-    fallback.server.stop(true);
   }
 });

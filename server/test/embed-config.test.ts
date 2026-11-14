@@ -4,17 +4,28 @@ import { loadConfig } from "../src/config";
 const base = { DATABASE_URL: "postgres://x", EMBED_URL: "http://cerebro-ollama:11434" };
 const DIGEST = "790764642607" + "a".repeat(52);
 
-test("EMBED_PRIMARY_URL is optional; unset or empty means no primary", () => {
-  expect(loadConfig(base).embedPrimaryUrl).toBeNull();
-  expect(loadConfig({ ...base, EMBED_PRIMARY_URL: "" }).embedPrimaryUrl).toBeNull();
-  expect(loadConfig({ ...base, EMBED_PRIMARY_URL: "http://192.168.4.42:11434" }).embedPrimaryUrl).toBe("http://192.168.4.42:11434");
+test("EMBED_MACHINE_URLS is optional; unset or empty means no per-machine endpoints", () => {
+  expect(loadConfig(base).embedMachineUrls).toEqual({});
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: "" }).embedMachineUrls).toEqual({});
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: " " }).embedMachineUrls).toEqual({});
 });
 
-test("embedding URLs are validated at startup: http(s) only", () => {
-  for (const bad of ["192.168.4.42:11434", "ftp://mac:11434", "not a url", "http://"]) {
-    expect(() => loadConfig({ ...base, EMBED_PRIMARY_URL: bad })).toThrow(/EMBED_PRIMARY_URL/);
+test("EMBED_MACHINE_URLS maps machine-token names to their Ollama", () => {
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: "mac-mini=http://192.168.4.42:11434" }).embedMachineUrls)
+    .toEqual({ "mac-mini": "http://192.168.4.42:11434" });
+  expect(loadConfig({ ...base, EMBED_MACHINE_URLS: " mac-mini = http://192.168.4.42:11434 , macbook-pro=http://192.168.4.45:11434/ ," }).embedMachineUrls)
+    .toEqual({ "mac-mini": "http://192.168.4.42:11434", "macbook-pro": "http://192.168.4.45:11434/" });
+});
+
+test("EMBED_MACHINE_URLS is validated at startup: name=url pairs, http(s) URLs, each machine once", () => {
+  for (const bad of ["mac-mini", "=http://x:1", "mac-mini=", "mac-mini=192.168.4.42:11434", "mac-mini=ftp://x:1",
+    "a=http://x:1,a=http://y:1", "a=http://x:1;b=http://y:1"])
+    expect(() => loadConfig({ ...base, EMBED_MACHINE_URLS: bad }), bad).toThrow(/EMBED_MACHINE_URLS/);
+});
+
+test("EMBED_URL is validated at startup: http(s) only", () => {
+  for (const bad of ["192.168.4.42:11434", "ftp://mac:11434", "not a url", "http://"])
     expect(() => loadConfig({ ...base, EMBED_URL: bad })).toThrow(/EMBED_URL/);
-  }
   expect(loadConfig({ ...base, EMBED_URL: "https://ollama.example:443/" }).embedUrl).toBe("https://ollama.example:443/");
 });
 
