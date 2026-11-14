@@ -20,7 +20,14 @@ async function summariserStatus(sql: SQL, s: AppDeps["summariser"]) {
   };
 }
 
-export function statusRoutes({ sql, workerState, summariser }: AppDeps) {
+/** Where embeddings are made (EMBED_PRIMARY_URL / EMBED_URL); URLs only, credentials already stripped. */
+function routingStatus(embedder: AppDeps["embedder"]) {
+  return embedder.routing?.() ?? {
+    primary: { url: null, state: "unset", lastError: null, downUntil: null }, fallback: null, lastUsed: null,
+  };
+}
+
+export function statusRoutes({ sql, embedder, workerState, summariser }: AppDeps) {
   const r = new Hono<Env>();
   r.get("/status", async (c) => {
     const [q] = await sql`
@@ -36,6 +43,7 @@ export function statusRoutes({ sql, workerState, summariser }: AppDeps) {
         lastSuccessAt: workerState?.lastSuccessAt ?? null,
         lastError: workerState?.lastError ?? null,
         pausedUntil: workerState && workerState.pausedUntil > Date.now() ? new Date(workerState.pausedUntil).toISOString() : null,
+        ...routingStatus(embedder),
       },
       summariser: await summariserStatus(sql, summariser),
       dbBytes: bytes,
