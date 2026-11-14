@@ -132,12 +132,16 @@ test("reset-instance also forgets what the old server said: machine name, verifi
   store.set("imported:github.com/acme/a|", "2026-11-01T00:00:00.000Z");
   store.set("imported:github.com/acme/b|pkg", "2026-11-01T00:00:00.000Z");
   store.set("lastSyncAt", "2026-11-01T00:00:00.000Z");
+  store.set("projectState:github.com/acme/a|", JSON.stringify({ clientId: "c", projectId: null, state: { doc: {}, updatedAt: "" } }));
+  store.set("recent:github.com/acme/a|", "[]");
+  store.set("scopeName:b1", "Old Client");
   store.cacheBinding("github.com/acme/a", "", { id: "b1", repo: "github.com/acme/a", subpath: "", status: "active", clientId: "c", projectId: null });
   store.cacheBinding("github.com/acme/b", "pkg", null);
   store.close();
   expect((await cli(["reset-instance"], home)).code).toBe(0);
   const s2 = new Store(join(home, ".cerebro", "cerebro.db"));
-  for (const k of ["instanceId", "instanceVerified", "machine", "imported:github.com/acme/a|", "imported:github.com/acme/b|pkg"]) {
+  for (const k of ["instanceId", "instanceVerified", "machine", "imported:github.com/acme/a|", "imported:github.com/acme/b|pkg",
+    "projectState:github.com/acme/a|", "recent:github.com/acme/a|", "scopeName:b1"]) {
     expect({ k, v: s2.get(k) }).toEqual({ k, v: undefined });
   }
   expect(s2.cachedBinding("github.com/acme/a", "")).toBeUndefined();
@@ -154,7 +158,7 @@ test("the skill file has the required frontmatter and names every MCP tool it us
   expect(m![1]).toContain("description: Use when Cerebro says this folder is not set up, or when the user wants to change which client/project this folder belongs to, stop recording here, or check Cerebro's status.");
   const body = m![2];
   expect(m![1]).toContain("this folder is not set up");
-  for (const t of ["cerebro_folder", "cerebro_bind", "cerebro_decline", "cerebro_adopt", "rebind", "AskUserQuestion", "Codex", "Gemini"]) {
+  for (const t of ["cerebro_folder", "cerebro_bind", "cerebro_decline", "cerebro_adopt", "cerebro_save_history", "rebind", "AskUserQuestion", "Codex", "Gemini"]) {
     expect(body).toContain(t);
   }
   // the CLI is run through the stable link, which exists wherever the plugin has started once
@@ -166,4 +170,26 @@ test("the skill file has the required frontmatter and names every MCP tool it us
   expect(setUp).toContain("If they agree, run `~/.cerebro/bin/cerebro retention`.");
   expect(body).not.toMatch(/retention` keeps Claude Code from deleting old transcripts before they are uploaded/);
   expect(existsSync(join(import.meta.dir, "../../plugin/skills/cerebro"))).toBe(true);
+});
+
+test("the skill names cerebro_save_history after binding", () => {
+  const body = readFileSync(join(import.meta.dir, "../../plugin/skills/cerebro/SKILL.md"), "utf8");
+  const setUp = body.slice(body.indexOf("## Setting up"), body.indexOf("## Changing"));
+  const step = setUp.slice(setUp.indexOf("Build an initial project history"));
+  expect(setUp.indexOf("Build an initial project history")).toBeGreaterThan(setUp.indexOf("Call `cerebro_bind`"));
+  expect(step).toContain("git log --since=\"12 months ago\" --date=short --pretty='%ad %s' | head -400");
+  expect(step).toContain("1500 words");
+  for (const part of ["what the project is", "how it got here", "key decisions with dates", "current state", "open questions"]) expect(step).toContain(part);
+  expect(step).toContain("`cerebro_save_history`");
+  for (const arg of ["`title`", "`text`", "`from`", "`to`"]) expect(step).toContain(arg);
+  // git log lists newest first: the period starts at its last line
+  expect(step).toContain("`from` (the oldest date covered: the last line of the `git log` output");
+  expect(step).toMatch(/tell the user/i);
+  // a folder without git history still gets a history, from its docs alone
+  expect(step).toMatch(/not a git repo[^.]*skip `git log`/i);
+  // skimming docs never opens secrets
+  expect(step).toContain(".env");
+  expect(step).toMatch(/never (read|open)/i);
+  // it runs only once the bind succeeded
+  expect(step).toMatch(/after a successful bind/i);
 });

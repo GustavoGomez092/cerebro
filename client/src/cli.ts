@@ -211,11 +211,13 @@ const resetInstance: Command = {
       store.set("machine", null);
       store.clearBindingCache();
       store.clearPrefix("imported:");
+      // The cached briefs: project states, recent sessions and scope names.
+      for (const p of ["projectState:", "recent:", "scopeName:"]) store.clearPrefix(p);
       if (store.get("blocked") === "instance_mismatch") store.set("blocked", null);
     } finally {
       store.close();
     }
-    await Bun.write(Bun.stdout, "Cleared the pinned instance, machine name, cached bindings and import markers; the next upload pins whichever server it reaches.\n");
+    await Bun.write(Bun.stdout, "Cleared the pinned instance, machine name, cached bindings, cached briefs and import markers; the next upload pins whichever server it reaches.\n");
   },
 };
 
