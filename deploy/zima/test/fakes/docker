@@ -12,6 +12,10 @@ case $1 in
     exit 0 ;;
   builder) exit 0 ;;
   build)
+    # FAKE_STEAL_LOCK: another deploy takes over the lock while this one builds.
+    if [[ -n ${FAKE_STEAL_LOCK-} ]]; then
+      printf 'zzz9999 from thief at 2026-11-14T00:00:00Z\n' > "$FAKE_ROOT/DATA/AppData/cerebro/state/deploy.lock/owner"
+    fi
     rc=${FAKE_BUILD_RC:-0}
     while (($#)); do [[ $1 == -t && $rc == 0 ]] && echo "$2" >> "$st/images"; shift; done
     exit "$rc" ;;
@@ -34,6 +38,7 @@ case $1 in
             if [[ $rc == 0 ]]; then echo "$img" > "$st/running"; else : > "$st/running"; exit "$rc"; fi
           fi ;;
       run) if [[ "$*" == *migrate* ]]; then
+             if [[ ${FAKE_TERM_AT-} == migrate ]]; then term-deploy; exit 1; fi
              printf '%s\n' "${FAKE_MIGRATE_OUT:-migrations up to date}"; exit "${FAKE_MIGRATE_RC:-0}"
            fi ;;
     esac
@@ -47,7 +52,7 @@ case $1 in
     exit 0 ;;
   exec)
     case "$*" in
-      *pg_dump*) printf 'PGDMP-fake'; exit "${FAKE_DUMP_RC:-0}" ;;
+      *pg_dump*) printf '%s' "${FAKE_DUMP_CONTENT:-PGDMP-fake}"; exit "${FAKE_DUMP_RC:-0}" ;;
       *"token create check"*)
         printf 'Token for check (shown once, store it on that machine):\n%s\nDo not create tokens inside a recorded Claude Code session.\n' "$FAKE_CHECK_TOKEN"
         exit 0 ;;

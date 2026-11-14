@@ -73,6 +73,9 @@ function sandbox(envFile = `BGE_M3_DIGEST=${MANIFEST_DIGEST}\nOLLAMA_CPUS=4\n`) 
 }
 
 const mode = (p: string) => statSync(p).mode & 0o777;
+type Sandbox = ReturnType<typeof sandbox>;
+const dumpFiles = (s: Sandbox) => readdirSync(s.app("state/pre-deploy")).filter((f) => f.endsWith(".dump")).sort();
+const dumpFor = (s: Sandbox, sha: string) => dumpFiles(s).find((f) => f.endsWith(`-${sha}.dump`)) ?? `<no dump for ${sha}>`;
 const show = (r: Run) => `exit ${r.code}\n--- stdout\n${r.out}\n--- stderr\n${r.err}`;
 
 describe("deploy.sh", () => {
@@ -148,7 +151,8 @@ describe("deploy.sh", () => {
     expect(compose).toContain('"127.0.0.1:8790:8790"');
     expect(compose).toMatch(/^ {4}cpus: 4$/m);
     expect(readFileSync(s.app("state/instance-id"), "utf8").trim()).toBe("inst-1");
-    expect(readFileSync(s.app("state/migrations"), "utf8").trim()).toBe("001_init.sql");
+    expect(readFileSync(s.app("state/schema-migrations"), "utf8").trim()).toBe("001_init.sql");
+    expect(readFileSync(s.app("state/deployed"), "utf8")).toStartWith(`${s.sha()} `);
     expect(s.locked()).toBe(false);
 
     // The check machine token is created on the server after the gate, stored 600, never shown.
@@ -268,11 +272,7 @@ describe("deploy.sh", () => {
     expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
     const dumps = s.app("state/pre-deploy");
     // Older dumps beyond the newest three are removed.
-    for (const [i, name] of ["old1", "old2", "old3"].entries()) {
-      writeFileSync(join(dumps, `${name}.dump`), "PGDMP");
-      const t = Date.now() / 1000 - 86_400 * (i + 1);
-      utimesSync(join(dumps, `${name}.dump`), t, t);
-    }
+    for (const i of [1, 2, 3]) writeFileSync(join(dumps, `20000101T00000${i}Z-seed${i}.dump`), "PGDMP");
     s.commit("server/migrations/002_more.sql", "alter table t add y int;\n");
     const sha = s.sha();
     s.clearCalls();
@@ -281,14 +281,108 @@ describe("deploy.sh", () => {
     const dumpCall = s.calls().split("\n").find((l) => l.includes("pg_dump")) ?? "";
     for (const t of ["chunk_embeddings", "summary_embeddings", "embed_queue"]) expect(dumpCall).toContain(`--exclude-table-data=${t}`);
     expect(dumpCall).toContain("-Fc");
-    expect(mode(join(dumps, `${sha}.dump`))).toBe(0o600);
-    expect(readFileSync(join(dumps, `${sha}.dump`), "utf8")).toBe("PGDMP-fake");
-    expect(readdirSync(dumps).filter((f) => f.endsWith(".dump")).length).toBe(3);
+    const dump = dumpFor(s, sha);
+    expect(dump).toMatch(/^\d{8}T\d{6}Z-[0-9a-f]{7}\.dump$/);
+    expect(mode(join(dumps, dump))).toBe(0o600);
+    expect(readFileSync(join(dumps, dump), "utf8")).toBe("PGDMP-fake");
+    expect(dumpFiles(s).length).toBe(3);
     expect(r.err).toContain("002_more.sql");
-    expect(r.err).toContain(`/DATA/AppData/cerebro/state/pre-deploy/${sha}.dump`);
+    expect(r.err).toContain(`/DATA/AppData/cerebro/state/pre-deploy/${dump}`);
     expect(r.out).toContain("migrated: 002_more.sql");
-    // The failed release doesn't record its migration list, so the next attempt dumps again.
-    expect(readFileSync(s.app("state/migrations"), "utf8").trim()).toBe("001_init.sql");
+    // The schema list is recorded once migrate succeeds, whatever the gate says.
+    expect(readFileSync(s.app("state/schema-migrations"), "utf8").trim()).toBe("001_init.sql\n002_more.sql");
+  });
+
+  test("retrying after a rolled-back migration keeps the original dump and takes no new one", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    s.commit("server/migrations/002_more.sql", "alter table t add y int;\n");
+    const sha = s.sha();
+    const failing = { FAKE_HEALTHY_TAGS: "prev" };
+    let r = s.run("deploy.sh", [], { ...failing, FAKE_MIGRATE_OUT: "migrated: 002_more.sql", FAKE_DUMP_CONTENT: "PGDMP-before" });
+    expect(r.code, show(r)).toBe(1);
+    const dump = dumpFor(s, sha);
+    const before = dumpFiles(s);
+
+    // Same sha again: the schema already has 002, so no dump (it would capture the migrated schema).
+    s.clearCalls();
+    r = s.run("deploy.sh", [], { ...failing, FAKE_DUMP_CONTENT: "PGDMP-after" });
+    expect(r.code, show(r)).toBe(1);
+    expect(s.calls()).not.toContain("pg_dump");
+    expect(readFileSync(s.app(`state/pre-deploy/${dump}`), "utf8")).toBe("PGDMP-before");
+    expect(dumpFiles(s)).toEqual(before);
+
+    // Three retries with new shas and no new migrations: still no dump, the original stays.
+    for (const n of [1, 2, 3]) {
+      s.commit("README.md", `retry ${n}\n`);
+      expect(s.run("deploy.sh", [], { ...failing, FAKE_DUMP_CONTENT: "PGDMP-after" }).code).toBe(1);
+    }
+    expect(readFileSync(s.app(`state/pre-deploy/${dump}`), "utf8")).toBe("PGDMP-before");
+
+    // Pruning never removes the dump taken before an applied migration, nor this run's dump.
+    for (const i of [1, 2, 3]) writeFileSync(s.app(`state/pre-deploy/29990101T00000${i}Z-later${i}.dump`), "PGDMP");
+    s.commit("server/migrations/003_again.sql", "alter table t add z int;\n");
+    r = s.run("deploy.sh", [], { FAKE_MIGRATE_OUT: "migrated: 003_again.sql" });
+    expect(r.code, show(r)).toBe(0);
+    expect(dumpFiles(s)).toContain(dump);
+    expect(dumpFiles(s)).toContain(dumpFor(s, s.sha()));
+  }, 30_000);
+
+  test(":prev is the last release that passed the gate, not whatever is running", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    const good = s.sha();
+    // A failed rollback left a never-gated image running.
+    writeFileSync(join(s.state, "running"), "cerebro-server:bad9999\n");
+    writeFileSync(join(s.state, "images"), readFileSync(join(s.state, "images"), "utf8") + "cerebro-server:bad9999\n");
+    s.commit("README.md", "next\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh");
+    expect(r.code, show(r)).toBe(0);
+    expect(s.calls()).toContain(`docker tag cerebro-server:${good} cerebro-server:prev`);
+    expect(s.calls()).not.toContain("docker tag cerebro-server:bad9999");
+  });
+
+  test("an ssh failure while locking is reported as unreachable, with no second connection", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"], { FAKE_SSH_RC: "255" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("cannot reach zima");
+    expect(r.err).not.toContain("another deploy");
+    expect(s.calls().split("\n").filter((l) => l.startsWith("ssh ")).length).toBe(1);
+  });
+
+  test("the lock is only released while it is still this run's", () => {
+    const s = sandbox();
+    const r = s.run("deploy.sh", ["--first-run"], { FAKE_STEAL_LOCK: "1" });
+    expect(r.code, show(r)).toBe(0);
+    expect(s.locked()).toBe(true);
+    expect(readFileSync(s.app("state/deploy.lock/owner"), "utf8")).toContain("thief");
+  });
+
+  test("an interrupt during migrate says the schema may be partly migrated and names the dump", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    s.commit("server/migrations/002_more.sql", "alter table t add y int;\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh", [], { FAKE_TERM_PATTERN: s.script("deploy.sh"), FAKE_TERM_AT: "migrate" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("partly migrated");
+    expect(r.err).toContain(`/DATA/AppData/cerebro/state/pre-deploy/${dumpFor(s, s.sha())}`);
+    expect(r.err).not.toContain("the running server is unchanged");
+    expect(s.calls()).not.toContain("compose-up-server");
+    expect(s.locked()).toBe(false);
+  });
+
+  test("a rollback is not cut short by further interrupts", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    s.commit("README.md", "interrupted twice\n");
+    const r = s.run("deploy.sh", [], { FAKE_TERM_PATTERN: s.script("deploy.sh"), FAKE_TERM_REPEAT: "1" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("rolled back to cerebro-server:prev (healthy)");
+    expect(s.running()).toBe("cerebro-server:prev");
+    expect(s.locked()).toBe(false);
   });
 
   test("a failed migration starts no server and leaves :prev alone", () => {

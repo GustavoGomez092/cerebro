@@ -4,8 +4,8 @@
 # clean tree + `bun test` → server-side deploy lock → first run: secrets (root 700/600, generated on the
 # server, never printed) and data dirs → rsync the repo to /DATA/AppData/cerebro/src → build
 # cerebro-server:<sha7> → bge-m3 present with the digest pinned in deploy/.env → db + ollama up → pre-deploy
-# dump when the migration list changed → migrate in a one-off container → keep the running image as :prev →
-# start the new server → health gate (/health ok + db within 60 s); a failed start, failed gate or an
+# dump when the migration list differs from the schema's → migrate in a one-off container → tag the last
+# release that passed the gate as :prev → start the new server → health gate (/health ok + db within 60 s); a failed start, failed gate or an
 # interrupt rolls back to :prev and exits 1 → check token, ZimaOS registration, old image cleanup.
 #
 # Rollback runs :prev on the schema the new release migrated, so migrations must stay backward-compatible
@@ -42,7 +42,9 @@ SHA=$(git rev-parse --short=7 HEAD)
 IMAGE=cerebro-server:$SHA
 NEXT=$APP/docker-compose.next.yml # the release being deployed; becomes $COMPOSE once healthy
 LOCK=$STATE/deploy.lock
+OWNER="$SHA from $(hostname -s 2>/dev/null || hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MIGRATIONS=$(git ls-files -- server/migrations | sed 's|.*/||' | sort)
+DUMPS=$STATE/pre-deploy
 DUMP=""     # pre-deploy dump taken by this run
 MIGRATED="" # migrations this release applied
 
@@ -82,7 +84,7 @@ health_gate() {
 
 # Puts :prev back after the new server failed to start, failed the gate or was interrupted; always exits 1.
 rollback() {
-  trap - INT TERM
+  trap '' INT TERM # a half-done rollback is worse than a slow one
   local msg="$IMAGE $1" logs="ssh zima sudo docker logs --tail 50 cerebro-server"
   if [[ -n $MIGRATED ]]; then
     msg="$msg; it applied migrations ($MIGRATED), so :prev runs on the migrated schema; pre-deploy dump: ${DUMP:-none taken} (not restored automatically)"
@@ -97,8 +99,13 @@ rollback() {
   die "$msg; rolled back to cerebro-server:prev, which is NOT healthy either; see: $logs"
 }
 
+# Removes the lock only while its owner line is still this run's (never someone else's lock).
 LOCKED=0
-release_lock() { if ((LOCKED)); then zssh "sudo rm -rf $LOCK" || true; fi; }
+release_lock() {
+  if ((LOCKED)); then
+    zssh "if [ \"\$(sudo cat $LOCK/owner 2>/dev/null)\" = '$OWNER' ]; then sudo rm -rf $LOCK; fi" || true
+  fi
+}
 
 # --- Functions below run on the server as root (via zfn). ---
 
@@ -131,12 +138,15 @@ first_run_setup() {
   chown root:root "$secrets/db.env" "$secrets/server.env"
 }
 
-# Dumps the database (embeddings excluded, like the nightlies) to DIR/SHA.dump, root 600; keeps the newest 3.
+# Dumps the database (embeddings excluded, like the nightlies) to DIR/NAME, root 600, never overwriting one.
+# Keeps the newest 3 by name (<UTC ts>-<sha>.dump), plus this one and the one named in DIR/applied (the
+# newest dump taken before a migration that was applied: the recovery point for the current schema).
 pre_deploy_dump() {
-  local dir=$1 sha=$2 tmp
+  local dir=$1 name=$2 tmp keep old
   umask 077
   mkdir -p "$dir"
   chmod 700 "$dir"
+  [[ ! -e $dir/$name ]] || { echo "pre-deploy dump $dir/$name already exists" >&2; return 1; }
   tmp=$(mktemp "$dir/.partial.XXXXXX")
   if ! docker exec cerebro-db pg_dump -U cerebro -d cerebro -Fc --exclude-table-data=chunk_embeddings \
     --exclude-table-data=summary_embeddings --exclude-table-data=embed_queue >"$tmp"; then
@@ -144,9 +154,11 @@ pre_deploy_dump() {
     return 1
   fi
   chmod 600 "$tmp"
-  mv -f "$tmp" "$dir/$sha.dump"
-  # shellcheck disable=SC2012 # plain file names written by this function
-  ls -1t "$dir"/*.dump | tail -n +4 | while read -r old; do rm -f "$old"; done
+  mv "$tmp" "$dir/$name"
+  keep=$(cat "$dir/applied" 2>/dev/null || true)
+  for old in $(find "$dir" -maxdepth 1 -name '*.dump' | sort -r | tail -n +4); do
+    case ${old##*/} in "$name" | "$keep") ;; *) rm -f "$old" ;; esac
+  done
 }
 
 # Creates the `check` machine token for check.sh in FILE (root 600). The token is never printed.
@@ -164,16 +176,22 @@ create_check_token() {
 # --- Deploy ---
 
 say "deploying $IMAGE to $ZIMA_HOST"
-# One deploy at a time (the owner has several Macs): an atomic mkdir on the server, before any change.
-if ! zssh "sudo mkdir -p $STATE && sudo mkdir $LOCK 2>/dev/null"; then
-  held=$(zssh "sudo cat $LOCK/owner 2>/dev/null" || true)
-  die "another deploy holds $LOCK (${held:-owner unknown}); if it is stale: ssh zima sudo rm -rf $LOCK"
-fi
+# One deploy at a time (the owner has several Macs): an atomic mkdir on the server, before any change, in one
+# connection that also reports a held lock's owner (exit 3). ssh's own failures (255: ban, unreachable) are
+# told apart, and nothing retries: another connection while banned only extends the ban.
+rc=0
+held=$(zssh "sudo mkdir -p $STATE || exit 4
+if sudo mkdir $LOCK 2>/dev/null; then printf '%s\n' '$OWNER' | sudo tee $LOCK/owner >/dev/null; exit 0; fi
+sudo cat $LOCK/owner 2>/dev/null; exit 3") || rc=$?
+case $rc in
+  0) ;;
+  3) die "another deploy holds $LOCK (${held:-owner unknown}); if it is stale: ssh zima sudo rm -rf $LOCK" ;;
+  255) die "cannot reach zima (ssh ban? wait ~90 s before one more try; retrying sooner extends the ban)" ;;
+  *) die "could not take the deploy lock (exit $rc)" ;;
+esac
 LOCKED=1
 trap release_lock EXIT
 trap 'die "interrupted; the running server is unchanged"' INT TERM
-printf '%s from %s at %s\n' "$SHA" "$(hostname -s 2>/dev/null || hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
-  zssh "sudo tee $LOCK/owner >/dev/null"
 
 if ((FIRST_RUN)); then
   zfn first_run_setup "$SECRETS" "$DATA"
@@ -203,25 +221,39 @@ digest=$(zssh "sudo sha256sum $BGE_MANIFEST" | cut -d' ' -f1) || die "bge-m3 is 
 render_compose "$SHA" | zssh "sudo tee $NEXT >/dev/null"
 zssh "sudo docker compose -f $NEXT up -d --wait db ollama"
 
-# A recovery point before the schema changes: rollback brings back the old code, not the old schema.
-recorded=$(zssh "sudo cat $STATE/migrations 2>/dev/null" || true)
-if [[ $MIGRATIONS != "$recorded" ]]; then
-  DUMP=$STATE/pre-deploy/$SHA.dump
-  say "the migration list changed; taking a pre-deploy dump"
-  zfn pre_deploy_dump "$STATE/pre-deploy" "$SHA" || die "pre-deploy dump failed; not migrating (the running server is unchanged)"
+# A recovery point before the schema changes (rollback brings back the old code, not the old schema). The
+# comparison is with the list the schema was last migrated to, so a retry after a rolled-back migration
+# doesn't take a post-migration "recovery point" or push the real one out.
+schema=$(zssh "sudo cat $STATE/schema-migrations 2>/dev/null" || true)
+if [[ $MIGRATIONS != "$schema" ]]; then
+  name="$(date -u +%Y%m%dT%H%M%SZ)-$SHA.dump"
+  DUMP=$DUMPS/$name
+  say "the schema is behind this release's migrations; taking a pre-deploy dump"
+  zfn pre_deploy_dump "$DUMPS" "$name" || die "pre-deploy dump failed; not migrating (the running server is unchanged)"
 fi
 say "migrating"
+trap 'die "interrupted during migration; the old server is still running but the schema may be partly migrated${DUMP:+; pre-deploy dump: $DUMP}"' INT TERM
 mig_out=$(zssh "sudo docker compose -f $NEXT run --rm --no-deps server bun server/src/cli.ts migrate") || {
   printf '%s\n' "$mig_out"
-  die "migration failed; the running server is unchanged${DUMP:+ (pre-deploy dump: $DUMP)}"
+  die "migration failed; the old server is still running, the schema may be partly migrated${DUMP:+; pre-deploy dump: $DUMP}"
 }
+trap 'die "interrupted; the schema is migrated but the running server is unchanged"' INT TERM
 printf '%s\n' "$mig_out"
 MIGRATED=$(sed -n 's/^migrated: //p' <<<"$mig_out")
+printf '%s\n' "$MIGRATIONS" | zssh "sudo tee $STATE/schema-migrations >/dev/null"
+if [[ -n $MIGRATED && -n $DUMP ]]; then
+  printf '%s\n' "${DUMP##*/}" | zssh "sudo tee $DUMPS/applied >/dev/null"
+fi
 
-running=$(zssh "sudo docker inspect -f '{{.Config.Image}}' cerebro-server 2>/dev/null" || true)
-if [[ -n $running && $running != "$IMAGE" ]]; then
-  zssh "sudo docker tag $running cerebro-server:prev"
-  say "kept $running as cerebro-server:prev"
+# :prev = the last release that passed the gate (not whatever runs: a failed rollback may have left a
+# never-gated image up).
+last_good=$(zssh "sudo cat $STATE/deployed 2>/dev/null" | cut -d' ' -f1 || true)
+if [[ -n $last_good && $last_good != "$SHA" ]]; then
+  if zssh "sudo docker tag cerebro-server:$last_good cerebro-server:prev"; then
+    say "kept cerebro-server:$last_good (the last release that passed the gate) as cerebro-server:prev"
+  else
+    say "warning: cerebro-server:$last_good is gone; cerebro-server:prev stays as it was"
+  fi
 fi
 
 say "starting $IMAGE"
@@ -232,7 +264,6 @@ trap 'die "interrupted after $IMAGE went live; re-run the deploy to finish regis
 
 zssh "sudo mv $NEXT $COMPOSE"
 printf '%s\n' "$instance" | zssh "sudo tee $STATE/instance-id >/dev/null"
-printf '%s\n' "$MIGRATIONS" | zssh "sudo tee $STATE/migrations >/dev/null"
 printf '%s %s\n' "$SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | zssh "sudo tee $STATE/deployed >/dev/null"
 
 if ! zssh "sudo test -s $SECRETS/check.token"; then

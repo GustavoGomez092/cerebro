@@ -120,9 +120,13 @@ the failing checks.
   no deployed code reads them.
 - A rollback runs `:prev` with the new release's compose definition (only the image tag
   changes). A compose change that the old image can't run with needs a manual rollback.
-- When the migration list changed since the last successful deploy, the deploy first saves
+- When the release has migrations the schema hasn't seen (compared with
+  `state/schema-migrations`, written after every successful migrate), the deploy first saves
   `pg_dump -Fc` (embeddings excluded, like the nightlies) to
-  `/DATA/AppData/cerebro/state/pre-deploy/<sha>.dump` (root 600, newest 3 kept). A rollback
-  message names the applied migrations and that dump. It is never restored automatically.
+  `/DATA/AppData/cerebro/state/pre-deploy/<UTC ts>-<sha>.dump` (root 600, never overwritten).
+  Only the newest 3 are kept, but the dump taken before the last applied migration is always
+  kept, so retries after a rollback never replace the recovery point. Rollback and interrupt
+  messages name the migrations and that dump. It is never restored automatically.
+- `:prev` is always the last release that passed the health gate (`state/deployed`).
 - One deploy at a time: the server-side lock `/DATA/AppData/cerebro/state/deploy.lock` names its
   owner. Remove it only when that deploy is certainly dead.

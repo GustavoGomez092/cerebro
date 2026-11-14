@@ -14,4 +14,6 @@ cmd="$*"
 cmd=${cmd//\/var\/lib\/casaos\//$FAKE_ROOT/var/lib/casaos/}
 cmd=${cmd//\/DATA\//$FAKE_ROOT/DATA/}
 printf 'ssh [%s] %s %s\n' "${opts[*]}" "$host" "$cmd" >> "$FAKE_LOG"
+# FAKE_SSH_RC: the connection itself fails, like sshd's ban ("Not allowed at this time", exit 255).
+if [[ -n ${FAKE_SSH_RC-} ]]; then echo "Not allowed at this time" >&2; exit "$FAKE_SSH_RC"; fi
 exec bash -c "$cmd"
