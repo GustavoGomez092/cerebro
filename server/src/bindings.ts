@@ -1,6 +1,7 @@
 import type { SQL } from "bun";
 import { normalizeIdentity, pathIdentityMachine, type Binding } from "@cerebro/shared";
 import type { Machine } from "./auth";
+import { markScopesDirty, scopeKey } from "./summarise/state";
 
 export type BindingErrorCode = "invalid" | "conflict" | "not_found" | "forbidden" | "rebind_required";
 
@@ -29,6 +30,35 @@ async function record(sql: SQL, bindingId: string, machine: Machine | undefined,
   await sql`
     insert into binding_history (binding_id, machine_id, action, before, after)
     values (${bindingId}, ${machine?.id ?? null}, ${action}, ${JSON.stringify(before)}::text::jsonb, ${JSON.stringify(after)}::text::jsonb)`;
+}
+
+/**
+ * Re-binding moves history: puts summaries in their binding's current scope (a declined binding has
+ * none) and flags the project state of every scope they left or joined for a rebuild. `which` picks
+ * the summaries: all of a binding's, or those of sessions that moved to `to`.
+ */
+async function rescopeSummaries(
+  tx: SQL, to: Binding, which: { bindingId: string } | { sessionIds: string[] },
+): Promise<void> {
+  const moved: { client_id: string | null; project_id: string | null }[] = "bindingId" in which
+    ? await tx`
+        with old as (select id, client_id, project_id from summaries where binding_id = ${which.bindingId} for update)
+        update summaries s set client_id = ${to.clientId}, project_id = ${to.projectId}
+        from old where s.id = old.id
+        returning old.client_id, old.project_id`
+    : which.sessionIds.length
+      ? await tx`
+          with old as (
+            select id, client_id, project_id from summaries
+            where session_id = any(${tx.array(which.sessionIds, "text")}) for update)
+          update summaries s set binding_id = ${to.id}, client_id = ${to.clientId}, project_id = ${to.projectId}
+          from old where s.id = old.id
+          returning old.client_id, old.project_id`
+      : [];
+  const target = to.status === "active" && to.clientId ? scopeKey(to.clientId, to.projectId) : null;
+  const left = moved.map((m) => (m.client_id ? scopeKey(m.client_id, m.project_id) : null));
+  if (!left.some((k) => k !== target)) return;
+  await markScopesDirty(tx, [...left, target].filter((k): k is string => k !== null));
 }
 
 export interface BindingInput {
@@ -74,6 +104,7 @@ export async function upsertBinding(
         `update bindings set status = $2, client_id = $3, project_id = $4, updated_at = now() where id = $1 returning ${COLS}`,
         [existing.id, input.status, clientId, projectId]);
       await record(tx, row.id, opts.machine, "rebind", view(existing), view(row));
+      await rescopeSummaries(tx, row, { bindingId: row.id });
       return row;
     }
     const [row] = await tx.unsafe(
@@ -137,7 +168,10 @@ export async function adoptSessions(sql: SQL, bindingId: string, machine?: Machi
         and s.repo = ${b.repo}
         and (${b.subpath} = '' or s.subpath = ${b.subpath} or starts_with(s.subpath, ${b.subpath} || '/'))
       returning s.id, cur.id as from_binding`;
-    if (moved.length) await record(tx, b.id, machine, "adopt", null, { sessions: moved.map((m: any) => ({ id: m.id, from: m.from_binding })) });
+    if (moved.length) {
+      await record(tx, b.id, machine, "adopt", null, { sessions: moved.map((m: any) => ({ id: m.id, from: m.from_binding })) });
+      await rescopeSummaries(tx, b, { sessionIds: moved.map((m: any) => m.id) });
+    }
     return moved.length;
   });
 }
@@ -152,6 +186,7 @@ export async function moveSession(sql: SQL, sessionId: string, bindingId: string
     if (!s) return false;
     await tx`update sessions set binding_id = ${bindingId} where id = ${sessionId}`;
     await record(tx, bindingId, machine, "session_move", { sessionId, bindingId: s.binding_id }, { sessionId, bindingId });
+    await rescopeSummaries(tx, target, { sessionIds: [sessionId] });
     return true;
   });
 }

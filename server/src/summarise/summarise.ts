@@ -196,9 +196,12 @@ export async function summariseJob(
     let stored: { id: unknown; scope: string } | "inactive" | null;
     try {
       stored = await sql.begin(async (tx) => {
+        // Share-locked so a concurrent re-bind, adopt or session move (which re-scopes summaries) waits
+        // for this insert, or this insert waits for it and reads the new scope.
         const [b] = await tx`
           select b.id, b.client_id, b.project_id from sessions s join bindings b on b.id = s.binding_id
-          where s.id = ${sessionId} and b.status = 'active'`;
+          where s.id = ${sessionId} and b.status = 'active'
+          for share`;
         if (!b) return "inactive" as const;
         const [row] = await tx`
           insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq,
