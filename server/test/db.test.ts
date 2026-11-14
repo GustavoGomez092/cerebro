@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { readdirSync } from "node:fs";
 import { freshDb } from "./helpers";
 import { migrate, checkEmbedSettings } from "../src/db";
 import { loadConfig } from "../src/config";
@@ -24,7 +25,8 @@ test("concurrent migrations both succeed", async () => {
     const { connect } = await import("../src/db");
     const a = connect(url), b = connect(url);
     const [ra, rb] = await Promise.all([migrate(a), migrate(b)]);
-    expect([...ra, ...rb].sort()).toEqual(["001_init.sql"]);
+    const all = readdirSync(new URL("../migrations", import.meta.url).pathname).filter((f) => f.endsWith(".sql")).sort();
+    expect([...ra, ...rb].sort()).toEqual(all);
     await a.close(); await b.close();
   } finally { await drop(); }
 });
@@ -57,6 +59,7 @@ test("embedding model and dims are pinned on first start", async () => {
 test("loadConfig applies defaults and validates", () => {
   expect(loadConfig({ DATABASE_URL: "postgres://x" })).toEqual({
     databaseUrl: "postgres://x", port: 8790, embedUrl: null, embedModel: "bge-m3", embedDims: 1024,
+    summariser: { enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" },
   });
   expect(() => loadConfig({})).toThrow(/DATABASE_URL/);
   expect(() => loadConfig({ DATABASE_URL: "x", PORT: "" })).not.toThrow();

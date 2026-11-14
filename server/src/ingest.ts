@@ -8,6 +8,7 @@ import { normalizeSubpath, BindingError } from "./bindings";
 import type { ChunkInput } from "./chunker";
 import { storeChunks } from "./chunk-store";
 import type { Machine } from "./auth";
+import { enqueueSummary } from "./summarise/jobs";
 
 const MIN_YEAR = 1970, MAX_YEAR = 2200;
 const iso = z.string().datetime({ offset: true }).refine((s) => {
@@ -161,6 +162,9 @@ export async function ingestBatch(
     }
     for (const [sessionId, list] of bySession) await storeChunks(tx, sessionId, list, existing.get(sessionId) ? 1 : 0);
 
+    // Imported history is summarised at low priority as soon as its events arrive.
+    for (const id of bySession.keys()) if (existing.get(id)) await enqueueSummary(tx, id, { priority: 1 });
+
     // Session bookkeeping: last activity only moves forward; later activity reopens an ended session.
     if (bySession.size) {
       const marks = [...bySession].map(([id, list]) => ({ id, max_ts: list.reduce((m, e) => (e.ts > m ? e.ts : m), list[0].ts) }));
@@ -182,6 +186,10 @@ export async function ingestBatch(
 }
 
 export async function endSession(sql: SQL, sessionId: string, endedAt: string): Promise<boolean> {
-  const rows = await sql`update sessions set ended_at = ${endedAt} where id = ${sessionId} returning id`;
-  return rows.length > 0;
+  return sql.begin(async (tx) => {
+    const rows = await tx`update sessions set ended_at = ${endedAt} where id = ${sessionId} returning id, imported`;
+    if (!rows.length) return false;
+    await enqueueSummary(tx, sessionId, { priority: rows[0].imported ? 1 : 0 });
+    return true;
+  });
 }
