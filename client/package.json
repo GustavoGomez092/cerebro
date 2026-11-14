@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@cerebro/shared": "workspace:*"
+    "@cerebro/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.6.7"
   }
 }

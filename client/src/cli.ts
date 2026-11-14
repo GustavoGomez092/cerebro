@@ -3,6 +3,7 @@ import { loadClientConfig } from "./config";
 import { flush, type FlushOptions } from "./flush";
 import { handleHook, HOOK_EVENTS, type HookEvent } from "./hooks";
 import { logError } from "./log";
+import { startMcpServer } from "./mcp";
 import { Store } from "./store";
 
 /** One CLI subcommand. Later commands are added as new entries in `COMMANDS`. */
@@ -74,9 +75,21 @@ const flushCommand: Command = {
   },
 };
 
+const mcp: Command = {
+  usage: "mcp   (stdio MCP server: recall and setup tools)",
+  async run() {
+    try {
+      await startMcpServer();
+    } catch (e) {
+      logError("mcp", e);
+    }
+  },
+};
+
 export const COMMANDS: Record<string, Command> = {
   hook,
   flush: flushCommand,
+  mcp,
 };
 
 export function usage(): string {
