@@ -1,6 +1,8 @@
 #!/bin/bash
 # Fake curl. Server /health is healthy for every tag unless FAKE_HEALTHY_TAGS lists the healthy ones;
 # FAKE_HEALTH_LOCAL / FAKE_HEALTH_LAN override the bodies; /v1/status needs the bearer header on stdin (-H @-).
+# FAKE_TERM_PATTERN: the first health poll of a non-prev release sends SIGTERM to the processes matching it
+# (the deploy script), like an owner pressing Ctrl-C during the gate.
 echo "curl $*" >> "$FAKE_LOG"
 url=${*: -1}; hdr=
 for a in "$@"; do [[ $a == @- ]] && hdr=$(cat); done
@@ -9,7 +11,15 @@ case $url in
   */health)
     if [[ -n ${FAKE_HEALTH_LOCAL-} ]]; then printf '%s' "$FAKE_HEALTH_LOCAL"; exit 0; fi
     run=$(cat "$FAKE_STATE/running" 2>/dev/null); tag=${run#*:}
-    if [[ -z ${FAKE_HEALTHY_TAGS+x} || " $FAKE_HEALTHY_TAGS " == *" $tag "* ]]; then
+    if [[ -n ${FAKE_TERM_PATTERN-} && $tag != prev && ! -e $FAKE_STATE/termed ]]; then
+      : > "$FAKE_STATE/termed"
+      # Not pkill: on macOS it skips its own ancestors, which is exactly the deploy script.
+      ps -A -o pid=,command= | while read -r pid cmd; do
+        [[ $cmd == *"$FAKE_TERM_PATTERN"* ]] && kill -TERM "$pid" 2>/dev/null
+      done
+      exit 7
+    fi
+    if [[ -n $run && ( -z ${FAKE_HEALTHY_TAGS+x} || " $FAKE_HEALTHY_TAGS " == *" $tag "* ) ]]; then
       printf '{"ok":true,"db":true,"apiVersion":1,"instanceId":"%s"}' "${FAKE_INSTANCE:-inst-1}"
     else exit 7; fi ;;
   */v1/status) [[ $hdr == "Authorization: Bearer ${FAKE_TOKEN-}" ]] || exit 22; printf '%s' "$FAKE_STATUS" ;;

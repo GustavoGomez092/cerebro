@@ -5,7 +5,16 @@ st=$FAKE_STATE
 case $1 in
   inspect) [[ -s $st/running ]] || { echo "Error: No such object" >&2; exit 1; }; cat "$st/running"; exit 0 ;;
   image) grep -qxF -- "${*: -1}" "$st/images" 2>/dev/null; exit ;;
-  build) while (($#)); do [[ $1 == -t ]] && echo "$2" >> "$st/images"; shift; done; exit "${FAKE_BUILD_RC:-0}" ;;
+  images) [[ -f $st/images ]] && sort -u "$st/images"; exit 0 ;;
+  rmi)
+    shift
+    for t in "$@"; do grep -vxF -- "$t" "$st/images" > "$st/images.tmp"; mv "$st/images.tmp" "$st/images"; done
+    exit 0 ;;
+  builder) exit 0 ;;
+  build)
+    rc=${FAKE_BUILD_RC:-0}
+    while (($#)); do [[ $1 == -t && $rc == 0 ]] && echo "$2" >> "$st/images"; shift; done
+    exit "$rc" ;;
   tag) echo "$3" >> "$st/images"; exit 0 ;;
   compose)
     shift; file=; sub=
@@ -18,10 +27,15 @@ case $1 in
     done
     case $sub in
       up) if [[ " $* " == *" server "* ]]; then
-            img=$(sed -n 's/^ *image: *\(cerebro-server:.*\)$/\1/p' "$file"); echo "$img" > "$st/running"
+            img=$(sed -n 's/^ *image: *\(cerebro-server:.*\)$/\1/p' "$file")
             echo "compose-up-server $img" >> "$FAKE_LOG"
+            if [[ $img == cerebro-server:prev ]]; then rc=${FAKE_UP_PREV_RC:-0}; else rc=${FAKE_UP_RC:-0}; fi
+            # A failed recreate has already removed the old container.
+            if [[ $rc == 0 ]]; then echo "$img" > "$st/running"; else : > "$st/running"; exit "$rc"; fi
           fi ;;
-      run) [[ "$*" == *migrate* ]] && exit "${FAKE_MIGRATE_RC:-0}" ;;
+      run) if [[ "$*" == *migrate* ]]; then
+             printf '%s\n' "${FAKE_MIGRATE_OUT:-migrations up to date}"; exit "${FAKE_MIGRATE_RC:-0}"
+           fi ;;
     esac
     exit 0 ;;
   run)
@@ -31,7 +45,14 @@ case $1 in
       m=$v/models/manifests/registry.ollama.ai/library/bge-m3; mkdir -p "$m"; printf '%s' "$FAKE_MANIFEST" > "$m/latest"
     fi
     exit 0 ;;
-  exec) printf '%s\n' "${FAKE_OLLAMA_LIST-}"; exit 0 ;;
+  exec)
+    case "$*" in
+      *pg_dump*) printf 'PGDMP-fake'; exit "${FAKE_DUMP_RC:-0}" ;;
+      *"token create check"*)
+        printf 'Token for check (shown once, store it on that machine):\n%s\nDo not create tokens inside a recorded Claude Code session.\n' "$FAKE_CHECK_TOKEN"
+        exit 0 ;;
+      *) printf '%s\n' "${FAKE_OLLAMA_LIST-}"; exit 0 ;;
+    esac ;;
   stats) printf '%s\n' "${FAKE_STATS-}"; exit 0 ;;
 esac
 exit 0
