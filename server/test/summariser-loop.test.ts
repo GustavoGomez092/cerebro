@@ -8,7 +8,7 @@ import { EmbedderError, type Embedder } from "../src/embed/embedder";
 import { runClaude, type ClaudeInput } from "../src/summarise/claude";
 import { record } from "../src/summarise/budget";
 import { markScopesDirty, scopeKey } from "../src/summarise/state";
-import { newSummariserState, startSummariser, type SummariserConfig } from "../src/summarise/loop";
+import { newSummariserState, startSummariser, type SummariserConfig, type SummariserDeps } from "../src/summarise/loop";
 
 const FAKE = "bun server/test/fakes/fake-claude.ts";
 const CFG: SummariserConfig = { enabled: true, share: 0.2, windowTokens: 2_000_000, cmd: FAKE };
@@ -26,6 +26,25 @@ function fakeCli(mode = "ok", extra: Record<string, string> = {}) {
   };
   return cli;
 }
+
+/**
+ * Starts a loop and lets its first tick's start-up probe (M9) answer, so the test sees only the calls its own work
+ * makes: the probe's call and its charge are cleared. Call it before creating any work.
+ */
+async function startVerified(t: any, cli: ReturnType<typeof fakeCli>, deps: Omit<SummariserDeps, "run">) {
+  const mode = cli.mode;
+  cli.mode = "ok";
+  const loop = startSummariser(t.sql, t.embedder, CFG, { ...deps, run: cli.run });
+  await loop.tick();
+  expect(cli.calls).toHaveLength(1);
+  cli.mode = mode;
+  cli.calls.length = 0;
+  await t.sql`delete from usage_ledger`;
+  return loop;
+}
+
+/** Whether a call is the CLI health probe (not a summary or state call). */
+const isProbe = (input: ClaudeInput) => "ok" in ((input.schema as any).properties ?? {});
 
 /** An injectable clock starting at the real time. */
 function clock() {
@@ -135,11 +154,61 @@ test("usage limit pauses the loop and live work resumes first after reset", asyn
   }
 });
 
+test("M9: a server that was never logged in reports the login pause on its first tick, before any job", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli("auth");
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  try {
+    // No work at all: the first tick still asks the CLI one tiny question.
+    await loop.tick();
+    expect(cli.calls).toHaveLength(1);
+    expect(cli.calls[0].prompt.length).toBeLessThan(100);
+    const s = await status(t);
+    expect(s.paused).toEqual({ reason: "login", until: null });
+    expect(s.lastError).toBe("probe: login");
+    expect(s.lastRunAt).toBeNull();
+    expect(await t.sql`select * from usage_ledger`).toHaveLength(0);
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
+test("M9: the first tick verifies a working CLI once (charged), and a CLI that is down pauses as an outage", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli("ok");
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  try {
+    await loop.tick();
+    expect(cli.calls).toHaveLength(1);
+    expect(state.paused).toBeNull();
+    expect(typeof state.lastRunAt).toBe("string");
+    expect(state.credentialExpiresAt).toBe("2030-01-01T00:00:00.000Z");
+    expect(await t.sql`select tokens, kind from usage_ledger`).toEqual([{ tokens: 22, kind: "summary" }]);
+    await loop.tick();
+    expect(cli.calls).toHaveLength(1); // verified: no probe on later ticks
+  } finally {
+    await loop.stop();
+  }
+  const down = fakeCli("connection");
+  const state2 = newSummariserState(true);
+  const loop2 = startSummariser(t.sql, t.embedder, CFG, { run: down.run, state: state2, manual: true, log: quiet });
+  try {
+    await loop2.tick();
+    expect(down.calls).toHaveLength(1);
+    expect(state2.paused?.reason).toBe("unavailable");
+    expect(state2.lastError).toBe("probe: unavailable");
+  } finally {
+    await loop2.stop();
+    await t.drop();
+  }
+});
+
 test("expired login is reported in status and recovers when the probe succeeds", async () => {
   const { t, state } = await setup();
   const c = clock();
   const cli = fakeCli("auth");
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, now: c.now, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, now: c.now, manual: true, log: quiet });
   try {
     const { binding } = await boundFolder(t, { project: "Web" });
     await endedSession(t, binding.id, "s1", "osprey");
@@ -219,7 +288,7 @@ test("an outage pauses the loop as unavailable without dead-lettering, and it re
   const { t, state } = await setup();
   const c = clock();
   const cli = fakeCli("connection");
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, now: c.now, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, now: c.now, manual: true, log: quiet });
   try {
     const { binding } = await boundFolder(t, { project: "Web" });
     await endedSession(t, binding.id, "s1", "osprey");
@@ -347,7 +416,7 @@ async function dirtyScope(t: any, binding: any, title: string) {
 test("dirty scopes are rebuilt two per tick, keeping a quarter of the budget for live work", async () => {
   const { t, state } = await setup();
   const cli = fakeCli();
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, manual: true, log: quiet });
   try {
     const scopes: string[] = [];
     for (const name of ["One", "Two", "Three"]) {
@@ -385,7 +454,7 @@ test("dirty scopes are rebuilt two per tick, keeping a quarter of the budget for
 test("a scope invalidated by a re-bind is rebuilt before imported jobs, after live ones", async () => {
   const { t, state } = await setup();
   const cli = fakeCli();
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, manual: true, log: quiet });
   try {
     const { binding: imp } = await boundFolder(t, { client: "Importer", project: "Big", repo: "github.com/acme/big" });
     for (let i = 1; i <= 12; i++) await endedSession(t, imp.id, `imp${i}`, `import${i}`, { imported: true });
@@ -419,7 +488,7 @@ test("a scope invalidated by a re-bind is rebuilt before imported jobs, after li
 test("N2: imports stop at three quarters of the share, so dirty rebuilds and live work are never starved by them", async () => {
   const { t, state } = await setup();
   const cli = fakeCli();
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, manual: true, log: quiet });
   try {
     const { binding: imp } = await boundFolder(t, { client: "Importer", project: "Big", repo: "github.com/acme/big" });
     for (let i = 1; i <= 6; i++) await endedSession(t, imp.id, `imp${i}`, `import${i}`, { imported: true });
@@ -485,7 +554,7 @@ test("a scope whose update fails is not retried every tick", async () => {
   const { t, state } = await setup();
   const c = clock();
   const cli = fakeCli("notjson");
-  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, now: c.now, manual: true, log: quiet });
+  const loop = await startVerified(t, cli, { state, now: c.now, manual: true, log: quiet });
   try {
     const { binding } = await boundFolder(t, { project: "Web" });
     await dirtyScope(t, binding, "One");
@@ -555,6 +624,7 @@ test("stop waits for the job in flight and runs nothing after it", async () => {
   let started!: () => void;
   const inFlight = new Promise<void>((r) => { started = r; });
   const run = async (input: ClaudeInput) => {
+    if (isProbe(input)) return cli.run(input); // the start-up probe (M9) answers at once
     started();
     await gate;
     return cli.run(input);

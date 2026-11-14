@@ -94,6 +94,9 @@ const OUTAGE_MAX_MS = 30 * 60_000;
  * live summaries. Dirty scopes are updated before the first imported job of a tick, so imports never
  * starve them. Single-flight throughout: one Claude call at a time, ever.
  *
+ * The first tick after start probes the CLI with a tiny call before any work, so a missing login or CLI shows
+ * as a pause at once rather than when the first session ends.
+ *
  * Pauses (reported in `state.paused`): over budget until the window frees up; a usage limit until the
  * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds; an outage
  * ("unavailable": CLI missing, network down, API overloaded) until a probe succeeds, probing after 2 min,
@@ -115,6 +118,8 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
   const dirtyBudget = { share: cfg.share * (1 - LIVE_RESERVE), windowTokens: cfg.windowTokens };
 
   let stopped = false;
+  /** Whether the CLI and its login have answered since start; until then the first tick probes (M9). */
+  let verified = false;
   let lastProbeAt = 0;
   let lastSweepAt: number | null = null;
   /** Jobs deferred by a login failure or an outage: due again as soon as a probe succeeds. */
@@ -213,6 +218,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       await record(sql, probe.tokens, "summary");
       noteRun(probe);
     }
+    verified = true;
     outageMs = OUTAGE_MIN_MS;
     resume();
     if (probeDeferred.size) {
@@ -222,6 +228,43 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       probeDeferred.clear();
     }
     return true;
+  };
+
+  /**
+   * The first tick after start asks the CLI one tiny question before any work (M9), so a server that was never
+   * logged in (or whose CLI is missing) reports `paused.reason: "login"` (or `"unavailable"`) at once, not when
+   * the first session ends, maybe hours later. True when work may go on.
+   */
+  const verify = async (): Promise<boolean> => {
+    const b = await budgetState(sql, budget);
+    if (b.resumesAt) {
+      pause("budget", b.resumesAt);
+      return false;
+    }
+    lastProbeAt = clock().getTime();
+    const probe = await run(HEALTH_PROBE);
+    if (stopped) return false;
+    if (probe.ok) {
+      await record(sql, probe.tokens, "summary");
+      noteRun(probe);
+      verified = true;
+      return true;
+    }
+    if (probe.tokens) await record(sql, probe.tokens, "summary");
+    // A timeout means nothing answered: an outage, as for a job's probe.
+    const kind = probe.kind === "timeout" ? "unavailable" : probe.kind;
+    state.lastError = `probe: ${kind === "auth" ? "login" : kind}`;
+    if (kind === "auth") pause("login", null);
+    else if (kind === "unavailable") pauseOutage();
+    else if (kind === "usage_limit") {
+      verified = true; // logged in, just out of quota
+      pause("usage_limit", probe.resetAt ?? new Date(clock().getTime() + RETRY_LATER_MS));
+    } else {
+      // The model answered (bad output) or an unknown failure: jobs will tell more; don't probe on every tick.
+      verified = true;
+      return true;
+    }
+    return false;
   };
 
   /**
@@ -293,6 +336,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     }
     await sweepEmbeddings();
     if (!(await mayRun())) return false;
+    if (!verified && !(await verify())) return false;
     await scheduleGrowingSessions(sql);
     let dirtyDone = false;
     for (let n = 0; !stopped; n++) {

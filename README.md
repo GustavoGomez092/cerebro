@@ -70,7 +70,9 @@ sessions, so a long import never holds back live summaries or a re-bound folder'
   - `login`: the `claude` login on the server has expired or was never made. Nothing is summarised (raw
     capture and search carry on) until you log in again: run `claude auth login` inside the server
     container (as the user the server runs as, so the same `CLAUDE_CONFIG_DIR`). A tiny probe call every
-    15 minutes notices the new login and the loop resumes by itself; `until` is `null`.
+    15 minutes notices the new login and the loop resumes by itself (`docker restart cerebro-server`
+    checks at once); `until` is `null`. The server makes the same probe when it starts, before any job, so a
+    login that was never made shows here right after a deploy (`lastError: "probe: login"`).
   - `unavailable`: an outage, not a problem with any one session: the `claude` CLI is missing or will not
     start, the network is down, or the API answers 5xx/529 "overloaded" or not at all. The loop probes
     again at `until` (after 2 minutes, backing off to every 30 minutes) and resumes when the probe
