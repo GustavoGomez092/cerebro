@@ -144,7 +144,8 @@ describe("deploy.sh", () => {
 
     const compose = readFileSync(s.app("docker-compose.yml"), "utf8");
     expect(compose).toContain(`image: cerebro-server:${s.sha()}`);
-    expect(compose).toContain("/DATA/AppData/cerebro/src/deploy/postgres.conf:/etc/postgresql/postgres.conf:ro");
+    const confHash = new Bun.CryptoHasher("sha256").update(readFileSync(join(s.repo, "deploy/postgres.conf"))).digest("hex");
+    expect(compose).toContain(`/DATA/AppData/cerebro/conf/postgres-${confHash}.conf:/etc/postgresql/postgres.conf:ro`);
     expect(compose).not.toContain("${");
     expect(compose).toContain("env_file: /DATA/AppData/cerebro/secrets/server.env");
     expect(compose).toContain("- /DATA/AppData/cerebro/data/db:/var/lib/postgresql/data");
@@ -524,6 +525,26 @@ describe("deploy.sh", () => {
     expect(s.locked()).toBe(false);
   });
 
+  test("a postgres.conf the db can't start with: the last good compose still mounts the previous conf", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    const good = readFileSync(join(s.repo, "deploy/postgres.conf"), "utf8");
+    s.commit("deploy/postgres.conf", good + "shared_buffers = 64GB\n");
+    const r = s.run("deploy.sh", [], { FAKE_UP_DEPS_RC: "1" });
+    expect(r.code, show(r)).toBe(1);
+    const mount = /- (\S+):\/etc\/postgresql\/postgres\.conf:ro/.exec(readFileSync(s.app("docker-compose.yml"), "utf8"))?.[1] ?? "<none>";
+    expect(mount).toStartWith("/DATA/AppData/cerebro/conf/");
+    expect(readFileSync(join(s.root, mount.slice(1)), "utf8")).toBe(good);
+    expect(mode(join(s.root, mount.slice(1)))).toBe(0o644); // read by postgres (uid 999)
+
+    // Once a release with a new conf is live, copies no compose refers to are removed.
+    s.commit("deploy/postgres.conf", good + "work_mem = 4MB\n");
+    expect(s.run("deploy.sh").code).toBe(0);
+    const confs = readdirSync(s.app("conf"));
+    expect(confs).toHaveLength(1);
+    expect(readFileSync(s.app(`conf/${confs[0]}`), "utf8")).toBe(good + "work_mem = 4MB\n");
+  });
+
   test("db/ollama failing on the first deploy says there is nothing to go back to", () => {
     const s = sandbox();
     const r = s.run("deploy.sh", ["--first-run"], { FAKE_UP_DEPS_RC: "1" });
@@ -542,6 +563,9 @@ describe("deploy.sh", () => {
     expect(r.out + r.err).toContain("ssh zima sudo casaos-cli app-management install -f /DATA/AppData/cerebro/docker-compose.yml");
     expect(r.out).toContain("is live");
     expect(s.calls()).toContain("docker builder prune");
+    // The live compose's postgres.conf copy survives the prune although ZimaOS stored no compose.
+    const mount = /- (\S+):\/etc\/postgresql\/postgres\.conf:ro/.exec(readFileSync(s.app("docker-compose.yml"), "utf8"))?.[1] ?? "<none>";
+    expect(existsSync(join(s.root, mount.slice(1))), mount).toBe(true);
     expect(s.locked()).toBe(false);
   });
 

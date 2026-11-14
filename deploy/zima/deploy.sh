@@ -36,10 +36,14 @@ OLLAMA_IMAGE=$(sed -n 's/^ *image: *\(ollama\/ollama[^ ]*\) *$/\1/p' deploy/comp
 [[ -n $OLLAMA_IMAGE ]] || die "no ollama/ollama image in deploy/compose.yml"
 HEALTH_TIMEOUT=${CEREBRO_HEALTH_TIMEOUT:-60}
 DEPS_TIMEOUT=${CEREBRO_DEPS_TIMEOUT:-300} # db first boot / recovery after a crash, ollama start
-# The db's label: a changed postgres.conf (a single-file bind mount compose can't see) recreates the db.
+# postgres.conf is mounted from a copy named by its sha256 (also the db's label): a changed conf recreates the db
+# (compose can't see a single-file bind mount change), and the last good compose keeps mounting the conf it was
+# started with, so going back to it after a conf the db can't start with works.
 if command -v sha256sum >/dev/null; then CONF_SHA256=$(sha256sum deploy/postgres.conf); else CONF_SHA256=$(shasum -a 256 deploy/postgres.conf); fi
 CONF_SHA256=${CONF_SHA256%% *}
 [[ ${#CONF_SHA256} == 64 ]] || die "could not hash deploy/postgres.conf"
+CONFS=$APP/conf
+CONF=$CONFS/postgres-$CONF_SHA256.conf
 
 [[ -z $(git status --porcelain) ]] || die "working tree is dirty; commit first (the image tag is the commit)"
 bun test || die "bun test failed; not deploying"
@@ -57,7 +61,7 @@ MIGRATED="" # migrations this release applied
 # deploy/compose.yml with its variables resolved and absolute paths, so ZimaOS can run its stored copy as is.
 render_compose() {
   # Patterns live in variables: bash 3.2 (macOS) splits ${c//pat/rep} at a '/' even inside quotes.
-  local c tag=$1 conf=$SRC/deploy/postgres.conf:
+  local c tag=$1 conf=$CONF:
   # shellcheck disable=SC2016 # literal compose variables, not expansions
   local v_data='${CEREBRO_DATA}' v_secrets='${CEREBRO_SECRETS}' v_tag='${CEREBRO_TAG}' v_cpus='${OLLAMA_CPUS:-4}' rel='./postgres.conf:'
   # shellcheck disable=SC2016
@@ -188,6 +192,28 @@ install_ops() {
   chown -R root:root "$dst"
 }
 
+# Copies the synced postgres.conf SRC to DST (world-readable: postgres runs as uid 999); never replaces a copy.
+install_conf() {
+  local src=$1 dst=$2
+  umask 022
+  mkdir -p "${dst%/*}"
+  [[ ! -e $dst ]] || return 0
+  cp "$src" "$dst.new"
+  chmod 644 "$dst.new"
+  mv -f "$dst.new" "$dst"
+}
+
+# Removes the postgres.conf copies in DIR that none of the given compose files mounts.
+prune_confs() {
+  local dir=$1 f
+  shift
+  for f in "$dir"/postgres-*.conf; do
+    [[ -f $f ]] || continue
+    # -s: a missing compose (ZimaOS registration failed) is no reason to drop a conf; -q still succeeds on a match.
+    grep -qsF -- "/${f##*/}:" "$@" || rm -f -- "$f"
+  done
+}
+
 # Creates the `check` machine token for check.sh in FILE (root 600). The token is never printed.
 create_check_token() {
   local out tok
@@ -250,6 +276,7 @@ digest=$(zssh "sudo sha256sum $BGE_MANIFEST" | cut -d' ' -f1) || die "bge-m3 is 
 [[ $digest == "$BGE_M3_DIGEST"* ]] ||
   die "bge-m3 digest ${digest:0:12} does not match BGE_M3_DIGEST ${BGE_M3_DIGEST:0:12} in deploy/.env; the running server is unchanged"
 
+zfn install_conf "$SRC/deploy/postgres.conf" "$CONF" || die "could not install $CONF; the running server is unchanged"
 render_compose "$SHA" | zssh "sudo tee $NEXT >/dev/null"
 # A failed `up` may have stopped or recreated db/ollama from the new definitions: bring them back from the last good
 # compose (the server keeps running against them), then stop before anything else changes.
@@ -346,6 +373,8 @@ else
       "ssh zima sudo casaos-cli app-management install -f $COMPOSE (or re-run the deploy)"
   fi
 fi
+
+zfn prune_confs "$CONFS" "$COMPOSE" "$CASA_COMPOSE" || say "warning: could not prune old postgres.conf copies in $CONFS"
 
 # Old server images: keep this release, :prev and whatever ZimaOS's stored compose references.
 stored_tag=$(zssh "sudo cat $CASA_COMPOSE 2>/dev/null" | sed -n 's/^ *image: *\(cerebro-server:[^ ]*\).*$/\1/p' | head -n 1 || true)

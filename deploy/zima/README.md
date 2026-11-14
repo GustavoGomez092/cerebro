@@ -8,7 +8,7 @@ never retry quickly and never open parallel connections).
 |---|---|
 | Containers | `cerebro-db` (pgvector, 2 GB, 2 CPUs), `cerebro-ollama` (bge-m3, 3 GB, `OLLAMA_CPUS`), `cerebro-server` (1 GB, 2 CPUs), network `cerebro-net` (internal) |
 | URL | `http://cerebro.home.lab` (Caddy) → `127.0.0.1:8790` (the only published port) |
-| App dir | `/DATA/AppData/cerebro`: `src/` (synced repo), `data/{db,ollama,claude}`, `secrets/` (root 700/600), `state/` (deploy records, pre-deploy dumps, lock), `zima/` (root-owned backup scripts + units, installed by every deploy), `docker-compose.yml` (rendered, last good release) |
+| App dir | `/DATA/AppData/cerebro`: `src/` (synced repo), `data/{db,ollama,claude}`, `secrets/` (root 700/600), `state/` (deploy records, pre-deploy dumps, lock), `zima/` (root-owned backup scripts + units, installed by every deploy), `conf/postgres-<sha256>.conf` (the conf each compose mounts), `docker-compose.yml` (rendered, last good release) |
 | Backups | `/DATA/Backup/cerebro/{nightly,weekly}` (USB drive shared with `zima-backup` and `postgres-backup`) |
 
 ## First deploy
@@ -72,8 +72,9 @@ owner; remove it only when that deploy is certainly dead). The deploy:
 
 - refuses a dirty tree, a failed `bun test`, a failed build or a bge-m3 digest mismatch without changing anything;
 - brings db and ollama up from the new definitions (`--wait`, 300 s). A changed `deploy/postgres.conf` changes
-  the db's `cerebro.postgres-conf-sha256` label, so the db is recreated with it (a short db restart). If they
-  don't come up healthy, it restarts them from the last good `docker-compose.yml` and stops before migrating;
+  the db's `cerebro.postgres-conf-sha256` label and its mounted copy `conf/postgres-<sha256>.conf`, so the db
+  is recreated with it (a short db restart). If they don't come up healthy, it restarts them from the last good
+  `docker-compose.yml` (which still mounts the previous conf copy) and stops before migrating;
 - takes a pre-deploy dump when the schema is behind the release's migrations (see "Migrations");
 - starts the new server and switches only after `/health` reports `ok` and `db` within 60 s. A failed start, a
   failed gate or Ctrl-C rolls back to `cerebro-server:prev` (the last release that passed the gate) and exits 1.
