@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Binding } from "@cerebro/shared";
@@ -271,9 +271,34 @@ test("a server that is not the pinned instance never sees the token, and the bri
   const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps(spy)));
   expect(authed).toEqual([]);
   expect(ctx).toContain("Acme / App");
-  expect(ctx).toContain("reset-instance");
+  expect(ctx).toContain("run `~/.cerebro/bin/cerebro reset-instance`");
   expect(e.store.get("blocked")).toBe("instance_mismatch");
   e.store.close();
+});
+
+test("problem lines name the CLI by its stable path, which works without cerebro on PATH", async () => {
+  for (const reason of ["token_revoked", "unauthorized"] as const) {
+    const e = setup();
+    await bind(e.repo);
+    e.store.set("blocked", reason);
+    const ctx = contextOf(await handleHook("SessionStart", e.input(), e.deps()));
+    expect(ctx, reason).toContain("run `~/.cerebro/bin/cerebro status --retry`");
+    expect(ctx, reason).not.toMatch(/(^|[^/])`?cerebro (status|reset-instance|retention|schedule|sync|import)/m);
+    e.store.close();
+  }
+  const binding: Binding = { id: "b", repo: "r", subpath: "", status: "active", clientId: "c", projectId: "p" };
+  const brief = buildBrief(binding, "Acme", [], { pending: 0, quarantined: 2 }, []);
+  expect(brief).toContain("(see `~/.cerebro/bin/cerebro status`)");
+});
+
+test("no message in client/src or plugin/ tells anyone to run a bare `cerebro <command>`", async () => {
+  const root = join(import.meta.dir, "..", "..");
+  const files = [...new Bun.Glob("client/src/**/*.ts").scanSync(root), ...new Bun.Glob("plugin/**/*.{md,json}").scanSync(root)];
+  const bare = /\b(run|see|use|try)\s+\(?`?cerebro\s+(status|retention|schedule|sync|import|reset-instance|flush)\b/i;
+  for (const f of files) {
+    const code = readFileSync(join(root, f), "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*\*)/.test(l));
+    for (const l of code) expect(bare.test(l), `${f}: ${l.trim()}`).toBe(false);
+  }
 });
 
 test("Stop captures then schedules a flush; SessionEnd does no network I/O", async () => {

@@ -255,7 +255,7 @@ const importFileCommand: Command = {
 };
 
 const scheduleCommand: Command = {
-  usage: "schedule [--off]   (run `cerebro sync` every 30 minutes via launchd, or stop doing so)",
+  usage: "schedule [--off]   (sync every 30 minutes via launchd, or stop doing so)",
   async run(args) {
     if (args.includes("--off")) {
       await say(removeSchedule() ? "removed the sync schedule" : "no sync schedule was installed");

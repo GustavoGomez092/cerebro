@@ -51,12 +51,12 @@ export const NOT_CONFIGURED_CONTEXT =
 
 const PROBLEMS: Record<BlockedReason, string> = {
   token_revoked:
-    "uploads are stopped: this Mac's Cerebro token was revoked. Ask the owner for a new token, put it in the plugin's settings, then run `cerebro status --retry`.",
+    "uploads are stopped: this Mac's Cerebro token was revoked. Ask the owner for a new token, put it in the plugin's settings, then run `~/.cerebro/bin/cerebro status --retry`.",
   unauthorized:
-    "uploads are stopped: the server does not accept this Mac's token. Check the token in the plugin's settings, then run `cerebro status --retry`.",
+    "uploads are stopped: the server does not accept this Mac's token. Check the token in the plugin's settings, then run `~/.cerebro/bin/cerebro status --retry`.",
   instance_mismatch:
     "uploads are stopped: the server answering at the configured URL is not the Cerebro instance this Mac was set up with. " +
-    "Check the server URL; if the server was reinstalled, run `cerebro reset-instance`.",
+    "Check the server URL; if the server was reinstalled, run `~/.cerebro/bin/cerebro reset-instance`.",
 };
 
 /**
