@@ -1,0 +1,9 @@
+[Unit]
+Description=Cerebro backup, daily after postgres-backup (03:10) and before zima-backup (03:30)
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
