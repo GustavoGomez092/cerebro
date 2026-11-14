@@ -42,9 +42,8 @@ backed by Postgres.
 
 ## Non-goals
 
-- Recording or serving Hermes, Paperclip, or any non–Claude Code agent. The owner
-  explicitly does not want them integrated. (They may use the API later, but
-  nothing is built for them.)
+- Live integration with Hermes or Paperclip (hooks, tools inside those agents). They
+  can still hand over history through the generic import format (see amendment).
 - Access from outside the house network. Cerebro is LAN-only like the other
   home-lab services; if Tailscale is added later it should work without changes.
 - A web UI. Not requested; the API is the interface. (Builder may add a minimal
@@ -298,3 +297,15 @@ consent) so history isn't lost before it's imported. *(Claude's call.)*
 - Whether subagent transcripts are captured as part of their parent session.
 - How the summariser measures its subscription share (see Summaries).
 - The initial-history prompt and how far back it reads git history.
+
+## Amendment 2026-11-13 — every agent contributes history (owner request)
+
+The owner asked for a per-agent context/history extractor "so all agents can give all
+the historical data, facts and info to Cerebro". Plan 2 therefore adds a `HistorySource`
+adapter per agent on each Mac: Claude Code (live via hooks), Claude Code subagents,
+Codex CLI, Gemini CLI, and a documented generic format (`cerebro-jsonl v1`, dropped in
+`~/.cerebro/inbox/` or passed to `cerebro import-file`) for any other agent or script.
+All of them follow the same rules: folder binding and opt-in, client → project scoping,
+secret stripping on the Mac, and `meta.agent` naming the source. Non-Claude agents are
+synced periodically (`cerebro sync`, at session start and every 30 minutes via launchd).
+Turning those histories into facts and summaries is the summariser's job (plan 3).

@@ -1,0 +1,21 @@
+{
+  "name": "cerebro",
+  "version": "0.1.0",
+  "description": "Long-term memory for Claude Code sessions: records opted-in folders to your Cerebro server and recalls past work.",
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Cerebro server URL",
+      "description": "Where your Cerebro server answers, e.g. http://cerebro.home.lab",
+      "required": true,
+      "default": "http://cerebro.home.lab"
+    },
+    "token": {
+      "type": "string",
+      "title": "Machine token",
+      "description": "This Mac's token, created on the server with `cli.ts token create <mac-name>`",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{"type":"session","agent":"my-agent","id":"run-0001","cwd":"/Users/dev/projects/demo","repo":"https://github.com/example/demo.git","startedAt":"2026-01-05T10:00:00.000Z","meta":{"model":"example-model-1"}}
+{"type":"event","key":"e1","ts":"2026-01-05T10:00:01.000Z","kind":"user","text":"placeholder user prompt"}
+{"type":"event","key":"e2","ts":"2026-01-05T10:00:05.000Z","kind":"assistant","text":"placeholder assistant answer"}
+{"type":"event","key":"e3","ts":"2026-01-05T10:00:06.000Z","kind":"tool_call","text":"","toolName":"read_file","toolInput":{"path":"placeholder/path.txt"},"meta":{"callId":"c1"}}
+{"type":"event","key":"e4","ts":"2026-01-05T10:00:07.000Z","kind":"tool_result","text":"placeholder file contents","toolName":"read_file","meta":{"callId":"c1"}}
+{"type":"event","key":"e5","ts":"2026-01-05T10:00:09.000Z","kind":"assistant","text":"placeholder final answer"}

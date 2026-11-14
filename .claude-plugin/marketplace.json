@@ -1,0 +1,12 @@
+{
+  "name": "cerebro",
+  "description": "Cerebro: long-term memory for Claude Code sessions",
+  "owner": { "name": "Cerebro" },
+  "plugins": [
+    {
+      "name": "cerebro",
+      "source": { "source": "github", "repo": "GustavoGomez092/cerebro", "ref": "plugin-dist" },
+      "description": "Long-term memory for Claude Code sessions"
+    }
+  ]
+}

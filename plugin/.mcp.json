@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cerebro": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/cerebro",
+      "args": ["mcp"],
+      "env": {
+        "CEREBRO_SERVER_URL": "${user_config.server_url}",
+        "CEREBRO_TOKEN": "${user_config.token}"
+      }
+    }
+  }
+}
