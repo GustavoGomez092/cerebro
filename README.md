@@ -83,3 +83,24 @@ DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a l
 Secrets are redacted at ingest (known key formats, bearer tokens, URL passwords, `*_PASSWORD=`-style
 lines). Events are chunked at ingest, so full-text search works immediately; a background worker
 embeds chunks (live sessions before imported history) and the vector half of search fills in.
+
+## Install on a Mac
+
+The client ships as a Claude Code plugin from this (private) repo's `plugin-dist` branch.
+
+```sh
+gh auth login && gh auth setup-git          # private repo access
+claude plugin marketplace add GustavoGomez092/cerebro
+claude plugin install cerebro@cerebro       # asks for the server URL and token
+```
+
+Create the token on the server with `bun server/src/cli.ts token create <mac-name>`,
+outside a recorded Claude Code session.
+
+Once Claude Code has started in any project (the stable link is created at session
+start), import existing history with `~/.cerebro/bin/cerebro retention`. Optionally run
+`~/.cerebro/bin/cerebro schedule` to also pick up other agents' history.
+
+Maintainers publish a release with `scripts/release-plugin.sh <version>` (`--dry-run`
+to preview): it compiles the arm64 and x64 binaries and force-pushes `plugin/` as a
+single commit on `plugin-dist`, tagged `plugin-v<version>`.
