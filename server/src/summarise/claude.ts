@@ -1,4 +1,6 @@
 // Headless Claude Code runner: one `claude -p` call per summary, prompt on stdin.
+import { estimateTokens } from "./budget";
+
 /**
  * - unavailable: the CLI or the API is not working right now (CLI missing or not starting, a crash with no
  *   output, a connection error, a 5xx/529 "overloaded" response): an outage, not the job's fault.
@@ -8,7 +10,19 @@ export type ClaudeFailureKind = "usage_limit" | "auth" | "timeout" | "bad_output
 
 export type ClaudeRun =
   | { ok: true; output: unknown; tokens: number; model: string; credentialExpiresAt: string | null }
-  | { ok: false; kind: ClaudeFailureKind; message: string; resetAt: Date | null };
+  | {
+      ok: false;
+      kind: ClaudeFailureKind;
+      message: string;
+      resetAt: Date | null;
+      /**
+       * What a call that reached the model spent before it failed (I2): the usage its envelope reported, or,
+       * when it reported none, an estimate from the input for a clean exit with unusable output or an unknown
+       * error envelope. Absent when nothing reached the model (CLI missing or crashed, outage, login, limit)
+       * and for a timeout, whose caller charges its own estimate.
+       */
+      tokens?: number;
+    };
 
 export interface ClaudeInput {
   systemPrompt: string;
@@ -71,6 +85,17 @@ export const HEALTH_PROBE: ClaudeInput = {
 
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
+/** Tokens an envelope's usage reports (input + output + cache creation), or null when it has no usage. */
+function usageTokens(env: Record<string, unknown>): number | null {
+  const u = env.usage;
+  if (!u || typeof u !== "object") return null;
+  const usage = u as Record<string, unknown>;
+  return num(usage.input_tokens) + num(usage.output_tokens) + num(usage.cache_creation_input_tokens);
+}
+
+/** A failure that spent `tokens` (omitted when 0). */
+const charged = (r: ClaudeRun, tokens: number): ClaudeRun => (!r.ok && tokens > 0 ? { ...r, tokens } : r);
+
 function parseStructured(env: Record<string, unknown>): { value: unknown } | null {
   if (env.structured_output != null && typeof env.structured_output === "object") {
     return { value: env.structured_output };
@@ -132,6 +157,8 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
       // child may exit before reading stdin; its output still tells us why
     }
     const [out, err, code] = await Promise.all([stdout, stderr, proc.exited]);
+    /** What a call that reached the model but reported no usage is assumed to have spent. */
+    const estimate = estimateTokens(input.systemPrompt.length + input.prompt.length);
     if (aborted) return fail("timeout", "claude call aborted");
     if (timedOut) return fail("timeout", `claude timed out after ${input.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`);
 
@@ -149,19 +176,23 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
         return fail("unavailable", `${err}\n${out}`.trim().slice(0, 500) || `claude exited with code ${code} and no output`);
       }
       if (code !== 0) return classify(`${err}\n${out}`.trim() ||`claude exited with code ${code}`);
-      return fail("bad_output", `claude stdout was not a JSON object: ${out.slice(0, 200)}`);
+      // A clean exit with output we cannot read: the model very likely ran, so it is charged an estimate.
+      return charged(fail("bad_output", `claude stdout was not a JSON object: ${out.slice(0, 200)}`), estimate);
     }
 
+    const used = usageTokens(parsed);
     if (parsed.is_error !== false) {
       const text = typeof parsed.result === "string" ? parsed.result : err || `claude error (exit ${code})`;
-      return classify(text, parsed.api_error_status);
+      const r = classify(text, parsed.api_error_status);
+      // An unknown error after an answer envelope (e.g. structured-output retries ran out) may have spent a lot;
+      // a login, limit or outage error never reached the model, so only reported usage counts for those.
+      return charged(r, used ?? (!r.ok && r.kind === "failed" ? estimate : 0));
     }
 
     const structured = parseStructured(parsed);
-    if (!structured) return fail("bad_output", "claude result was not valid JSON for the schema");
+    if (!structured) return charged(fail("bad_output", "claude result was not valid JSON for the schema"), used ?? estimate);
 
-    const usage = (parsed.usage ?? {}) as Record<string, unknown>;
-    const tokens = num(usage.input_tokens) + num(usage.output_tokens) + num(usage.cache_creation_input_tokens);
+    const tokens = used ?? 0;
     const model = Object.keys((parsed.modelUsage ?? {}) as object)[0] ?? "unknown";
     const exp = parsed.credential_expires_at;
     return {

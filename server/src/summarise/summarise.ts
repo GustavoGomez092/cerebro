@@ -261,8 +261,11 @@ export async function summariseJob(
       // A call killed at our timeout (or by a stop) reports no usage, but its input was very likely processed
       // and billed: charge its estimate so the budget sees it, whatever the probe below says. The probe decides
       // only whether the job is to blame (an attempt) or an outage pauses the loop. Over-charging only delays
-      // work; under-charging would let a slow API spend the subscription unrecorded (N1).
-      if (run.kind === "timeout") await record(sql, estimateTokens(req.systemPrompt.length + req.prompt.length), "summary");
+      // work; under-charging would let a slow API spend the subscription unrecorded (N1). A call that reached
+      // the model and then failed (bad output, an error envelope) is charged what it reported or an estimate,
+      // so a failure on every call cannot spend the subscription unrecorded either (I2).
+      const spent = run.kind === "timeout" ? estimateTokens(req.systemPrompt.length + req.prompt.length) : run.tokens ?? 0;
+      if (spent > 0) await record(sql, spent, "summary");
       if (deps.signal?.aborted) return stopped();
       const error = `${run.kind}: ${run.message}`;
       const later = run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS);
@@ -274,6 +277,8 @@ export async function summariseJob(
       // A probe that times out too means an outage; the probe itself is not charged (nothing answered it).
       if (health.ok) {
         credentialExpiresAt = health.credentialExpiresAt;
+        await record(sql, health.tokens, "summary");
+      } else if (health.tokens) {
         await record(sql, health.tokens, "summary");
       }
       if (deps.signal?.aborted) return stopped();

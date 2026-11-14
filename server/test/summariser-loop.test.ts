@@ -193,6 +193,28 @@ test("a login probe that still fails keeps the loop paused", async () => {
   }
 });
 
+test("I2: a pause's probe that reached the model and failed is charged", async () => {
+  const { t, state } = await setup();
+  const c = clock();
+  const cli = fakeCli("auth");
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, now: c.now, manual: true, log: quiet });
+  try {
+    const { binding } = await boundFolder(t, { project: "Web" });
+    await endedSession(t, binding.id, "s1", "osprey");
+    await loop.tick();
+    expect(state.paused?.reason).toBe("login");
+    cli.mode = "schemafail";
+    c.advance(16 * MIN);
+    await loop.tick();
+    expect(cli.calls).toHaveLength(2);
+    expect(state.paused?.reason).toBe("login");
+    expect(await t.sql`select tokens, kind from usage_ledger`).toEqual([{ tokens: 22, kind: "summary" }]);
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
 test("an outage pauses the loop as unavailable without dead-lettering, and it resumes when a probe succeeds", async () => {
   const { t, state } = await setup();
   const c = clock();

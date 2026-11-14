@@ -843,6 +843,20 @@ test("histories too big for the window keep the seed and the newest, and stay ou
   }
 });
 
+test("I2: a state call that reached the model and failed is charged", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await addSummary(t, binding, { title: "One", day: 1, facts: ["fact one"] });
+    for (const [mode, reason] of [["notjson", "bad_output"], ["schemafail", "failed"]]) {
+      await t.sql`delete from usage_ledger`;
+      expect(await rebuildState(t.sql, scope, deps(mode))).toMatchObject({ status: "failed", reason });
+      expect(await t.sql`select tokens, kind from usage_ledger`).toEqual([{ tokens: 22, kind: "state" }]);
+    }
+  } finally { await t.drop(); }
+});
+
 test("a state call that times out is charged its estimated spend", async () => {
   const t = await authedApp();
   try {

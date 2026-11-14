@@ -491,8 +491,10 @@ async function foldNext(
 
   const run = await deps.run({ ...req, schema: STATE_SCHEMA });
   if (!run.ok) {
-    // A killed call reports no usage, but it may have spent: charge its estimate so the budget sees it.
-    if (run.kind === "timeout") await record(sql, estimateTokens(requestChars(req)), "state");
+    // A killed call reports no usage, but it may have spent: charge its estimate so the budget sees it. A call
+    // that reached the model and then failed is charged what it reported, or an estimate (I2).
+    const spent = run.kind === "timeout" ? estimateTokens(requestChars(req)) : run.tokens ?? 0;
+    if (spent > 0) await record(sql, spent, "state");
     if (deps.signal?.aborted) return stopped;
     const later = run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS);
     if (run.kind === "usage_limit") return { status: "deferred", reason: "usage_limit", until: later };

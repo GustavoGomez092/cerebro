@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { runClaude } from "../src/summarise/claude";
+import { estimateTokens } from "../src/summarise/budget";
 
 const FAKE = "bun server/test/fakes/fake-claude.ts";
 const schema = { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] };
@@ -131,4 +132,31 @@ test("connection errors, 5xx, 529 overloaded and a silent crash are unavailable"
     expect(r.ok).toBe(false);
     if (!r.ok) expect([mode, r.kind]).toEqual([mode, "unavailable"]);
   }
+});
+
+// I2: a call that reached the model and then failed reports what it spent, so the caller can charge it.
+test("I2: an error envelope after the model ran carries its usage as tokens", async () => {
+  const r = await runClaude(input, base("schemafail"));
+  expect(r).toMatchObject({ ok: false, kind: "failed", tokens: 10 + 5 + 7 });
+});
+
+test("I2: unusable output carries its usage, or an estimate from the input when the CLI reported none", async () => {
+  const notjson = await runClaude(input, base("notjson"));
+  expect(notjson).toMatchObject({ ok: false, kind: "bad_output", tokens: 10 + 5 + 7 });
+  // A clean exit (0) whose stdout is not an envelope: the model very likely ran, so charge the estimate.
+  const garbage = await runClaude(input, base("garbage"));
+  expect(garbage).toMatchObject({ ok: false, kind: "bad_output", tokens: estimateTokens("SYS".length + "hello cerebro world".length) });
+  // An error envelope with no usage, classified as an unknown failure: estimated too.
+  const nousage = await runClaude(input, base("errnousage"));
+  expect(nousage).toMatchObject({ ok: false, kind: "failed", tokens: estimateTokens("SYS".length + "hello cerebro world".length) });
+});
+
+test("I2: failures that never reached the model carry no tokens", async () => {
+  for (const mode of ["auth", "limit", "connection", "overloaded", "crash"]) {
+    const r = await runClaude(input, base(mode));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect([mode, r.tokens]).toEqual([mode, undefined]);
+  }
+  const missing = await runClaude(input, { ...process.env, SUMMARISER_CMD: "/nonexistent/claude-bin" } as NodeJS.ProcessEnv);
+  expect(!missing.ok && missing.tokens).toBeUndefined();
 });

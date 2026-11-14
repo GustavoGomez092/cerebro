@@ -195,7 +195,8 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     lastProbeAt = now;
     const probe = await run(HEALTH_PROBE);
     // Any answer from the model (even one off-schema) means the CLI and the login work. A probe that times
-    // out is not charged: nothing answered it.
+    // out is not charged: nothing answered it. One that answered and failed is charged what it spent (I2).
+    if (!probe.ok && probe.tokens) await record(sql, probe.tokens, "summary");
     if (!probe.ok && probe.kind !== "bad_output") {
       if (probe.kind === "usage_limit") {
         pause("usage_limit", probe.resetAt ?? new Date(now + RETRY_LATER_MS));

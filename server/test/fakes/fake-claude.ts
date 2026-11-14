@@ -3,6 +3,8 @@ export {};
 // Mode comes from FAKE_CLAUDE_MODE: ok (default) | structured | echo | limit | auth | garbage | notjson | slow
 //   | overloaded (529) | server500 | connection ("API Error: Connection error.") | crash (exit 3, no output)
 //   | missing (summary without required fields) | hostile (oversized fields, secrets, extra keys)
+//   | schemafail (the model ran, then the CLI gave up on the structured output: is_error with usage, exit 1)
+//   | errnousage (is_error, an unknown error, no usage reported, exit 1)
 // "ok" answers in the shape of the --json-schema it is given: a summary object for SUMMARY_SCHEMA, a project
 // state for STATE_SCHEMA (the fenced current state with the fenced new summaries folded in: decisions, facts
 // and open threads added; threads named in a summary's resolved_threads moved to resolved_recently).
@@ -194,6 +196,12 @@ switch (mode) {
     process.exit(1);
   case "crash":
     process.exit(3);
+  case "schemafail":
+    emit(envelope({ subtype: "error_max_structured_output_retries", is_error: true, result: undefined }));
+    process.exit(1);
+  case "errnousage":
+    emit(failure("Something went wrong while answering"));
+    process.exit(1);
   case "missing":
     emit(envelope({ result: JSON.stringify({ title: "only a title" }) }));
     break;

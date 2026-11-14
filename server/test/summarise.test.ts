@@ -274,6 +274,30 @@ test("a job stopped at the event cap is due again now, not in two hours", async 
   } finally { await t.drop(); }
 });
 
+test("I2: calls that reached the model and failed are charged, so a systematic failure cannot spend unrecorded", async () => {
+  const t = await authedApp();
+  try {
+    let { job } = await endedSession(t);
+    // Off-schema output with usage (22 tokens), and a CLI that gave up on the structured output (22 tokens; its
+    // probe answers, another 22). A clean exit with no envelope at all is charged its estimate.
+    const cases: [string, string, number][] = [["notjson", "bad_output", 22], ["schemafail", "failed", 44], ["garbage", "bad_output", 4000]];
+    for (const [i, [mode, reason, min]] of cases.entries()) {
+      if (i > 0) job = await reclaim(t);
+      await t.sql`delete from usage_ledger`;
+      const run = (input: ClaudeInput) => (isProbe(input) ? fakeRun("ok") : fakeRun(mode))(input);
+      expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET })).toMatchObject({ status: "failed", reason });
+      const [{ n }] = await t.sql`select coalesce(sum(tokens), 0)::int as n from usage_ledger where kind = 'summary'`;
+      expect([mode, n >= min]).toEqual([mode, true]);
+      if (mode !== "garbage") expect(n).toBe(min);
+    }
+    // When the probe fails the same way (the CLI breaks every call), the job is not blamed, but both calls are charged.
+    job = await reclaim(t);
+    await t.sql`delete from usage_ledger`;
+    expect(await summariseJob(t.sql, t.embedder, job, { run: fakeRun("schemafail"), budget: BUDGET })).toMatchObject({ status: "deferred" });
+    expect((await t.sql`select sum(tokens)::int as n from usage_ledger`)[0].n).toBe(44);
+  } finally { await t.drop(); }
+});
+
 test("a binding declined after the claim defers without calling claude", async () => {
   const t = await authedApp();
   try {
