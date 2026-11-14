@@ -65,6 +65,15 @@ test("retention creates a missing file and leaves invalid JSON untouched", async
   expect(readFileSync(settingsPath(bad), "utf8")).toBe("{ not json");
 });
 
+test("status shows how long Claude Code keeps transcripts", async () => {
+  const configured = { CLAUDE_PLUGIN_OPTION_SERVER_URL: TEST_URL, CLAUDE_PLUGIN_OPTION_TOKEN: "t" };
+  const home = tmp();
+  expect((await cli(["status"], home, configured)).stdout).toContain("retention: 30 days (Claude Code's default; cleanupPeriodDays is unset)");
+  mkdirSync(join(home, ".claude"));
+  writeFileSync(settingsPath(home), JSON.stringify({ cleanupPeriodDays: 90 }));
+  expect((await cli(["status"], home, configured)).stdout).toContain("retention: 90 days (cleanupPeriodDays)");
+});
+
 test("status says not configured and explains the plugin options", async () => {
   const r = await cli(["status"], tmp());
   expect(r.code).toBe(0);
@@ -127,5 +136,10 @@ test("the skill file has the required frontmatter and names every MCP tool it us
   // the CLI is run through the stable link, which exists wherever the plugin has started once
   for (const cmd of ["status", "retention", "schedule"]) expect(body).toContain(`~/.cerebro/bin/cerebro ${cmd}`);
   expect(body).not.toMatch(/(^|[^/])`cerebro (status|retention|schedule)/m);
+  // after a bind: raise a short transcript retention, but only once the user agreed
+  const setUp = body.slice(body.indexOf("## Setting up"), body.indexOf("## Changing"));
+  expect(setUp).toContain("run `~/.cerebro/bin/cerebro status`; if its `retention:` line shows fewer than 36500 days, ask with AskUserQuestion");
+  expect(setUp).toContain("If they agree, run `~/.cerebro/bin/cerebro retention`.");
+  expect(body).not.toMatch(/retention` keeps Claude Code from deleting old transcripts before they are uploaded/);
   expect(existsSync(join(import.meta.dir, "../../plugin/skills/cerebro"))).toBe(true);
 });

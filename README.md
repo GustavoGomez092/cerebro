@@ -97,9 +97,12 @@ claude plugin install cerebro@cerebro       # asks for the server URL and token
 Create the token on the server with `bun server/src/cli.ts token create <mac-name>`,
 outside a recorded Claude Code session.
 
-Once Claude Code has started in any project (the stable link is created at session
-start), import existing history with `~/.cerebro/bin/cerebro retention`. Optionally run
-`~/.cerebro/bin/cerebro schedule` to also pick up other agents' history.
+A folder's past conversations are imported when you opt it in (the cerebro skill asks in
+each new folder). Claude Code deletes transcripts after 30 days by default, so once it has
+started in any project (the stable link is created at session start), run
+`~/.cerebro/bin/cerebro retention`: it only raises how long Claude Code keeps transcripts
+(`cleanupPeriodDays`, to 36500 days), so history survives until it is imported. Optionally
+run `~/.cerebro/bin/cerebro schedule` to also pick up other agents' history.
 
 Maintainers publish a release with `scripts/release-plugin.sh <version>` (`--dry-run`
 to preview, `--remote <url>` to publish somewhere other than `origin`, which must be

@@ -19,6 +19,7 @@ Cerebro records Claude Code work into a searchable memory, grouped by client and
 5. Call `cerebro_bind` with `client`, optionally `project`, and `whole_repo` (true for the whole repo, false for only this subfolder; leave it out when subpath is empty).
 6. If the result suggests moving earlier sessions, ask the user first, and only then call `cerebro_adopt`.
 7. Tell the user that past conversations for this folder, from Claude Code, its subagents, Codex and Gemini CLI, are being imported in the background. Mention that `~/.cerebro/bin/cerebro schedule` keeps new sessions from other agents flowing in, and offer to run it for them.
+8. After a successful bind, run `~/.cerebro/bin/cerebro status`; if its `retention:` line shows fewer than 36500 days, ask with AskUserQuestion whether to raise how long Claude Code keeps its transcripts, so older history survives until Cerebro has imported it (Claude Code deletes transcripts after that many days; 30 by default). If they agree, run `~/.cerebro/bin/cerebro retention`.
 
 ## Changing an existing binding or declining a bound folder
 
@@ -32,4 +33,4 @@ If a call fails with a conflict error saying the folder is already bound differe
 
 ## Checking status
 
-For "is Cerebro working?", run `~/.cerebro/bin/cerebro status` (add `--retry` to clear a block and upload once). `~/.cerebro/bin/cerebro retention` keeps Claude Code from deleting old transcripts before they are uploaded.
+For "is Cerebro working?", run `~/.cerebro/bin/cerebro status` (add `--retry` to clear a block and upload once). Its `retention:` line is how long Claude Code keeps transcripts; `~/.cerebro/bin/cerebro retention` raises it (only with the user's agreement).

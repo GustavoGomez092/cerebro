@@ -98,6 +98,22 @@ const mcp: Command = {
   },
 };
 
+/** Claude Code's user settings, where `cleanupPeriodDays` (how long transcripts are kept) lives. */
+const claudeSettingsPath = () => join(process.env.HOME || homedir(), ".claude", "settings.json");
+
+/** How long Claude Code keeps transcripts, as the status report shows it. */
+function retentionLine(): string {
+  let days: unknown;
+  try {
+    const path = claudeSettingsPath();
+    days = existsSync(path) ? JSON.parse(readFileSync(path, "utf8"))?.cleanupPeriodDays : undefined;
+  } catch {
+    return "retention: unknown (~/.claude/settings.json is not valid JSON)";
+  }
+  if (days === undefined) return "retention: 30 days (Claude Code's default; cleanupPeriodDays is unset)";
+  return `retention: ${String(days)} days (cleanupPeriodDays)`;
+}
+
 /** The status report. Never includes the token. */
 export function statusText(store: Store, config: ClientConfig | null): string {
   if (!config) {
@@ -118,6 +134,7 @@ export function statusText(store: Store, config: ClientConfig | null): string {
     `blocked: ${store.get("blocked") ?? "no"}`,
     `last error: ${store.get("lastError") ?? "none"}`,
     `open cursors: ${store.openCursors().length}`,
+    retentionLine(),
     "",
   ].join("\n");
 }
@@ -158,7 +175,7 @@ const retention: Command = {
       await Bun.write(Bun.stdout, "--days needs a positive whole number\n");
       return;
     }
-    const path = join(process.env.HOME || homedir(), ".claude", "settings.json");
+    const path = claudeSettingsPath();
     let settings: Record<string, unknown> = {};
     if (existsSync(path)) {
       try {
