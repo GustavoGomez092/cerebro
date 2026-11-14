@@ -326,6 +326,10 @@ test("output missing fields stores nothing; usage limit and budget defer", async
       run: fakeRun("limit", { FAKE_CLAUDE_RESET_EPOCH: "1900000000" }), budget: BUDGET,
     })).toMatchObject({ status: "deferred", reason: "usage_limit", until: new Date(1_900_000_000_000) });
     expect(await updateState(t.sql, scope, [s1], deps("auth"))).toMatchObject({ status: "deferred", reason: "login" });
+    // An outage is the loop's concern (it pauses and probes), not a failure of this scope.
+    for (const mode of ["connection", "overloaded"]) {
+      expect(await updateState(t.sql, scope, [s1], deps(mode))).toMatchObject({ status: "deferred", reason: "unavailable" });
+    }
     let after = await stateRow(t, scope);
     expect(after.version).toBe(before.version);
     expect(after.doc).toEqual({});

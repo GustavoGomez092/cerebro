@@ -1,5 +1,10 @@
 // Headless Claude Code runner: one `claude -p` call per summary, prompt on stdin.
-export type ClaudeFailureKind = "usage_limit" | "auth" | "timeout" | "bad_output" | "failed";
+/**
+ * - unavailable: the CLI or the API is not working right now (CLI missing or not starting, a crash with no
+ *   output, a connection error, a 5xx/529 "overloaded" response): an outage, not the job's fault.
+ * - failed: any other error.
+ */
+export type ClaudeFailureKind = "usage_limit" | "auth" | "timeout" | "bad_output" | "unavailable" | "failed";
 
 export type ClaudeRun =
   | { ok: true; output: unknown; tokens: number; model: string; credentialExpiresAt: string | null }
@@ -37,14 +42,32 @@ function parseResetAt(text: string): Date | null {
   return null;
 }
 
+/** Connection and server-side errors: the API is unreachable or overloaded, whatever the input. */
+const OUTAGE_TEXT =
+  /connection error|connection refused|ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|network error|overloaded|service unavailable|bad gateway|gateway time-?out|internal server error|API Error: 5\d\d\b/i;
+
 function classify(text: string, status?: unknown): ClaudeRun {
   const message = text.trim().slice(0, 500) || "claude failed";
   if (/usage limit|rate limit|hit your limit|limit reached/i.test(text)) {
     return fail("usage_limit", message, parseResetAt(text));
   }
-  if (status === 401 || status === 403 || /login|auth|credential|401/i.test(text)) return fail("auth", message);
+  if (status === 401 || status === 403) return fail("auth", message);
+  if (typeof status === "number" && status >= 500) return fail("unavailable", message);
+  if (OUTAGE_TEXT.test(text)) return fail("unavailable", message);
+  if (/login|auth|credential|401/i.test(text)) return fail("auth", message);
   return fail("failed", message);
 }
+
+/**
+ * A tiny known-good call. When a call fails, this tells an outage (the probe fails too) from a failure
+ * the job caused (the probe works); it also tells when an expired login or an outage is over.
+ */
+export const HEALTH_PROBE: ClaudeInput = {
+  systemPrompt: 'Reply with the JSON object {"ok": true} and nothing else.',
+  prompt: "ping",
+  schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+  timeoutMs: 60_000,
+};
 
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
@@ -83,7 +106,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
   try {
     proc = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: childEnv });
   } catch (e) {
-    return fail("failed", `cannot start ${cmd[0]}: ${(e as Error).message}`);
+    return fail("unavailable", `cannot start ${cmd[0]}: ${(e as Error).message}`);
   }
 
   let timedOut = false;
@@ -121,6 +144,10 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
     }
 
     if (!parsed) {
+      // 127: the shell found no such command. No output at all: the CLI died before it could say why.
+      if (code === 127 || (code !== 0 && !`${err}${out}`.trim())) {
+        return fail("unavailable", `${err}\n${out}`.trim().slice(0, 500) || `claude exited with code ${code} and no output`);
+      }
       if (code !== 0) return classify(`${err}\n${out}`.trim() ||`claude exited with code ${code}`);
       return fail("bad_output", `claude stdout was not a JSON object: ${out.slice(0, 200)}`);
     }

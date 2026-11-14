@@ -3,13 +3,13 @@ import type { Config } from "../config";
 import { pgState } from "../db";
 import type { Embedder } from "../embed/embedder";
 import { budgetState, estimateTokens, record } from "./budget";
-import { runClaude, type ClaudeInput } from "./claude";
+import { HEALTH_PROBE, runClaude, type ClaudeInput } from "./claude";
 import { claimSummaryJob, scheduleGrowingSessions } from "./jobs";
 import { updateState, type StateResult } from "./state";
 import { embedSummary, summariseJob, summaryEmbedText, type SummariseResult } from "./summarise";
 
 export type SummariserConfig = Config["summariser"];
-export type PauseReason = "budget" | "usage_limit" | "login" | "disabled";
+export type PauseReason = "budget" | "usage_limit" | "login" | "unavailable" | "disabled";
 
 /** What /v1/status reports about the summariser (plus backlog and budget, read from the database). */
 export interface SummariserState {
@@ -79,13 +79,9 @@ const LIVE_RESERVE = 0.25;
 const SCOPE_BACKOFF_MIN_MS = 5 * 60_000;
 const SCOPE_BACKOFF_MAX_MS = 6 * 3600_000;
 const RETRY_LATER_MS = 30 * 60_000;
-
-const LOGIN_PROBE: ClaudeInput = {
-  systemPrompt: 'Reply with the JSON object {"ok": true} and nothing else.',
-  prompt: "ping",
-  schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
-  timeoutMs: 60_000,
-};
+/** An outage pause before the next probe: 2 min, doubling up to 30 min while the probes keep failing. */
+const OUTAGE_MIN_MS = 2 * 60_000;
+const OUTAGE_MAX_MS = 30 * 60_000;
 
 /**
  * Runs the summariser in the background: every 30 s it queues growing sessions, then claims and
@@ -94,8 +90,10 @@ const LOGIN_PROBE: ClaudeInput = {
  * budget window. Single-flight throughout: one Claude call at a time, ever.
  *
  * Pauses (reported in `state.paused`): over budget until the window frees up; a usage limit until the
- * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds. Raw capture
- * and search are never affected. A disabled summariser leaves its jobs queued.
+ * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds; an outage
+ * ("unavailable": CLI missing, network down, API overloaded) until a probe succeeds, probing after 2 min,
+ * then backing off to every 30 min. Outages never count against a job, so a long one dead-letters
+ * nothing. Raw capture and search are never affected. A disabled summariser leaves its jobs queued.
  */
 export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserConfig, deps: SummariserDeps = {}): Summariser {
   const state = deps.state ?? newSummariserState(cfg.enabled);
@@ -114,8 +112,9 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
   let stopped = false;
   let lastProbeAt = 0;
   let lastSweepAt: number | null = null;
-  /** Jobs deferred by a login failure: due again as soon as the login works. */
-  const loginDeferred = new Set<string>();
+  /** Jobs deferred by a login failure or an outage: due again as soon as a probe succeeds. */
+  const probeDeferred = new Set<string>();
+  let outageMs = OUTAGE_MIN_MS;
   const scopeBackoff = new Map<string, { until: number; ms: number }>();
   /** Summaries whose embedding failed, skipped by the sweep until `until`. */
   const sweepBackoff = new Map<string, { until: number; ms: number }>();
@@ -124,6 +123,12 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     state.paused = { reason, until: until ? until.toISOString() : null };
     if (reason === "login") lastProbeAt = clock().getTime();
     log(JSON.stringify({ level: "info", msg: "summariser paused", reason, until: state.paused.until }));
+  };
+  /** Pauses for an outage; each consecutive one waits twice as long before the next probe (up to 30 min). */
+  const pauseOutage = () => {
+    const ms = outageMs;
+    outageMs = Math.min(OUTAGE_MAX_MS, outageMs * 2);
+    pause("unavailable", new Date(clock().getTime() + ms));
   };
   const resume = () => {
     log(JSON.stringify({ level: "info", msg: "summariser resumed", reason: state.paused?.reason }));
@@ -157,10 +162,17 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       pause("login", null);
       return true;
     }
+    if (reason === "unavailable") {
+      pauseOutage();
+      return true;
+    }
     return false;
   };
 
-  /** Whether work may run now; lifts a pause whose time has come (a login pause only after a good probe). */
+  /**
+   * Whether work may run now; lifts a pause whose time has come. A login or outage pause is lifted only
+   * after a good probe (a login one every 15 min; an outage one at its `until`, backing off meanwhile).
+   */
   const mayRun = async (): Promise<boolean> => {
     const p = state.paused;
     if (!p) return true;
@@ -169,20 +181,24 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       resume();
       return true;
     }
-    if (p.reason !== "login") {
+    if (p.reason === "budget" || p.reason === "usage_limit") {
       if (p.until && now < Date.parse(p.until)) return false;
       resume();
       return true;
     }
-    if (now - lastProbeAt < PROBE_MS) return false;
+    if (p.reason === "login" ? now - lastProbeAt < PROBE_MS : !!p.until && now < Date.parse(p.until)) return false;
     lastProbeAt = now;
-    const probe = await run(LOGIN_PROBE);
-    // Any answer from the model (even one off-schema) means the login works.
+    const probe = await run(HEALTH_PROBE);
+    // Any answer from the model (even one off-schema) means the CLI and the login work. A probe that times
+    // out is not charged: nothing answered it.
     if (!probe.ok && probe.kind !== "bad_output") {
-      if (probe.kind === "timeout") await record(sql, estimateTokens(LOGIN_PROBE.systemPrompt.length + LOGIN_PROBE.prompt.length), "summary");
       if (probe.kind === "usage_limit") {
         pause("usage_limit", probe.resetAt ?? new Date(now + RETRY_LATER_MS));
-      } else if (probe.kind !== "auth") {
+      } else if (probe.kind === "auth") {
+        if (p.reason !== "login") pause("login", null);
+      } else if (p.reason === "unavailable") {
+        pauseOutage();
+      } else {
         state.lastError = `probe: ${probe.kind}`;
       }
       return false;
@@ -191,12 +207,13 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       await record(sql, probe.tokens, "summary");
       noteRun(probe);
     }
+    outageMs = OUTAGE_MIN_MS;
     resume();
-    if (loginDeferred.size) {
+    if (probeDeferred.size) {
       await sql`
         update summary_jobs set due_at = now()
-        where session_id = any(${sql.array([...loginDeferred], "text")}) and (locked_until is null or locked_until < now())`;
-      loginDeferred.clear();
+        where session_id = any(${sql.array([...probeDeferred], "text")}) and (locked_until is null or locked_until < now())`;
+      probeDeferred.clear();
     }
     return true;
   };
@@ -282,7 +299,8 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       if (!job) break;
       const res = await summariseJob(sql, embedder, job, { run, budget, signal });
       noteRun(res);
-      if (res.status === "deferred" && res.reason === "login") loginDeferred.add(job.sessionId);
+      if (res.status === "deferred" && (res.reason === "login" || res.reason === "unavailable")) probeDeferred.add(job.sessionId);
+      if (res.status === "done") outageMs = OUTAGE_MIN_MS;
       if (handle("summary", res)) return false;
       for (const scope of res.scopes) {
         const r = await updateState(sql, scope, [], { run, budget, signal });

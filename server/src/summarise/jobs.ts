@@ -128,3 +128,14 @@ export async function failSummaryJob(
       due_at = now() + make_interval(mins => least(360, 5 * power(2, attempts + 1))::int)
     where session_id = ${sessionId}`;
 }
+
+/**
+ * Revives dead summary jobs (recovery after a failure that dead-lettered them): attempts reset, due now.
+ * Returns how many were revived.
+ */
+export async function requeueDeadSummaries(sql: SQL): Promise<number> {
+  const rows = await sql`
+    update summary_jobs set dead = false, attempts = 0, last_error = null, locked_until = null, due_at = now()
+    where dead returning session_id`;
+  return rows.length;
+}

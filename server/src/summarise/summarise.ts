@@ -2,7 +2,7 @@ import type { SQL } from "bun";
 import { redactSecrets, storable } from "@cerebro/shared";
 import { toVector, type Embedder } from "../embed/embedder";
 import { budgetState, canSpend, estimateTokens, record } from "./budget";
-import type { runClaude } from "./claude";
+import { HEALTH_PROBE, type runClaude } from "./claude";
 import { completeSummaryJob, failSummaryJob, releaseSummaryJob } from "./jobs";
 import { SUMMARY_SCHEMA, summaryRequest } from "./prompts";
 import { renderRange, type EventRow } from "./render";
@@ -11,6 +11,8 @@ import { markScopesDirty, scopeKey } from "./state";
 const MAX_EVENTS = 2000;
 const EMBED_TIMEOUT_MS = 30_000;
 const RETRY_LATER_MS = 30 * 60_000;
+/** A job deferred by an outage is due again after this (the loop pauses and probes meanwhile). */
+const OUTAGE_RETRY_MS = 5 * 60_000;
 
 export interface SummaryBody {
   title: string;
@@ -38,7 +40,7 @@ export interface SummariseDeps {
 }
 
 export type SummariseReason =
-  | "budget" | "usage_limit" | "login" | "timeout" | "binding" | "bad_output" | "failed" | "stopped";
+  | "budget" | "usage_limit" | "login" | "timeout" | "binding" | "bad_output" | "unavailable" | "failed" | "stopped";
 
 export interface SummariseResult {
   status: "done" | "deferred" | "failed";
@@ -146,9 +148,14 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
  * completed, so a crash or a later deferral resumes after the last stored piece.
  *
  * - "done": everything loaded is covered; the job is completed (due again now if the event cap was hit).
- * - "deferred": budget, usage limit, login, an inactive binding or a stop request; no attempt is counted.
- * - "failed": timeout, bad model output or another failure (including a store error); counts towards
- *   dead-lettering. A timed-out (killed) call is charged its estimated tokens.
+ * - "deferred": budget, usage limit, login, an outage ("unavailable"), an inactive binding or a stop
+ *   request; no attempt is counted.
+ * - "failed": bad model output, a store error, or a timeout or other CLI failure while the CLI itself
+ *   works; counts towards dead-lettering. A timed-out (killed) call is then charged its estimated tokens.
+ *
+ * A timeout or CLI failure is followed by a tiny probe call (HEALTH_PROBE): when the probe fails too, it is
+ * an outage (network down, API overloaded, CLI missing), not the job's fault, so the job is deferred
+ * without an attempt and never dead-letters however long the outage lasts.
  */
 export async function summariseJob(
   sql: SQL,
@@ -208,15 +215,39 @@ export async function summariseJob(
     const run = await deps.run({ ...req, schema: SUMMARY_SCHEMA });
     if (!run.ok) {
       // A killed call reports no usage, but it may have spent: charge its estimate so the budget sees it.
-      if (run.kind === "timeout") await record(sql, estimateTokens(req.systemPrompt.length + req.prompt.length), "summary");
-      if (deps.signal?.aborted) return stopped();
+      const chargeKilled = () => record(sql, estimateTokens(req.systemPrompt.length + req.prompt.length), "summary");
+      if (deps.signal?.aborted) {
+        if (run.kind === "timeout") await chargeKilled();
+        return stopped();
+      }
       const error = `${run.kind}: ${run.message}`;
       const later = run.resetAt ?? new Date(Date.now() + RETRY_LATER_MS);
       if (run.kind === "usage_limit") return defer("usage_limit", error, later);
       if (run.kind === "auth") return defer("login", error, later);
-      // A job that keeps timing out must dead-letter like any failing job, not retry forever.
-      if (run.kind === "timeout") return fail("timeout", error);
-      return fail(run.kind === "bad_output" ? "bad_output" : "failed", error);
+      if (run.kind === "bad_output") return fail("bad_output", error);
+      // Timeout, outage or unknown failure: does the CLI answer a known-good call right now?
+      const health = await deps.run(HEALTH_PROBE);
+      // A probe that times out too means an outage; it is not charged (nothing answered).
+      if (health.ok) {
+        credentialExpiresAt = health.credentialExpiresAt;
+        await record(sql, health.tokens, "summary");
+      }
+      if (deps.signal?.aborted) {
+        if (run.kind === "timeout") await chargeKilled();
+        return stopped();
+      }
+      if (health.ok || health.kind === "bad_output") {
+        // The CLI works, so this job is to blame: it must dead-letter like any failing job, not retry forever.
+        if (run.kind === "timeout") {
+          await chargeKilled();
+          return fail("timeout", error);
+        }
+        return fail("failed", error);
+      }
+      if (health.kind === "usage_limit") return defer("usage_limit", error, health.resetAt ?? later);
+      if (health.kind === "auth") return defer("login", error, later);
+      // An outage: not the job's fault. A call killed while the API was unreachable is not charged.
+      return defer("unavailable", error, new Date(Date.now() + OUTAGE_RETRY_MS));
     }
     credentialExpiresAt = run.credentialExpiresAt;
     await record(sql, run.tokens, "summary");

@@ -38,7 +38,8 @@ export interface StateDeps {
   signal?: AbortSignal;
 }
 
-export type StateReason = "budget" | "usage_limit" | "login" | "timeout" | "bad_output" | "failed" | "stopped";
+export type StateReason =
+  | "budget" | "usage_limit" | "login" | "timeout" | "bad_output" | "unavailable" | "failed" | "stopped";
 
 export interface StateResult {
   status: "updated" | "deferred" | "failed";
@@ -492,6 +493,8 @@ async function foldNext(
     if (run.kind === "usage_limit") return { status: "deferred", reason: "usage_limit", until: later };
     if (run.kind === "auth") return { status: "deferred", reason: "login", until: later };
     if (run.kind === "timeout") return { status: "deferred", reason: "timeout", until: later };
+    // An outage: the loop pauses and probes; the scope itself did nothing wrong.
+    if (run.kind === "unavailable") return { status: "deferred", reason: "unavailable", until: new Date(Date.now() + RETRY_LATER_MS) };
     return { status: "failed", reason: run.kind === "bad_output" ? "bad_output" : "failed" };
   }
   ctx.credentialExpiresAt = run.credentialExpiresAt;

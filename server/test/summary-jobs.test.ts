@@ -4,7 +4,7 @@ import { connect } from "../src/db";
 import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
 import {
-  enqueueSummary, scheduleGrowingSessions, claimSummaryJob, completeSummaryJob, failSummaryJob,
+  enqueueSummary, scheduleGrowingSessions, claimSummaryJob, completeSummaryJob, failSummaryJob, requeueDeadSummaries,
 } from "../src/summarise/jobs";
 
 const msgs = (id: string, from: number, to: number) =>
@@ -262,5 +262,46 @@ test("a completion can leave the job due now by the database's clock", async () 
     expect(job?.sessionId).toBe("s");
     expect(j).toEqual({ covered_seq: 3, locked_until: null, due: true });
     expect((await claimSummaryJob(t.sql))?.sessionId).toBe("s");
+  } finally { await t.drop(); }
+});
+
+/** Two dead summary jobs (s1, s2) and one live one (s3). */
+async function deadJobs(t: any) {
+  const { binding } = await boundFolder(t);
+  await ingest(t, { sessions: ["s1", "s2", "s3"].map((id) => sess(id, binding.id)) });
+  for (const id of ["s1", "s2", "s3"]) await enqueueSummary(t.sql, id, { priority: 0 });
+  await t.sql`update summary_jobs set dead = true, attempts = 5, last_error = 'boom', due_at = now() + interval '6 hours'
+    where session_id in ('s1', 's2')`;
+}
+
+test("requeueDeadSummaries revives dead summary jobs: attempts reset, due now, claimable", async () => {
+  const t = await authedApp();
+  try {
+    await deadJobs(t);
+    expect(await requeueDeadSummaries(t.sql)).toBe(2);
+    const rows = await t.sql`
+      select session_id, dead, attempts, last_error, locked_until, due_at <= now() as due from summary_jobs order by session_id`;
+    expect(rows.map((r: any) => [r.session_id, r.dead, r.attempts, r.last_error, r.locked_until, r.due])).toEqual([
+      ["s1", false, 0, null, null, true], ["s2", false, 0, null, null, true], ["s3", false, 0, null, null, true],
+    ]);
+    expect(await requeueDeadSummaries(t.sql)).toBe(0);
+  } finally { await t.drop(); }
+});
+
+test("cli requeue-dead-summaries revives dead summary jobs; requeue-dead covers chunks and summaries", async () => {
+  const t = await authedApp();
+  try {
+    await deadJobs(t);
+    const env = { ...process.env, DATABASE_URL: t.url };
+    let p = Bun.spawnSync(["bun", "server/src/cli.ts", "requeue-dead-summaries"], { env });
+    expect(p.stdout.toString()).toContain("requeued 2 summary job(s)");
+    expect((await t.sql`select count(*)::int as n from summary_jobs where dead`)[0].n).toBe(0);
+
+    await t.sql`update summary_jobs set dead = true, attempts = 5 where session_id = 's1'`;
+    p = Bun.spawnSync(["bun", "server/src/cli.ts", "requeue-dead"], { env });
+    const out = p.stdout.toString();
+    expect(out).toContain("requeued 0 chunk(s)");
+    expect(out).toContain("requeued 1 summary job(s)");
+    expect((await t.sql`select count(*)::int as n from summary_jobs where dead`)[0].n).toBe(0);
   } finally { await t.drop(); }
 });

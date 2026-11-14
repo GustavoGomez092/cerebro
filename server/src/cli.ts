@@ -3,19 +3,24 @@ import { connect, migrate } from "./db";
 import { createToken, revokeToken } from "./auth";
 import { redactSession } from "./redact-session";
 import { requeueDead } from "./worker";
+import { requeueDeadSummaries } from "./summarise/jobs";
 
 const usage = [
   "usage: bun server/src/cli.ts token create|revoke <machine>",
   "       bun server/src/cli.ts token list",
   "       bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret and rebuild its search index",
-  "       bun server/src/cli.ts requeue-dead                  # retry chunks the embedder gave up on",
+  "       bun server/src/cli.ts requeue-dead                  # retry chunks and summary jobs that were given up on",
+  "       bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only",
 ].join("\n");
 
 async function main(argv: string[]) {
   const [area, cmd, name] = argv;
-  if (area === "requeue-dead") {
+  if (area === "requeue-dead" || area === "requeue-dead-summaries") {
     const sql = connect(loadConfig(process.env).databaseUrl);
-    try { console.log(`requeued ${await requeueDead(sql)} chunk(s)`); } finally { await sql.close(); }
+    try {
+      if (area === "requeue-dead") console.log(`requeued ${await requeueDead(sql)} chunk(s)`);
+      console.log(`requeued ${await requeueDeadSummaries(sql)} summary job(s)`);
+    } finally { await sql.close(); }
     return;
   }
   if (area === "redact" && cmd) {

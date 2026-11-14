@@ -290,11 +290,15 @@ test("a binding declined after the claim defers without calling claude", async (
   } finally { await t.drop(); }
 });
 
-test("timeouts count as attempts, dead-letter after five, and charge their estimated spend", async () => {
+/** Whether a call is the CLI health probe (not a summary or state call). */
+const isProbe = (input: ClaudeInput) => "ok" in ((input.schema as any).properties ?? {});
+
+test("timeouts with a working CLI count as attempts, dead-letter after five, and charge their estimated spend", async () => {
   const t = await authedApp();
   try {
     let { job } = await endedSession(t);
-    const slow = (input: ClaudeInput) => fakeRun("slow")({ ...input, timeoutMs: 200 });
+    // The summary call times out, but the CLI answers a probe: the job is to blame.
+    const slow = (input: ClaudeInput) => isProbe(input) ? fakeRun("ok")(input) : fakeRun("slow")({ ...input, timeoutMs: 200 });
     for (let i = 1; i <= 5; i++) {
       expect(await summariseJob(t.sql, t.embedder, job, { run: slow, budget: BUDGET }))
         .toMatchObject({ status: "failed", reason: "timeout" });
@@ -302,7 +306,7 @@ test("timeouts count as attempts, dead-letter after five, and charge their estim
       expect(j).toEqual({ attempts: i, dead: i === 5 });
       if (i < 5) job = await reclaim(t);
     }
-    const rows = await t.sql`select tokens, kind from usage_ledger`;
+    const rows = await t.sql`select tokens, kind from usage_ledger where tokens > 100`;
     expect(rows).toHaveLength(5);
     for (const r of rows) {
       expect(r.kind).toBe("summary");
@@ -346,5 +350,43 @@ test("a call killed by a stop is not counted as a failure", async () => {
     const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
     expect(j).toEqual({ attempts: 0, dead: false });
     expect((await t.sql`select tokens from usage_ledger`)[0]?.tokens).toBeGreaterThan(4000);
+  } finally { await t.drop(); }
+});
+
+test("an outage (missing CLI, connection error, 5xx, 529, hung CLI) defers without attempts and never dead-letters", async () => {
+  const t = await authedApp();
+  try {
+    let { job } = await endedSession(t);
+    const missing = (input: ClaudeInput) =>
+      runClaude(input, { ...process.env, SUMMARISER_CMD: "/nonexistent/claude-bin" } as NodeJS.ProcessEnv);
+    const hung = (input: ClaudeInput) => fakeRun("slow")({ ...input, timeoutMs: 200 });
+    const outages = [missing, fakeRun("connection"), fakeRun("overloaded"), fakeRun("server500"), hung, fakeRun("crash"), missing, hung];
+    for (const run of outages) {
+      const res = await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET });
+      expect(res).toMatchObject({ status: "deferred", reason: "unavailable", scopes: [] });
+      expect(res.until).toBeInstanceOf(Date);
+      const [j] = await t.sql`select attempts, dead, locked_until, last_error from summary_jobs where session_id = 's1'`;
+      expect([j.attempts, j.dead, j.locked_until]).toEqual([0, false, null]);
+      expect(j.last_error).toMatch(/^unavailable|^timeout/);
+      job = await reclaim(t);
+    }
+    // A hung call during an outage is not charged as if it had spent a whole transcript.
+    const [{ n }] = await t.sql`select coalesce(sum(tokens), 0)::int as n from usage_ledger`;
+    expect(n).toBeLessThan(1000);
+    // Once the CLI is back the job is summarised as usual.
+    expect(await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET })).toMatchObject({ status: "done" });
+    expect(await t.sql`select 1 from summaries`).toHaveLength(1);
+  } finally { await t.drop(); }
+});
+
+test("a failure the CLI survives (it answers a probe) is the job's fault and counts as an attempt", async () => {
+  const t = await authedApp();
+  try {
+    const { job } = await endedSession(t);
+    const run = (input: ClaudeInput) => fakeRun(isProbe(input) ? "ok" : "crash")(input);
+    expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET }))
+      .toMatchObject({ status: "failed", reason: "failed" });
+    const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ attempts: 1, dead: false });
   } finally { await t.drop(); }
 });

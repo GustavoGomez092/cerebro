@@ -46,6 +46,46 @@ day's volume across the Macs. When the budget runs out, live jobs wait until the
 (`/v1/status` `summariser.paused.reason: "budget"`), so nothing is lost. If your plan allows more, raise
 `SUBSCRIPTION_TOKENS_PER_5H`; to spend less, lower `SUMMARY_SHARE`.
 
+#### Summariser status and recovery
+
+`GET /v1/status` carries a `summariser` block:
+
+```json
+"summariser": {
+  "enabled": true,
+  "paused": { "reason": "login", "until": null },
+  "lastRunAt": "2026-11-14T09:12:00.000Z",
+  "lastError": "summary: login",
+  "credentialExpiresAt": "2026-12-01T00:00:00.000Z",
+  "backlog": { "live": 3, "imported": 120, "dead": 0 },
+  "budget": { "used": 182000, "limit": 400000, "resumesAt": null }
+}
+```
+
+- `paused` is `null` while the loop runs, else `{reason, until}` (`until` is an ISO time or `null`):
+  - `budget`: the summariser's share of the 5-hour window is spent; it resumes at `until` by itself.
+  - `usage_limit`: the subscription itself hit its limit; it resumes at the reset time the CLI reported.
+  - `login`: the `claude` login on the server has expired or was never made. Nothing is summarised (raw
+    capture and search carry on) until you log in again: run `claude auth login` inside the server
+    container (as the user the server runs as, so the same `CLAUDE_CONFIG_DIR`). A tiny probe call every
+    15 minutes notices the new login and the loop resumes by itself; `until` is `null`.
+  - `unavailable`: an outage, not a problem with any one session: the `claude` CLI is missing or will not
+    start, the network is down, or the API answers 5xx/529 "overloaded" or not at all. The loop probes
+    again at `until` (after 2 minutes, backing off to every 30 minutes) and resumes when the probe
+    answers. Outages never count against a job, so however long one lasts, nothing is dead-lettered.
+  - `disabled`: `SUMMARISER_ENABLED` is off; queued jobs stay queued.
+- `backlog`: summary jobs waiting, `live` (sessions recorded live) and `imported` (opted-in history, done
+  after live work), and `dead`: jobs given up on after five failures that were the session's own fault
+  (output that never matched the schema, a call that kept timing out while the CLI otherwise worked).
+- `budget`: tokens `used` in the current rolling 5-hour window, the summariser's `limit`
+  (`SUMMARY_SHARE × SUBSCRIPTION_TOKENS_PER_5H`), and `resumesAt` when it is over the limit.
+- `credentialExpiresAt`: when the CLI's login expires, as the last successful call reported it. Log in
+  again before then to avoid a `login` pause.
+- `lastError` names the failing step and class only (`summary: timeout`), never model or transcript text.
+
+To retry dead summary jobs (for example after fixing whatever made them fail), run
+`bun server/src/cli.ts requeue-dead-summaries`; `requeue-dead` retries both dead chunks and dead summary jobs.
+
 ## Running the server locally
 
 ```sh
@@ -79,7 +119,7 @@ project; anything else may search all clients. Repo spellings are normalised ser
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | `{ok, db, apiVersion, instanceId}` — no auth; clients check `instanceId` before sending data |
-| `GET /v1/status` | Calling machine, embed queue (`pending`, `dead`, `oldestPendingSeconds`), embedder state, DB size |
+| `GET /v1/status` | Calling machine, embed queue (`pending`, `dead`, `oldestPendingSeconds`), embedder state, summariser (see [Summariser status and recovery](#summariser-status-and-recovery)), DB size |
 | `GET/POST /v1/clients`, `GET /v1/clients/:id/projects`, `POST /v1/projects` | Clients and projects (create is idempotent by name) |
 | `GET /v1/bindings/resolve?repo=&subpath=` | Most specific binding for a folder |
 | `PUT /v1/bindings` | Bind or decline a folder; changing an existing binding needs `rebind: true` (moves/holds its history) |
@@ -99,6 +139,8 @@ project; anything else may search all clients. Repo spellings are normalised ser
 
 ```sh
 DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret, rebuild its search index
+DATABASE_URL=… bun server/src/cli.ts requeue-dead                  # retry dead chunks and dead summary jobs
+DATABASE_URL=… bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only
 ```
 
 Secrets are redacted at ingest (known key formats, bearer tokens, URL passwords, `*_PASSWORD=`-style

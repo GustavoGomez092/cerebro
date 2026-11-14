@@ -119,8 +119,16 @@ test("newer limit wording is usage_limit; 'resets <time>' without an epoch gives
   }
 });
 
-test("missing binary is failed, not a throw", async () => {
+test("missing binary is unavailable (not the job's fault), not a throw", async () => {
   const r = await runClaude(input, { ...process.env, SUMMARISER_CMD: "/nonexistent/claude-bin" } as NodeJS.ProcessEnv);
   expect(r.ok).toBe(false);
-  if (!r.ok) expect(r.kind).toBe("failed");
+  if (!r.ok) expect(r.kind).toBe("unavailable");
+});
+
+test("connection errors, 5xx, 529 overloaded and a silent crash are unavailable", async () => {
+  for (const mode of ["overloaded", "server500", "connection", "crash"]) {
+    const r = await runClaude(input, base(mode));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect([mode, r.kind]).toEqual([mode, "unavailable"]);
+  }
 });

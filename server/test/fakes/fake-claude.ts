@@ -1,6 +1,7 @@
 export {};
 // Stand-in for the `claude` CLI. Run as: SUMMARISER_CMD="bun server/test/fakes/fake-claude.ts"
 // Mode comes from FAKE_CLAUDE_MODE: ok (default) | structured | echo | limit | auth | garbage | notjson | slow
+//   | overloaded (529) | server500 | connection ("API Error: Connection error.") | crash (exit 3, no output)
 //   | missing (summary without required fields) | hostile (oversized fields, secrets, extra keys)
 // "ok" answers in the shape of the --json-schema it is given: a summary object for SUMMARY_SCHEMA, a project
 // state for STATE_SCHEMA (the fenced current state with the fenced new summaries folded in: decisions, facts
@@ -182,6 +183,17 @@ switch (mode) {
   case "auth":
     emit(failure("Invalid API key - Please run /login"));
     process.exit(1);
+  case "overloaded":
+    emit({ ...failure('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'), api_error_status: 529 });
+    process.exit(1);
+  case "server500":
+    emit({ ...failure("API Error: 500 Internal server error"), api_error_status: 500 });
+    process.exit(1);
+  case "connection":
+    emit(failure("API Error: Connection error."));
+    process.exit(1);
+  case "crash":
+    process.exit(3);
   case "missing":
     emit(envelope({ result: JSON.stringify({ title: "only a title" }) }));
     break;

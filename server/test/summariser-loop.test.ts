@@ -193,6 +193,63 @@ test("a login probe that still fails keeps the loop paused", async () => {
   }
 });
 
+test("an outage pauses the loop as unavailable without dead-lettering, and it resumes when a probe succeeds", async () => {
+  const { t, state } = await setup();
+  const c = clock();
+  const cli = fakeCli("connection");
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, now: c.now, manual: true, log: quiet });
+  try {
+    const { binding } = await boundFolder(t, { project: "Web" });
+    await endedSession(t, binding.id, "s1", "osprey");
+    await endedSession(t, binding.id, "s2", "heron");
+
+    await loop.tick();
+    expect(cli.calls).toHaveLength(2); // the summary call, then a probe that fails too
+    expect(state.paused?.reason).toBe("unavailable");
+    const firstUntil = Date.parse(state.paused!.until!);
+    expect(firstUntil).toBeGreaterThan(c.now().getTime());
+    const s = await status(t);
+    expect(s.paused.reason).toBe("unavailable");
+    expect(s.lastError).toBe("summary: unavailable");
+
+    // Paused: nothing runs before `until`.
+    await loop.tick();
+    expect(cli.calls).toHaveLength(2);
+
+    // A long outage (a day): only a tiny probe now and then, backing off; no job ever charged an attempt.
+    let probes = 0;
+    let lastGap = 0;
+    for (let i = 0; i < 48; i++) {
+      c.advance(30 * MIN);
+      const before = cli.calls.length;
+      await loop.tick();
+      for (const call of cli.calls.slice(before)) expect(call.prompt.length).toBeLessThan(100);
+      probes += cli.calls.length - before;
+      expect(state.paused?.reason).toBe("unavailable");
+      lastGap = Date.parse(state.paused!.until!) - c.now().getTime();
+    }
+    expect(probes).toBeGreaterThan(10);
+    expect(probes).toBeLessThanOrEqual(48);
+    expect(lastGap).toBeLessThanOrEqual(30 * MIN);
+    const jobs = await t.sql`select session_id, attempts, dead from summary_jobs order by session_id`;
+    expect(jobs).toEqual([
+      { session_id: "s1", attempts: 0, dead: false }, { session_id: "s2", attempts: 0, dead: false },
+    ]);
+    expect((await status(t)).backlog).toEqual({ live: 2, imported: 0, dead: 0 });
+
+    // Back online: the next probe succeeds and both sessions are summarised.
+    cli.mode = "ok";
+    c.advance(31 * MIN);
+    await loop.tick();
+    expect(state.paused).toBeNull();
+    expect(await t.sql`select * from summary_jobs`).toHaveLength(0);
+    expect((await t.sql`select session_id from summaries order by session_id`).map((r: any) => r.session_id)).toEqual(["s1", "s2"]);
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
 test("disabled summariser leaves jobs queued", async () => {
   const cfg = { ...CFG, enabled: false };
   const { t, state } = await setup(cfg);
