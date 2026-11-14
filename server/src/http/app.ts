@@ -4,6 +4,7 @@ import { bearerAuth, type Machine } from "../auth";
 import { statusRoutes } from "./routes/status";
 import { catalogRoutes } from "./routes/catalog";
 import { bindingRoutes } from "./routes/bindings";
+import { ingestRoutes } from "./routes/ingest";
 
 export interface AppDeps { sql: SQL; embedder: unknown }
 export type Env = { Variables: { machine: Machine } };
@@ -19,5 +20,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.route("/v1", statusRoutes(deps));
   app.route("/v1", catalogRoutes(deps));
   app.route("/v1", bindingRoutes(deps));
+  app.route("/v1", ingestRoutes(deps));
   return app;
 }
