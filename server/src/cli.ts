@@ -2,15 +2,22 @@ import { loadConfig } from "./config";
 import { connect, migrate } from "./db";
 import { createToken, revokeToken } from "./auth";
 import { redactSession } from "./redact-session";
+import { requeueDead } from "./worker";
 
 const usage = [
   "usage: bun server/src/cli.ts token create|revoke <machine>",
   "       bun server/src/cli.ts token list",
   "       bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret and rebuild its search index",
+  "       bun server/src/cli.ts requeue-dead                  # retry chunks the embedder gave up on",
 ].join("\n");
 
 async function main(argv: string[]) {
   const [area, cmd, name] = argv;
+  if (area === "requeue-dead") {
+    const sql = connect(loadConfig(process.env).databaseUrl);
+    try { console.log(`requeued ${await requeueDead(sql)} chunk(s)`); } finally { await sql.close(); }
+    return;
+  }
   if (area === "redact" && cmd) {
     const sql = connect(loadConfig(process.env).databaseUrl);
     try {

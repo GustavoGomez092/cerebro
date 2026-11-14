@@ -63,8 +63,10 @@ export async function ingestBatch(
   // --- sessions -----------------------------------------------------------------------------
   const sessions: any[] = [];
   for (const raw of batch.sessions) {
-    const p = sessionSchema.safeParse(raw);
     const id = strOrNull((raw as any)?.id);
+    // Depth first: everything below walks the value recursively.
+    if (depth(raw, INGEST_LIMITS.maxDepth + 2) > INGEST_LIMITS.maxDepth + 1) { rejected.push({ sessionId: id ?? "", code: "invalid_session" }); continue; }
+    const p = sessionSchema.safeParse(raw);
     if (!p.success) { rejected.push({ sessionId: id ?? "", code: "invalid_session" }); continue; }
     const s = p.data;
     const owner = pathIdentityMachine(s.repo);
@@ -84,13 +86,11 @@ export async function ingestBatch(
   const events: any[] = [];
   for (const raw of batch.events) {
     const key = strOrNull((raw as any)?.key), sessionId = strOrNull((raw as any)?.sessionId);
+    // Depth first (the event object itself is one level): everything below walks values recursively.
+    if (depth(raw, INGEST_LIMITS.maxDepth + 2) > INGEST_LIMITS.maxDepth + 1) { rejected.push({ key, sessionId, code: "too_deep" }); continue; }
     const p = eventSchema.safeParse(raw);
     if (!p.success) { rejected.push({ key, sessionId, code: "invalid_event" }); continue; }
     const e = p.data;
-    if (depth(e.toolInput, INGEST_LIMITS.maxDepth + 1) > INGEST_LIMITS.maxDepth || depth(e.meta, INGEST_LIMITS.maxDepth + 1) > INGEST_LIMITS.maxDepth) {
-      rejected.push({ key, sessionId, code: "too_deep" });
-      continue;
-    }
     events.push({
       session_id: storable(e.sessionId), key: storable(e.key), seq: e.seq, ts: e.ts, kind: e.kind,
       text: clean(e.text) as string, tool_name: e.toolName === undefined ? null : storable(e.toolName),
@@ -98,6 +98,16 @@ export async function ingestBatch(
     });
   }
   events.sort((a, b) => (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+  // The same session twice in one batch: keep the first, merge later metadata into it.
+  const byId = new Map<string, any>();
+  for (const s of sessions) {
+    const prev = byId.get(s.id);
+    if (prev) prev.meta = { ...prev.meta, ...s.meta };
+    else byId.set(s.id, s);
+  }
+  sessions.length = 0;
+  sessions.push(...byId.values());
 
   return sql.begin(async (tx) => {
     // Sessions whose binding is unknown are rejected; declined bindings are accepted (held).

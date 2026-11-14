@@ -58,7 +58,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
     const state = pgState(err);
     // Log only the error class and code: messages can quote stored conversation text.
     log(JSON.stringify({ level: "error", t: new Date().toISOString(), path: c.req.path, machine: c.get("machine")?.name ?? null, pg: state, error: err.name }));
-    if (state?.startsWith("22")) return c.json({ error: "invalid_data", message: "the database rejected a value in this request" }, 422);
+    // 22 data exceptions, 21 cardinality, 54 program limits: the request's data, not a server fault.
+    if (state && /^(22|21|54)/.test(state)) return c.json({ error: "invalid_data", message: "the database rejected a value in this request" }, 422);
     return c.json({ error: "internal", message: "internal error" }, 500);
   });
   return app;

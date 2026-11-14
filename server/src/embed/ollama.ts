@@ -20,8 +20,9 @@ export function ollamaEmbedder(
           signal: AbortSignal.any(signals),
         });
         if (!res.ok) {
-          // 502/503/504: the server is overloaded or restarting, not a problem with these texts.
-          throw new EmbedderError(`embedder returned ${res.status}`, { transient: [502, 503, 504].includes(res.status) });
+          // 404 (model missing), 500 (out of memory, crashed runner), 502–504 (overloaded/restarting):
+          // the embedder is broken, not these texts. 400 and other 4xx point at the input.
+          throw new EmbedderError(`embedder returned ${res.status}`, { transient: [404, 500, 502, 503, 504].includes(res.status) });
         }
         ({ embeddings } = (await res.json()) as { embeddings?: unknown });
       } catch (e) {

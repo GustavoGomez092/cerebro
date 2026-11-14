@@ -30,6 +30,8 @@ export interface WorkerState {
 export const newWorkerState = (): WorkerState => ({ pausedUntil: 0, pauseMs: 0, lastSuccessAt: null, lastError: null });
 
 const PAUSE_MIN_MS = 5_000, PAUSE_MAX_MS = 5 * 60_000;
+/** Known-good text: if it fails too, the embedder is broken and no chunk is to blame. */
+const CANARY = "cerebro embedder health check";
 const RETRY_BASE_S = 30, RETRY_MAX_S = 6 * 3600;
 
 interface Claimed { chunk_id: number; text: string }
@@ -114,6 +116,11 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
     if (pending.length) await sql`update embed_queue set locked_until = null where chunk_id = any(${sql.array(pending.map((x) => x.chunk_id), "int8")})`;
   };
   const isTransient = (e: unknown) => e instanceof EmbedderError && e.transient;
+  let canaryOk: boolean | null = null;
+  const embedderHealthy = async () => {
+    if (canaryOk === null) canaryOk = await embedder.embed([CANARY]).then(() => true, () => false);
+    return canaryOk;
+  };
 
   for (const [bi, batch] of batches.entries()) {
     await opts.gate?.whenIdle();
@@ -129,13 +136,24 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
       try {
         await store([item], await embedder.embed([item.text]));
       } catch (e) {
-        if (isTransient(e)) { await pause([...batch.slice(ii), ...batches.slice(bi + 1).flat()], e as Error); return result; }
+        if (isTransient(e) || !(await embedderHealthy())) {
+          await pause([...batch.slice(ii), ...batches.slice(bi + 1).flat()], e as Error);
+          return result;
+        }
         state.lastError = (e as Error).message;
         await charge(item, e as Error);
       }
     }
   }
   return result;
+}
+
+/** Puts dead-lettered chunks back in the queue (after fixing the embedder). Returns how many. */
+export async function requeueDead(sql: SQL): Promise<number> {
+  const rows = await sql`
+    update embed_queue set dead = false, attempts = 0, next_attempt_at = now(), locked_until = null, last_error = null
+    where dead returning chunk_id`;
+  return rows.length;
 }
 
 /** Runs embedPending continuously; never throws. */

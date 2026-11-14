@@ -27,3 +27,23 @@ test("ordinary text is left alone", () => {
   }
   expect(redactSecrets("postgres://app@db/x")).toBe("postgres://app@db/x");
 });
+
+test("ordinary configuration and code is not mistaken for secrets", () => {
+  for (const s of [
+    "const API_KEY = process.env.API_KEY",
+    "TOKEN_ENDPOINT=https://auth.example.com/oauth/token",
+    "GITHUB_TOKEN_URL='https://github.com/login/oauth'",
+    "DB_PASSWORD_FILE=/run/secrets/db_password",
+    "MAX_TOKENS: 100000000",
+    "API_KEY=${API_KEY}",
+    "SECRET_NAME=my_secret_name",
+    'class="sk-spinner-fading-circle-large"',
+    "import sk-learn-preprocessing-pipeline",
+  ]) expect(redactSecrets(s)).toBe(s);
+});
+
+test("real-looking env secrets are still redacted", () => {
+  expect(redactSecrets("DB_PASSWORD=correct-horse-battery")).toContain("[REDACTED");
+  expect(redactSecrets("API_KEY=9f8a7b6c5d4e3f2a1b0c")).toContain("[REDACTED");
+  expect(redactSecrets("export STRIPE_SECRET_KEY='rk_live_51H8abcdEFGH'")).toContain("[REDACTED");
+});

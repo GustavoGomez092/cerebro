@@ -14,13 +14,17 @@ export async function redactSession(sql: SQL, sessionId: string, pattern?: strin
     return extra ? r.replace(extra, "[REDACTED:manual]") : r;
   };
   return sql.begin(async (tx) => {
-    const rows = await tx`select id, seq, ts, kind, text, tool_name, tool_input from events where session_id = ${sessionId} order by seq`;
+    const [s] = await tx`select cwd, meta from sessions where id = ${sessionId}`;
+    if (s) await tx`update sessions set cwd = ${scrub(s.cwd)}, meta = ${JSON.stringify(mapStrings(s.meta, scrub))}::text::jsonb where id = ${sessionId}`;
+    const rows = await tx`select id, seq, ts, kind, text, tool_name, tool_input, meta from events where session_id = ${sessionId} order by seq`;
     let changed = 0;
     for (const r of rows) {
       const text = scrub(r.text);
       const toolInput = r.tool_input == null ? null : mapStrings(r.tool_input, scrub);
-      if (text === r.text && JSON.stringify(toolInput) === JSON.stringify(r.tool_input)) continue;
-      await tx`update events set text = ${text}, tool_input = ${toolInput === null ? null : JSON.stringify(toolInput)}::text::jsonb where id = ${r.id}`;
+      const meta = mapStrings(r.meta, scrub);
+      if (text === r.text && JSON.stringify(toolInput) === JSON.stringify(r.tool_input) && JSON.stringify(meta) === JSON.stringify(r.meta)) continue;
+      await tx`update events set text = ${text}, tool_input = ${toolInput === null ? null : JSON.stringify(toolInput)}::text::jsonb,
+               meta = ${JSON.stringify(meta)}::text::jsonb where id = ${r.id}`;
       r.text = text;
       r.tool_input = toolInput;
       changed++;
