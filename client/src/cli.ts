@@ -2,6 +2,7 @@ import { ApiClient } from "./api";
 import { loadClientConfig } from "./config";
 import { flush, type FlushOptions } from "./flush";
 import { handleHook, HOOK_EVENTS, type HookEvent } from "./hooks";
+import { checkInstance } from "./instance";
 import { logError } from "./log";
 import { Store } from "./store";
 
@@ -55,15 +56,7 @@ const flushCommand: Command = {
         const api = new ApiClient(config);
         const r = await flush(store, api, opts);
         if (r.outcome === "error") logError("flush", "flush ended with an unexpected error");
-        // "done"/"nothing" mean /health matched the pinned instance, so the token may be sent.
-        if ((r.outcome === "done" || r.outcome === "nothing") && !store.get("machine")) {
-          try {
-            const { machine } = await api.status({ timeoutMs: MACHINE_TIMEOUT_MS });
-            if (machine) store.set("machine", machine);
-          } catch (e) {
-            logError("flush status", e);
-          }
-        }
+        await learnMachineName(store, api);
         await Bun.write(Bun.stdout, JSON.stringify(r) + "\n");
       } finally {
         store.close();
@@ -73,6 +66,18 @@ const flushCommand: Command = {
     }
   },
 };
+
+/** Caches the server's name for this Mac (state `machine`), asking only a pinned, unblocked, verified instance. */
+async function learnMachineName(store: Store, api: ApiClient): Promise<void> {
+  if (store.get("machine") || !store.get("instanceId") || store.get("blocked")) return;
+  try {
+    if ((await checkInstance(store, api, { timeoutMs: MACHINE_TIMEOUT_MS })) !== "ok") return;
+    const { machine } = await api.status({ timeoutMs: MACHINE_TIMEOUT_MS });
+    if (machine) store.set("machine", machine);
+  } catch (e) {
+    logError("flush status", e);
+  }
+}
 
 export const COMMANDS: Record<string, Command> = {
   hook,

@@ -3,6 +3,7 @@ import type { ApiClient } from "./api";
 import { buildBrief } from "./brief";
 import { captureTranscript, type CaptureResult } from "./capture";
 import { folderIdentity, type FolderIdentity } from "./identity";
+import { checkInstance } from "./instance";
 import { logError } from "./log";
 import { claudeCodeSource } from "./sources/claude-code";
 import { spawnDetached } from "./spawn";
@@ -55,6 +56,15 @@ const PROBLEMS: Record<BlockedReason, string> = {
     "Check the server URL; if the server was reinstalled, run `cerebro reset-instance`.",
 };
 
+/**
+ * Non-interactive runs are never recorded or prompted: Cerebro's own summariser (CEREBRO_HEADLESS=1),
+ * and `claude -p` / SDK sessions, which Claude Code marks with CLAUDE_CODE_ENTRYPOINT=sdk-* and
+ * CLAUDE_CODE_SESSION_ATTENDED=0 in the hook's environment.
+ */
+export function isHeadless(env: Record<string, string | undefined>): boolean {
+  return env.CEREBRO_HEADLESS === "1" || (env.CLAUDE_CODE_ENTRYPOINT ?? "").startsWith("sdk") || env.CLAUDE_CODE_SESSION_ATTENDED === "0";
+}
+
 /** Runs one hook and returns what to print on stdout (JSON or ""). Never throws. */
 export async function handleHook(event: HookEvent, input: HookInput, deps: HookDeps): Promise<string> {
   const spawn = (args: string[]) => {
@@ -62,6 +72,7 @@ export async function handleHook(event: HookEvent, input: HookInput, deps: HookD
   };
   const i: HookInput = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   try {
+    if (isHeadless(deps.env)) return ""; // no capture, no network, no spawns
     switch (event) {
       case "SessionStart":
         try { return await sessionStart(i, deps, spawn); } finally { spawn(["flush"]); }
@@ -71,12 +82,15 @@ export async function handleHook(event: HookEvent, input: HookInput, deps: HookD
         return "";
       case "SessionEnd": {
         // No network here: Claude Code gives SessionEnd hooks ~1.5 s, so the detached flush ends the session.
-        let r: CaptureResult | null = null;
+        let end = false;
         try {
-          r = captureSession(i, deps);
+          const r = captureSession(i, deps);
+          // End any session tied to a binding, even if its transcript is gone; the server ignores unknown ones.
+          const cursor = i.transcript_path ? deps.store.getCursor(i.transcript_path) : undefined;
+          end = r?.status !== "headless" && (r?.status === "recorded" || !!cursor?.bindingId);
           if (i.reason !== "clear" && i.transcript_path) deps.store.markDone(i.transcript_path);
         } finally {
-          spawn(r?.status === "recorded" && i.session_id ? ["flush", "--end", i.session_id, new Date().toISOString()] : ["flush"]);
+          spawn(end && i.session_id ? ["flush", "--end", i.session_id, new Date().toISOString()] : ["flush"]);
         }
         return "";
       }
@@ -108,8 +122,7 @@ function captureSession(input: HookInput, { store, machine, env }: HookDeps): Ca
 type Left = () => number;
 
 async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: string[]) => void): Promise<string> {
-  const { store, api, env } = deps;
-  if (env.CEREBRO_HEADLESS === "1") return "";
+  const { store, api } = deps;
   if (!api) return context(NOT_CONFIGURED_CONTEXT);
   const cwd = input.cwd;
   if (!cwd) return "";
@@ -153,19 +166,11 @@ async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: stri
   return context(brief);
 }
 
-/** Checks the unauthenticated /health against the pinned instance, so an impostor never sees the token. */
+/** True when the configured server is the pinned instance; until then no request carries the token. */
 async function verifyInstance(store: Store, api: ApiClient, left: Left): Promise<boolean> {
   if (store.get("blocked") === "instance_mismatch" || left() < MIN_CALL_MS) return false;
   try {
-    const h = await api.health({ timeoutMs: left() });
-    if (!h.ok || !h.instanceId) return false;
-    const pinned = store.get("instanceId");
-    if (pinned === undefined) store.set("instanceId", h.instanceId);
-    else if (pinned !== h.instanceId) {
-      store.set("blocked", "instance_mismatch" satisfies BlockedReason);
-      return false;
-    }
-    return true;
+    return (await checkInstance(store, api, { timeoutMs: left() })) === "ok";
   } catch (e) {
     logError("SessionStart health", e);
     return false;
