@@ -149,9 +149,9 @@ first_run_setup() {
     printf '%s\n' "DATABASE_URL=postgres://cerebro:$pw@cerebro-db:5432/cerebro" SUMMARY_SHARE=0.2 \
       SUBSCRIPTION_TOKENS_PER_5H=2000000 SUMMARISER_ENABLED=true \
       "# SUMMARISER_CMD=claude (set in the image; the CLI pinned in server/Dockerfile)" \
-      "# Embed on the Mac mini's Ollama first, falling back to cerebro-ollama (EMBED_URL): uncomment both, redeploy." \
-      "# The primary is skipped while its bge-m3 digest differs. See deploy/zima/README.md." \
-      "# EMBED_PRIMARY_URL=http://192.168.4.42:11434" \
+      "# Each Mac embeds its own work on its own Ollama (machine-token name=URL), cerebro-ollama (EMBED_URL) the" \
+      "# fallback: uncomment both, redeploy. A Mac whose bge-m3 digest differs is skipped. See deploy/zima/README.md." \
+      "# EMBED_MACHINE_URLS=mac-mini=http://192.168.4.42:11434,macbook-pro=http://192.168.4.45:11434" \
       "# EMBED_MODEL_DIGEST=790764642607" |
       secret_write "$secrets/server.env"
     echo "secrets: wrote server.env"

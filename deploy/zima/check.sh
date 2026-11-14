@@ -96,20 +96,25 @@ else
     fail embedder "$pending pending, last success $last"
   fi
 
-  # embedder.primary (server/src/embed/failover.ts): with EMBED_PRIMARY_URL set, the Mac mini's Ollama embeds and
-  # the Zima's own container is the fallback. A fallback still embeds everything, ~70x slower: warn, never fail.
-  route_state=$(jq -r '.embedder.primary.state // "unset"' <<<"$status")
-  route_url=$(jq -r '.embedder.primary.url // empty' <<<"$status")
-  route_error=$(jq -r '.embedder.primary.lastError // empty' <<<"$status")
-  route_used=$(jq -r '.embedder.lastUsed // empty' <<<"$status")
-  case $route_state in
-    down) warn embed-route "embedding on the Zima CPU (slow): Mac mini Ollama unreachable at $route_url${route_error:+ ($route_error)}" ;;
-    digest_mismatch) warn embed-route "embedding on the Zima CPU (slow): Mac mini Ollama mismatch at $route_url${route_error:+ ($route_error)}" ;;
-    up) ok embed-route "Mac mini Ollama at $route_url${route_used:+ (last embedding: $route_used)}" ;;
-    unknown) ok embed-route "Mac mini Ollama at $route_url not tried since the server started" ;;
-    unset) ok embed-route "Zima Ollama only (EMBED_PRIMARY_URL unset)" ;;
-    *) warn embed-route "unknown primary state $route_state" ;;
-  esac
+  # embedder.endpoints (server/src/embed/failover.ts): with EMBED_MACHINE_URLS set, each Mac embeds its own work on
+  # its own Ollama. While one is down or mismatched, its chunks wait or embed on the Zima CPU (~70x slower) and
+  # its searches use the Zima: warn per machine, never fail.
+  route_ok=""
+  while IFS=$'\t' read -r e_machine e_state e_url e_error; do
+    [[ -n $e_machine ]] || continue
+    case $e_state in
+      down) warn embed-route "$e_machine: embedding on the Zima CPU (slow): its Ollama is unreachable at $e_url${e_error:+ ($e_error)}" ;;
+      digest_mismatch) warn embed-route "$e_machine: embedding on the Zima CPU (slow): its Ollama has a different bge-m3 (mismatch) at $e_url${e_error:+ ($e_error)}" ;;
+      up) route_ok="$route_ok, $e_machine up" ;;
+      unknown) route_ok="$route_ok, $e_machine not tried yet" ;;
+      *) warn embed-route "$e_machine: unknown endpoint state $e_state" ;;
+    esac
+  done < <(jq -r '.embedder.endpoints[]? | [.machine, .state, .url, (.lastError // "")] | @tsv' <<<"$status")
+  if ! jq -e '(.embedder.endpoints // []) | length > 0' >/dev/null <<<"$status"; then
+    ok embed-route "Zima Ollama only (EMBED_MACHINE_URLS unset)"
+  elif [[ -n $route_ok ]]; then
+    ok embed-route "${route_ok#, } (each Mac embeds its own work)"
+  fi
 
   # summariser.paused.reason (server/src/summarise/loop.ts PauseReason): login and unavailable need the owner;
   # budget and usage_limit are normal deferral that ends by itself; disabled is SUMMARISER_ENABLED=false.
