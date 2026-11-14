@@ -44,9 +44,10 @@ async function addSummary(
       title: o.title, period: `2026-11-${o.day}`, overview: `Overview of ${o.title}`,
       decisions: o.decisions ?? [], changes: [], facts: o.facts ?? [], open_threads: o.open ?? [], resolved_threads: o.resolved ?? [],
     };
-  const from = new Date(Date.UTC(2026, 10, o.day, 9)).toISOString();
-  const to = new Date(Date.UTC(2026, 10, o.day, 11)).toISOString();
   const first = (seqBase += 10);
+  // A distinct start per row: initial histories are unique per binding and period.
+  const from = new Date(Date.UTC(2026, 10, o.day, 9, 0, first)).toISOString();
+  const to = new Date(Date.UTC(2026, 10, o.day, 11)).toISOString();
   const [row] = await t.sql`
     insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq, ts_from, ts_to,
       title, body, text, model)
@@ -70,7 +71,9 @@ async function lockWaitSeen(t: any): Promise<boolean> {
 }
 
 const stateRow = async (t: any, scope: string) => (await t.sql`select * from project_states where scope = ${scope}`)[0];
-const ids = (row: any) => (row.source_summary_ids as unknown[]).map((x) => BigInt(x as any)).sort();
+/** bigint ids in numeric order (a plain sort() would compare them as strings). */
+const sortedIds = (xs: unknown[]) => xs.map((x) => BigInt(x as any)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+const ids = (row: any) => sortedIds(row.source_summary_ids);
 
 test("STATE_SCHEMA caps every field", () => {
   const p = (STATE_SCHEMA as any).properties;
@@ -605,6 +608,8 @@ test("a rebuild too big for the budget shrinks to the newest summaries and leave
     expect(used.length).toBeLessThan(40);
     expect(used).toEqual(all.slice(40 - used.length)); // the newest ones
     expect(calls()).toBe(used.length);
+    const excluded = sortedIds((await stateRow(t, scope)).excluded_summary_ids);
+    expect(excluded).toEqual(all.slice(0, 40 - used.length)); // recorded as deliberately left out
     const spent = (await budgetState(t.sql, SMALL)).used;
     expect(spent).toBeLessThanOrEqual(100_000); // at most half the window
 
@@ -670,5 +675,57 @@ test("adopt and move wait for a re-bind of their target and use its new scope", 
     expect(await duringRebind(B.id, () => moveSession(t.sql, "s2", web.id))).toBe(true);
     expect(await scopeOf(s2)).toEqual({ client_id: B.id, project_id: null });
     expect((await stateRow(t, scopeKey(B.id, null))).dirty).toBe(true);
+  } finally { await t.drop(); }
+});
+
+test("summaries stored after the state exists are folded in, however old their period", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await addSummary(t, binding, { title: "Recent", day: 20, facts: ["recent fact"] });
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+
+    // An imported session from long before anything folded so far, summarised now.
+    await ingest(t, { sessions: [sess("imp", binding.id, { startedAt: "2026-10-01T09:00:00.000Z" })], events: [] });
+    const imported = await addSummary(t, binding, { title: "Imported", day: 1, sessionId: "imp", facts: ["imported fact"] });
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    let st = await stateRow(t, scope);
+    expect(ids(st)).toContain(imported);
+    expect(st.doc.facts).toContain("imported fact");
+    expect(st.dirty).toBe(false);
+
+    // An initial history covering an even older period, posted by the client.
+    const res = await t.call("POST", "/v1/summaries", {
+      repo: binding.repo, subpath: "", title: "How it began", text: "Started as a weekend prototype",
+      tsFrom: "2026-09-01T00:00:00.000Z", tsTo: "2026-09-30T00:00:00.000Z",
+    });
+    expect(res.status).toBe(201);
+    const history = BigInt((await res.json()).summary.id);
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    st = await stateRow(t, scope);
+    expect(ids(st)).toContain(history);
+    expect(st.dirty).toBe(false);
+  } finally { await t.drop(); }
+});
+
+test("re-sending a history period puts its new text in the state", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const post = (text: string) => t.call("POST", "/v1/summaries", {
+      repo: binding.repo, subpath: "", title: "History", text,
+      tsFrom: "2026-09-01T00:00:00.000Z", tsTo: "2026-09-30T00:00:00.000Z",
+    });
+    expect((await post("First draft about zebras")).status).toBe(201);
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    expect((await stateRow(t, scope)).text).toContain("zebras");
+
+    expect((await post("Second draft about giraffes")).status).toBe(200); // same period: replaced in place
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    const st = await stateRow(t, scope);
+    expect(st.text).toContain("giraffes");
+    expect(st.text).not.toContain("zebras");
   } finally { await t.drop(); }
 });

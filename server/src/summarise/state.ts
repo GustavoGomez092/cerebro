@@ -380,38 +380,37 @@ async function summariesInScope(sql: SQL, sc: Scope, ids: string[]): Promise<Sum
       [ids, sc.clientId]);
 }
 
-type SummaryKey = Pick<SummaryRow, "id" | "ts_to">;
-
-/** Those of `ids` that are summaries in this scope now (id and time only), oldest first. */
-async function sourcesInScope(sql: SQL, sc: Scope, ids: string[]): Promise<SummaryKey[]> {
-  return sc.projectId
-    ? sql.unsafe(`select id::text as id, ts_to from summaries where id = any($1::bigint[]) and project_id = $2
-       order by ts_to, id`, [ids, sc.projectId])
-    : sql.unsafe(`select id::text as id, ts_to from summaries where id = any($1::bigint[]) and client_id = $2
-       and project_id is null order by ts_to, id`, [ids, sc.clientId]);
+/** How many of `ids` are summaries in this scope now. */
+async function countInScope(sql: SQL, sc: Scope, ids: string[]): Promise<number> {
+  const [row] = sc.projectId
+    ? await sql.unsafe(`select count(*)::int as n from summaries where id = any($1::bigint[]) and project_id = $2`,
+      [ids, sc.projectId])
+    : await sql.unsafe(`select count(*)::int as n from summaries where id = any($1::bigint[]) and client_id = $2
+       and project_id is null`, [ids, sc.clientId]);
+  return row.n;
 }
-
-/** Summary order: by time, then id. */
-const isNewer = (a: SummaryKey, b: SummaryKey) => {
-  const d = new Date(a.ts_to).getTime() - new Date(b.ts_to).getTime();
-  return d > 0 || (d === 0 && BigInt(a.id) > BigInt(b.id));
-};
 
 interface StateRow {
   version: number;
   dirtyGen: string;
   doc: StateDoc;
   sources: string[];
+  /** Summaries the last rebuild deliberately left out to fit the budget. */
+  excluded: string[];
 }
 
 /** The scope's state row (created empty when missing); null when the client or project is unknown. */
 async function loadState(sql: SQL, sc: Scope): Promise<StateRow | null> {
   await touchRows(sql, [sc.key], false);
   const [row] = await sql`
-    select version, dirty_gen::text as dirty_gen, doc, source_summary_ids::text[] as sources
+    select version, dirty_gen::text as dirty_gen, doc, source_summary_ids::text[] as sources,
+      excluded_summary_ids::text[] as excluded
     from project_states where scope = ${sc.key}`;
   if (!row) return null;
-  return { version: row.version, dirtyGen: row.dirty_gen, doc: parseState(row.doc) ?? emptyDoc(), sources: row.sources };
+  return {
+    version: row.version, dirtyGen: row.dirty_gen, doc: parseState(row.doc) ?? emptyDoc(),
+    sources: row.sources, excluded: row.excluded,
+  };
 }
 
 const scopeLabel = (sc: Scope) => (sc.projectId ? "this project" : "this client's work outside any project");
@@ -465,8 +464,9 @@ const failedScope: StateResult = { status: "failed", reason: "failed" };
 
 /**
  * Folds new summaries into a scope's state: the given ids plus any of the scope's newest 40 not yet
- * folded that are newer than the oldest folded one (so a summary whose update was lost is picked up,
- * but ones a budget-shrunk rebuild left out are not), oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS per call.
+ * folded, whatever their period (an imported session or an initial history stored after the state was
+ * built; a summary whose update was lost), except those the last rebuild deliberately left out to fit
+ * the budget. Oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS per call.
  * Each call's result replaces `doc` and `text`, bumps `version` and appends to `source_summary_ids`,
  * committed only if no other update landed meanwhile (else the update starts over from the new state).
  * `dirty` is cleared when everything is folded and no new mark arrived while it ran.
@@ -481,15 +481,14 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
   attempts: for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const st = await loadState(sql, sc);
     if (!st) return failedScope;
-    const sources = st.sources.length ? await sourcesInScope(sql, sc, st.sources) : [];
-    if (!st.sources.length || sources.length < st.sources.length) return rebuildState(sql, scope, deps);
+    if (!st.sources.length || (await countInScope(sql, sc, st.sources)) < st.sources.length) {
+      return rebuildState(sql, scope, deps);
+    }
     const folded = new Set(st.sources);
+    const excluded = new Set(st.excluded);
     const pending = new Map<string, SummaryRow>();
-    // Unfolded summaries among the newest 40 that are newer than the oldest folded one (older ones were
-    // left out on purpose by a budget-shrunk rebuild), plus any asked for by id.
-    const oldest = sources[0];
     for (const r of await newestSummaries(sql, sc, REBUILD_WINDOW)) {
-      if (!folded.has(r.id) && isNewer(r, oldest)) pending.set(r.id, r);
+      if (!folded.has(r.id) && !excluded.has(r.id)) pending.set(r.id, r);
     }
     for (const r of await summariesInScope(sql, sc, newSummaryIds.map(String))) {
       if (!folded.has(r.id)) pending.set(r.id, r);
@@ -532,7 +531,8 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
 /**
  * Rebuilds a scope's state from scratch out of its newest 40 summaries (oldest first, ≤ 10 and
  * ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. When those would cost more than
- * half the budget window, only the newest that fit in half are used (rebuildPlan). Nothing is spent
+ * half the budget window, only the newest that fit in half are used (rebuildPlan); the rest are recorded
+ * in `excluded_summary_ids` so later updates do not fold them back in one at a time. Nothing is spent
  * unless the remaining budget covers the whole planned rebuild, so it does not defer part-way through
  * its own spend. The one exception is a single summary costing more than the whole window: that estimate
  * is capped at the limit, so it can still run once the window is clear. Nothing is committed part-way:
@@ -564,10 +564,12 @@ export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Pr
       doc = out.doc;
       i += out.count;
     }
+    const used = new Set(rows.map((r) => r.id));
     const [u] = await sql`
       update project_states set
         doc = ${JSON.stringify(doc)}::text::jsonb, text = ${renderState(doc)}, version = version + 1,
-        source_summary_ids = ${rows.map((r) => r.id)}::bigint[],
+        source_summary_ids = ${[...used]}::bigint[],
+        excluded_summary_ids = ${newest.filter((r) => !used.has(r.id)).map((r) => r.id)}::bigint[],
         dirty = dirty and dirty_gen <> ${st.dirtyGen}::bigint,
         updated_at = now()
       where scope = ${sc.key} and version = ${st.version}

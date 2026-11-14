@@ -9,7 +9,7 @@ import type { AppDeps, Env } from "../app";
 import { BindingError, resolveBinding } from "../../bindings";
 import { SUMMARY_FROM, summaryScopeClause } from "../../search";
 import { embedSummary, summaryEmbedText, type SummaryBody } from "../../summarise/summarise";
-import { markScopesDirty, scopeKey } from "../../summarise/state";
+import { invalidateStates, markScopesDirty, scopeKey } from "../../summarise/state";
 import { parseBody } from "../validate";
 import { cursorTs, parseCursor } from "../../read";
 import { int, iso, scopeParams, withScope } from "./read";
@@ -147,7 +147,10 @@ export function summaryRoutes({ sql, embedder, log = (l: string) => console.log(
       if (old) await tx`delete from summary_embeddings where summary_id = ${row.id}`;
       const scopes = [scopeKey(cur.client_id, cur.project_id)];
       if (old?.client_id) scopes.push(scopeKey(old.client_id, old.project_id));
-      await markScopesDirty(tx, scopes);
+      // A replaced history keeps its id, which the state already counts as folded, and its old text
+      // may be woven into the state: rebuild rather than fold. A new one is folded like any summary.
+      if (old) await invalidateStates(tx, scopes);
+      else await markScopesDirty(tx, scopes);
       return { id: row.id, created: !old };
     });
     if (!saved) return declined();
