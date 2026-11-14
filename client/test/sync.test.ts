@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApiClient } from "../src/api";
+import { ApiClient, ApiError } from "../src/api";
 import { ensureCliLink, installSchedule, removeSchedule, setUpSchedule } from "../src/schedule";
 import { codexSource } from "../src/sources/codex";
 import { genericSource } from "../src/sources/generic";
@@ -221,6 +221,27 @@ test("the 50-resolve cap never starves a folder: the oldest-checked identities g
   await syncAllSources(store, counting, "test-mac", { home, sources: [genericSource] });
   expect(asked).toHaveLength(50);
   for (const r of missed) expect(asked).toContain(r);
+  store.close();
+});
+
+test("a folder the server refuses to resolve (4xx) is put to the back of the queue, not retried first forever", async () => {
+  const home = tmp();
+  const tag = crypto.randomUUID().slice(0, 8);
+  const refused = `github.com/acme/refused-${tag}`;
+  write(join(home, ".cerebro", "inbox", "refused.jsonl"), fixture("generic.jsonl").replace("/Users/dev/projects/demo", "/nonexistent/refused")
+    .replace("https://github.com/example/demo.git", `https://${refused}.git`));
+  const failing = new Proxy(h.api, {
+    get(target, prop, recv) {
+      if (prop !== "resolve") return Reflect.get(target, prop, recv);
+      return (...args: Parameters<typeof target.resolve>) =>
+        args[0] === refused ? Promise.reject(new ApiError(400, "invalid_request", "bad identity")) : target.resolve(...args);
+    },
+  });
+  const store = newStore();
+  await syncAllSources(store, failing, "test-mac", { home, sources: [genericSource] });
+  const cached = store.cachedBinding(refused, "");
+  expect(cached?.binding ?? null).toBeNull();
+  expect(cached?.at).toBeString(); // known now, so never-asked folders sort ahead of it next run
   store.close();
 });
 

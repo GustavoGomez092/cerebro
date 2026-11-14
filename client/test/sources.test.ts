@@ -203,6 +203,14 @@ test("subagent transcripts become their own session linked to the parent", async
   store.close();
 });
 
+test("a subagent's own cwd is found even after a long run of entries without one", async () => {
+  const { home, path } = subagentHome({ subagentCwd: false });
+  const noCwd = Array.from({ length: 150 }, (_, i) => JSON.stringify({ type: "attachment", uuid: `u${i}`, attachment: { type: "x", text: "y".repeat(500) } }));
+  writeFileSync(path, [...noCwd, JSON.stringify({ type: "user", uuid: "44444444-4444-4444-8444-444444444444", timestamp: "2026-01-05T10:00:00.000Z", cwd: "/Users/dev/own-cwd", message: { role: "user", content: "x" } })].join("\n") + "\n");
+  const [file] = await claudeSubagentsSource.discover({ home });
+  expect(file!.cwd).toBe("/Users/dev/own-cwd");
+});
+
 test("subagent without a cwd takes the parent transcript's", async () => {
   const { home } = subagentHome({ subagentCwd: false });
   const [file] = await claudeSubagentsSource.discover({ home });

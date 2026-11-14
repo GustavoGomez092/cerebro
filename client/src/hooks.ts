@@ -2,6 +2,7 @@ import type { Binding, SessionView } from "@cerebro/shared";
 import type { ApiClient } from "./api";
 import { buildBrief } from "./brief";
 import { captureTranscript, type CaptureResult } from "./capture";
+import { syncConfigFile } from "./config";
 import { folderIdentity, type FolderIdentity } from "./identity";
 import { checkInstance } from "./instance";
 import { logError } from "./log";
@@ -127,6 +128,8 @@ type Left = () => number;
 async function sessionStart(input: HookInput, deps: HookDeps, spawn: (args: string[]) => void): Promise<string> {
   const { store, api } = deps;
   ensureCliLink(); // keeps ~/.cerebro/bin/cerebro (used by launchd and the skill) on the current binary
+  // launchd's sync and commands Claude runs through Bash never see the plugin settings; they read config.json.
+  try { syncConfigFile(deps.env); } catch (e) { logError("SessionStart config file", e); }
   if (!api) return context(NOT_CONFIGURED_CONTEXT);
   if (!(Date.now() - Date.parse(store.get("lastSyncAt") ?? "") < SYNC_EVERY_MS)) spawn(["sync"]);
   const cwd = input.cwd;

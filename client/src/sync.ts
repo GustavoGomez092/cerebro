@@ -193,6 +193,9 @@ async function refreshBindings(
     } catch (e) {
       logError(`sync resolve ${ident.repo}`, e);
       if (e instanceof ApiError && (e.status === 0 || e.status >= 500)) return { asked, reachable: false };
+      // Refused (4xx): note it as not bound as of now, so never-asked folders go ahead of it next run.
+      // Only identities with no binding reach here, so nothing bound or declined is overwritten.
+      store.cacheBinding(ident.repo, ident.subpath, null);
     }
   }
   return { asked, reachable: true };

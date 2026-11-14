@@ -9,13 +9,20 @@ import type { HistorySource, SourceFile, SourceRead } from "./types";
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.isArray(v);
 
-/** The `cwd` of the first transcript entry that has one, read from the head of the file. */
+const CWD_SCAN_LINES = 200;
+
+/**
+ * The `cwd` of the first transcript entry that has one, from the first 200 lines. The first line almost always
+ * has it, so that is read alone before reading further.
+ */
 function firstCwd(path: string): string | null {
-  for (const line of headLines(path, 10)) {
-    try {
-      const e = JSON.parse(line);
-      if (isObj(e) && typeof e.cwd === "string" && e.cwd) return storable(e.cwd);
-    } catch { /* not an entry */ }
+  for (const count of [1, CWD_SCAN_LINES]) {
+    for (const line of headLines(path, count)) {
+      try {
+        const e = JSON.parse(line);
+        if (isObj(e) && typeof e.cwd === "string" && e.cwd) return storable(e.cwd);
+      } catch { /* not an entry */ }
+    }
   }
   return null;
 }

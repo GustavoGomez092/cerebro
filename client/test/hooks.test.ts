@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Binding } from "@cerebro/shared";
@@ -164,6 +164,54 @@ test("SessionStart schedules `cerebro sync` when the last sync is over an hour o
   await handleHook("SessionStart", e.input(), e.deps(null));
   await handleHook("SessionStart", e.input(), { ...e.deps(), env: { CEREBRO_HEADLESS: "1" } });
   expect(e.calls).not.toContainEqual(["sync"]);
+  e.store.close();
+});
+
+test("SessionStart keeps ~/.cerebro/config.json equal to the plugin settings it was started with", async () => {
+  const e = setup();
+  const home = process.env.CEREBRO_HOME!;
+  const file = join(home, "config.json");
+  const plugin = { CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://zima:8787", CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_first" };
+  const run = (env: Record<string, string>) => handleHook("SessionStart", e.input(), { ...e.deps(), env });
+  const saved = () => JSON.parse(readFileSync(file, "utf8"));
+  const mode = () => statSync(file).mode & 0o777;
+
+  // no file yet: written, owner-only
+  await run(plugin);
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_first" });
+  expect(mode()).toBe(0o600);
+
+  // equal: left alone
+  const old = (Date.now() - 3600_000) / 1000;
+  utimesSync(file, old, old);
+  const before = statSync(file).mtimeMs;
+  await run(plugin);
+  expect(statSync(file).mtimeMs).toBe(before);
+
+  // the token was rotated in the plugin settings: replaced
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_rotated" });
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_rotated" });
+  expect(mode()).toBe(0o600);
+
+  // an older, world-readable file ends owner-only (same content or not)
+  chmodSync(file, 0o644);
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_rotated" });
+  expect(mode()).toBe(0o600);
+  writeFileSync(file, JSON.stringify({ serverUrl: "http://old", token: "cbr_old" }));
+  chmodSync(file, 0o644);
+  await run(plugin);
+  expect(saved()).toEqual({ serverUrl: "http://zima:8787", token: "cbr_first" });
+  expect(mode()).toBe(0o600);
+  expect(readdirSync(home).filter((n) => n.startsWith("config.json") && n !== "config.json")).toEqual([]); // no temp files left
+
+  // headless, or settings not complete in the env: untouched
+  writeFileSync(file, JSON.stringify({ serverUrl: "http://keep", token: "cbr_keep" }));
+  await run({ ...plugin, CLAUDE_PLUGIN_OPTION_TOKEN: "cbr_headless", CEREBRO_HEADLESS: "1" });
+  await run({ CLAUDE_PLUGIN_OPTION_SERVER_URL: "http://half" });
+  expect(saved()).toEqual({ serverUrl: "http://keep", token: "cbr_keep" });
+  rmSync(file);
+  await run({});
+  expect(existsSync(file)).toBe(false);
   e.store.close();
 });
 
