@@ -22,7 +22,9 @@ export function ollamaEmbedder(
         if (!res.ok) {
           // 404 (model missing), 500 (out of memory, crashed runner), 502–504 (overloaded/restarting):
           // the embedder is broken, not these texts. 400 and other 4xx point at the input.
-          throw new EmbedderError(`embedder returned ${res.status}`, { transient: [404, 500, 502, 503, 504].includes(res.status) });
+          throw new EmbedderError(`embedder returned ${res.status}`, {
+            transient: [404, 500, 502, 503, 504].includes(res.status), status: res.status,
+          });
         }
         ({ embeddings } = (await res.json()) as { embeddings?: unknown });
       } catch (e) {
