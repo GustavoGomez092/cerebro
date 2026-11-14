@@ -27,6 +27,24 @@ Tests create and drop their own throwaway databases on the dev Postgres
 | `EMBED_URL`    | required to run | Ollama base URL for embeddings           |
 | `EMBED_MODEL`  | `bge-m3` | Ollama embedding model                          |
 | `EMBED_DIMS`   | `1024`   | Embedding size; must match the schema's vector size |
+| `SUMMARISER_ENABLED` | `true` | `false` or `0` turns the summary loop off |
+| `SUMMARISER_CMD` | `claude` | The Claude Code CLI to run (`claude -p`, the owner's subscription login; API-key variables are removed from its environment) |
+| `SUMMARY_SHARE` | `0.2` | Share of the 5-hour window the summariser may spend |
+| `SUBSCRIPTION_TOKENS_PER_5H` | `2000000` | Tokens the subscription allows per rolling 5-hour window; the summariser's budget is `SUMMARY_SHARE ×` this |
+
+#### Summariser cost (measured 2026-11-14, `claude-haiku-5-5`)
+
+| Call | Tokens | Wall time |
+|---|---|---|
+| Minimal summary (a few lines) | 4 467 | 4 s |
+| One real 17-minute agent session (167 events, tool output included): summary | 26 493 | ~60 s for both |
+| Project state update after it | 10 042 | |
+
+Tokens are input + output + cache creation, as the ledger counts them. With the defaults the budget is
+400 000 tokens per 5 hours: about 11 such sessions (summary + state) per window, 50+ a day, above a busy
+day's volume across the Macs. When the budget runs out, live jobs wait until the window frees up
+(`/v1/status` `summariser.paused.reason: "budget"`), so nothing is lost. If your plan allows more, raise
+`SUBSCRIPTION_TOKENS_PER_5H`; to spend less, lower `SUMMARY_SHARE`.
 
 ## Running the server locally
 
