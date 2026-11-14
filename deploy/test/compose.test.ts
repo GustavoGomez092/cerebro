@@ -100,6 +100,20 @@ describe("compose config", () => {
     expect(casa.title.en_us).toBe("Cerebro");
   });
 
+  test("the server's stop grace period outlasts the summariser's stop deadline (M5)", async () => {
+    const r = run(["docker", "compose", "-f", COMPOSE, "--env-file", ENV_EXAMPLE, "config", "--format", "json"], env);
+    expect(r.code).toBe(0);
+    const { server } = JSON.parse(r.out).services;
+    // stop() lets a Claude call finish for 20 s, then kills it and waits 2 s more (server/src/summarise/loop.ts);
+    // Docker's default 10 s would SIGKILL the server mid-shutdown, before the worker and database close.
+    const src = await Bun.file(join(REPO, "server/src/summarise/loop.ts")).text();
+    const deadline = Number(/const STOP_DEADLINE_MS = ([\d_]+)/.exec(src)?.[1].replaceAll("_", ""));
+    const settle = Number(/const STOP_SETTLE_MS = ([\d_]+)/.exec(src)?.[1].replaceAll("_", ""));
+    expect(deadline + settle).toBe(22_000);
+    expect(server.stop_grace_period).toBe("30s");
+    expect(30_000).toBeGreaterThan(deadline + settle + 5_000); // room for the worker stop and sql.close()
+  });
+
   test("postgres.conf carries the tuned settings", async () => {
     const conf = await Bun.file(join(DEPLOY, "postgres.conf")).text();
     const want = [

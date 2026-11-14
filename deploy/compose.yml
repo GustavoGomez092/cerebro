@@ -48,6 +48,9 @@ services:
   server:
     container_name: cerebro-server
     image: cerebro-server:${CEREBRO_TAG}
+    # On SIGTERM the summariser lets a Claude call finish for up to 20 s, kills it, waits 2 s, then the embed
+    # worker and the database pool close: Docker's default 10 s would SIGKILL it part-way through.
+    stop_grace_period: 30s
     depends_on:
       db:
         condition: service_healthy
