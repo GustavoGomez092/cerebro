@@ -138,7 +138,7 @@ project; anything else may search all clients. Repo spellings are normalised ser
 ### Maintenance
 
 ```sh
-DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret, rebuild its search index
+DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret from a session, its summaries and project states
 DATABASE_URL=… bun server/src/cli.ts requeue-dead                  # retry dead chunks and dead summary jobs
 DATABASE_URL=… bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only
 ```

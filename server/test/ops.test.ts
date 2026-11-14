@@ -108,3 +108,57 @@ test("pgState reads the SQLSTATE of a real statement timeout", async () => {
     expect(pgState(new Error("x"))).toBeNull();
   } finally { await db.drop(); }
 });
+
+test("redactSession also scrubs the session's summaries, re-queues their embeddings and marks the scope's state for rebuild", async () => {
+  const { endSession } = await import("../src/ingest");
+  const { claimSummaryJob } = await import("../src/summarise/jobs");
+  const { runClaude } = await import("../src/summarise/claude");
+  const { summariseJob } = await import("../src/summarise/summarise");
+  const { scopeKey, updateState } = await import("../src/summarise/state");
+  const run = (input: any) => runClaude(input, {
+    ...process.env, SUMMARISER_CMD: "bun server/test/fakes/fake-claude.ts", FAKE_CLAUDE_MODE: "ok",
+  } as NodeJS.ProcessEnv);
+  const budget = { share: 0.2, windowTokens: 2_000_000 };
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await ingest(t, {
+      sessions: [sess("s1", binding.id)],
+      events: [ev("s1", 1, "user", "the staging password is PINEAPPLE-42 remember it"), ev("s1", 2, "assistant", "Noted the staging password")],
+    });
+    await endSession(t.sql, "s1", new Date().toISOString());
+    expect(await summariseJob(t.sql, t.embedder, (await claimSummaryJob(t.sql))!, { run, budget })).toMatchObject({ status: "done" });
+    // The model put the secret in the title too.
+    await t.sql`update summaries set title = 'Staging password PINEAPPLE-42'`;
+    expect(await updateState(t.sql, scope, [], { run, budget })).toMatchObject({ status: "updated" });
+    const [sum] = await t.sql`select id from summaries`;
+    const dumpSummaries = async () => JSON.stringify(await t.sql`select title, body, text from summaries`);
+    const dumpState = async () => JSON.stringify(await t.sql`select doc, text from project_states`);
+    expect(await dumpSummaries()).toContain("PINEAPPLE-42");
+    expect(await dumpState()).toContain("PINEAPPLE-42");
+    expect(await t.sql`select 1 from summary_embeddings`).toHaveLength(1);
+    const search = async () => (await (await t.call("POST", "/v1/search", { query: "PINEAPPLE-42", scope: "open", include: "summaries" })).json()).hits;
+    expect((await search()).length).toBeGreaterThan(0);
+
+    const r = await redactSession(t.sql, "s1", "PINEAPPLE-\\d+");
+    expect(r.summaries).toBe(1);
+    expect(r.states).toBe(1);
+
+    expect(await dumpSummaries()).not.toContain("PINEAPPLE");
+    expect(await dumpSummaries()).toContain("[REDACTED:manual]");
+    const [s] = await t.sql`select title, tsv::text as tsv from summaries`;
+    expect(s.title).toBe("Staging password [REDACTED:manual]");
+    expect(s.tsv.toLowerCase()).not.toContain("pineapple");
+    // The old vector was made from the secret: dropped, so the loop's sweep re-embeds the cleaned text.
+    expect(await t.sql`select 1 from summary_embeddings where summary_id = ${sum.id}`).toHaveLength(0);
+    expect(JSON.stringify(await search())).not.toContain("PINEAPPLE");
+    // The state no longer shows the secret and is rebuilt (from the cleaned summaries) on the next update.
+    expect(await dumpState()).not.toContain("PINEAPPLE");
+    const [st] = await t.sql`select dirty, source_summary_ids from project_states where scope = ${scope}`;
+    expect(st.dirty).toBe(true);
+    expect(st.source_summary_ids).toHaveLength(0);
+    expect(await updateState(t.sql, scope, [], { run, budget })).toMatchObject({ status: "updated" });
+    expect(await dumpState()).not.toContain("PINEAPPLE");
+  } finally { await t.drop(); }
+});

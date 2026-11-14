@@ -8,7 +8,7 @@ import { requeueDeadSummaries } from "./summarise/jobs";
 const usage = [
   "usage: bun server/src/cli.ts token create|revoke <machine>",
   "       bun server/src/cli.ts token list",
-  "       bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret and rebuild its search index",
+  "       bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret from a session, its summaries and states",
   "       bun server/src/cli.ts requeue-dead                  # retry chunks and summary jobs that were given up on",
   "       bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only",
 ].join("\n");
@@ -29,6 +29,7 @@ async function main(argv: string[]) {
       await migrate(sql);
       const r = await redactSession(sql, cmd, name);
       console.log(`redacted ${r.events} event(s); rebuilt ${r.chunks} search chunk(s), queued for re-embedding`);
+      console.log(`scrubbed ${r.summaries} summary(ies), queued for re-embedding; ${r.states} project state(s) scrubbed and marked for rebuild`);
     } finally { await sql.close(); }
     return;
   }
