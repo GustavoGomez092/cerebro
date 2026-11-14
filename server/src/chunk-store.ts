@@ -18,6 +18,7 @@ export async function storeChunks(tx: SQL, sessionId: string, events: ChunkInput
         first_seq integer, last_seq integer, part integer, ts_from timestamptz, ts_to timestamptz, text text, extra_terms text)
       on conflict (session_id, first_seq, last_seq, part) do nothing
       returning id)
-    insert into embed_queue (chunk_id, priority) select id, ${priority} from ins returning chunk_id`;
+    insert into embed_queue (chunk_id, priority, machine_id)
+    select id, ${priority}, (select machine_id from sessions where id = ${sessionId}) from ins returning chunk_id`;
   return created.length;
 }

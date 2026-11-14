@@ -76,8 +76,8 @@ export async function requeueMissingEmbeddings(
   },
 ): Promise<{ chunks: number; summaries: number | null }> {
   const queued = await sql`
-    insert into embed_queue (chunk_id, priority)
-    select c.id, 1 from chunks c
+    insert into embed_queue (chunk_id, priority, machine_id)
+    select c.id, 1, s.machine_id from chunks c join sessions s on s.id = c.session_id
     where not exists (select 1 from chunk_embeddings e where e.chunk_id = c.id)
     on conflict (chunk_id) do nothing
     returning chunk_id`;

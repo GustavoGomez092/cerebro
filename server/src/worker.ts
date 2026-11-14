@@ -94,24 +94,8 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
       returning q.chunk_id, c.text`;
     claimed.sort((a, b) => a.chunk_id - b.chunk_id);
   } else {
-    const mapped = sql.array(opts.route.zima?.mapped ?? [], "text");
-    const waiting = sql.array(opts.route.zima?.waiting ?? [], "text");
-    claimed = await sql`
-      with picked as (
-        select q.chunk_id, q.priority, m.name = any(${waiting}) as waiting from embed_queue q
-          join chunks c on c.id = q.chunk_id
-          join sessions s on s.id = c.session_id
-          join machines m on m.id = s.machine_id
-        where not q.dead and q.next_attempt_at <= now() and (q.locked_until is null or q.locked_until < now())
-          and case when ${lane}::text is not null then m.name = ${lane}::text
-                   else not (m.name = any(${mapped})) or m.name = any(${waiting}) end
-        order by q.priority, waiting, q.chunk_id
-        limit ${lane === null ? Math.min(limit, ZIMA_LANE_LIMIT) : limit}
-        for update of q skip locked)
-      update embed_queue q set locked_until = now() + make_interval(secs => ${leaseSeconds})
-      from picked, chunks c
-      where q.chunk_id = picked.chunk_id and c.id = q.chunk_id
-      returning q.chunk_id, c.text, picked.priority, picked.waiting`;
+    const q = claimQuery(opts.route, lane === null ? Math.min(limit, ZIMA_LANE_LIMIT) : limit, leaseSeconds);
+    claimed = await sql.unsafe(q.text, q.params);
     // Live before imported, then (the Zima lane) unmapped machines' work before a down machine's.
     claimed.sort((a: any, b: any) => a.priority - b.priority || Number(a.waiting) - Number(b.waiting) || a.chunk_id - b.chunk_id);
   }
@@ -198,6 +182,43 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
     }
   }
   return result;
+}
+
+/**
+ * The routed claim (see EmbedRoute), as text and parameters: the worker runs it, tests EXPLAIN it. Each eligible
+ * machine's ready rows come from embed_queue_machine_ready_idx (machine_id, priority, chunk_id), one index range
+ * per machine, so a backlog never makes a claim scan the queue or join chunks beyond the rows it takes.
+ * $1 the lane's machine (null: the Zima lane), $2 mapped machines, $3 waiting (down) machines, $4 limit, $5 lease.
+ */
+export function claimQuery(route: EmbedRoute, limit: number, leaseSeconds: number): { text: string; params: unknown[] } {
+  const ready = "not q.dead and q.next_attempt_at <= now() and (q.locked_until is null or q.locked_until < now())";
+  return {
+    text: `
+      with eligible as (
+        select id, name = any($3::text[]) as waiting from machines
+        where case when $1::text is not null then name = $1::text
+                   else not (name = any($2::text[])) or name = any($3::text[]) end
+      ), cand as (
+        select x.chunk_id, x.priority, e.waiting from eligible e cross join lateral (
+          select q.chunk_id, q.priority from embed_queue q
+          where q.machine_id = e.id and ${ready}
+          order by q.priority, q.chunk_id limit $4) x
+        union all
+        (select q.chunk_id, q.priority, false from embed_queue q
+         where $1::text is null and q.machine_id is null and ${ready}
+         order by q.priority, q.chunk_id limit $4)
+      ), picked as (
+        select q.chunk_id, cand.priority, cand.waiting from cand join embed_queue q on q.chunk_id = cand.chunk_id
+        where ${ready}
+        order by cand.priority, cand.waiting, cand.chunk_id
+        limit $4
+        for update of q skip locked)
+      update embed_queue q set locked_until = now() + make_interval(secs => $5)
+      from picked, chunks c
+      where q.chunk_id = picked.chunk_id and c.id = q.chunk_id
+      returning q.chunk_id, c.text, picked.priority, picked.waiting`,
+    params: [route.machine ?? null, route.zima?.mapped ?? [], route.zima?.waiting ?? [], limit, leaseSeconds],
+  };
 }
 
 export type EmbedResult = Awaited<ReturnType<typeof embedPending>>;
