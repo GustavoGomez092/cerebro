@@ -5,6 +5,13 @@ export class BindingError extends Error {
   constructor(public code: "invalid" | "conflict" | "not_found", message: string) { super(message); }
 }
 
+/** Canonical subpath: no leading/trailing or doubled slashes, no "." segments; ".." is rejected. */
+export function normalizeSubpath(subpath: string): string {
+  const parts = subpath.split("/").filter((p) => p !== "" && p !== ".");
+  if (parts.includes("..")) throw new BindingError("invalid", "subpath may not contain '..'");
+  return parts.join("/");
+}
+
 const COLS = `id, repo, subpath, status, client_id as "clientId", project_id as "projectId"`;
 
 export interface BindingInput {
@@ -19,7 +26,8 @@ export interface BindingInput {
  * Creates or updates the binding for (repo, subpath). Sessions reference the binding,
  * so changing client/project here moves all of that folder's history.
  */
-export async function upsertBinding(sql: SQL, b: BindingInput): Promise<Binding> {
+export async function upsertBinding(sql: SQL, input: BindingInput): Promise<Binding> {
+  const b = { ...input, subpath: normalizeSubpath(input.subpath) };
   const declined = b.status === "declined";
   const clientId = declined ? null : b.clientId ?? null;
   const projectId = declined ? null : b.projectId ?? null;
@@ -31,6 +39,12 @@ export async function upsertBinding(sql: SQL, b: BindingInput): Promise<Binding>
   if (clientId) {
     const [c] = await sql`select id from clients where id = ${clientId}`;
     if (!c) throw new BindingError("invalid", "unknown client");
+  }
+  if (declined) {
+    const [hist] = await sql`
+      select 1 from bindings bd join sessions s on s.binding_id = bd.id
+      where bd.repo = ${b.repo} and bd.subpath = ${b.subpath} limit 1`;
+    if (hist) throw new BindingError("conflict", "this folder already has recorded history; re-bind it instead of declining");
   }
   const [row] = await sql.unsafe(
     `insert into bindings (repo, subpath, status, client_id, project_id)
@@ -45,7 +59,8 @@ export async function upsertBinding(sql: SQL, b: BindingInput): Promise<Binding>
 }
 
 /** The most specific binding for a folder: longest subpath that equals or is a path-boundary prefix. */
-export async function resolveBinding(sql: SQL, repo: string, subpath: string): Promise<Binding | null> {
+export async function resolveBinding(sql: SQL, repo: string, rawSubpath: string): Promise<Binding | null> {
+  const subpath = normalizeSubpath(rawSubpath);
   const rows = await sql.unsafe(
     `select ${COLS} from bindings
      where repo = $1 and (subpath = '' or subpath = $2 or $2 like replace(replace(replace(subpath, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '/%')
@@ -61,7 +76,8 @@ export async function getBinding(sql: SQL, id: string): Promise<Binding | null> 
 }
 
 /** Re-points a binding at a new folder identity (e.g. after a remote rename). */
-export async function repointBinding(sql: SQL, id: string, repo: string, subpath: string): Promise<Binding> {
+export async function repointBinding(sql: SQL, id: string, repo: string, rawSubpath: string): Promise<Binding> {
+  const subpath = normalizeSubpath(rawSubpath);
   const [clash] = await sql`select id from bindings where repo = ${repo} and subpath = ${subpath} and id <> ${id}`;
   if (clash) throw new BindingError("conflict", "that folder identity is already bound");
   const rows = await sql.unsafe(

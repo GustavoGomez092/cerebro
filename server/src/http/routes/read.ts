@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import type { AppDeps, Env } from "../app";
 import { getEvents, listSessions } from "../../read";
+import { z } from "zod";
 import { uuid } from "../validate";
 
-const isoOk = (s?: string) => !s || !Number.isNaN(Date.parse(s));
+const isoDate = z.string().datetime({ offset: true });
+const isoOk = (s?: string) => !s || isoDate.safeParse(s).success;
 const intOrUndef = (s?: string) => (s === undefined ? undefined : Number.parseInt(s, 10));
 
 export function readRoutes({ sql }: AppDeps) {

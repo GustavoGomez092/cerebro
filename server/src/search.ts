@@ -21,7 +21,7 @@ export async function scopeFor(sql: SQL, req: SearchRequest): Promise<SearchScop
  * unavailable, falls back to full-text only and reports `degraded: true`.
  */
 export async function search(
-  sql: SQL, embedder: Embedder, req: SearchRequest,
+  sql: SQL, embedder: Embedder, req: SearchRequest, opts: { embedTimeoutMs?: number } = {},
 ): Promise<{ scope: SearchScope; hits: SearchHit[]; degraded: boolean }> {
   const scope = await scopeFor(sql, req);
   const query = req.query.trim();
@@ -29,7 +29,15 @@ export async function search(
   const limit = Math.min(req.limit ?? 10, 50);
   let qvec: number[] | null = null;
   try {
-    [qvec] = await embedder.embed([query]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => rej(new EmbedderError("query embedding timed out")), opts.embedTimeoutMs ?? 3000);
+    });
+    try {
+      [qvec] = await Promise.race([embedder.embed([query]), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     if (!(e instanceof EmbedderError)) throw e;
     console.error(`search: embedder unavailable, full-text only: ${e.message}`);

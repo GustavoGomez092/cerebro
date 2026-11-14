@@ -18,7 +18,7 @@ export async function buildServer(env: Record<string, string | undefined>) {
 if (import.meta.main) {
   try {
     const { config, sql, embedder, app } = await buildServer(process.env);
-    const server = Bun.serve({ port: config.port, fetch: app.fetch, maxRequestBodySize: 11 * 1024 * 1024 });
+    const server = Bun.serve({ port: config.port, fetch: app.fetch, maxRequestBodySize: 11 * 1024 * 1024, idleTimeout: 30 });
     const indexer = startIndexer(sql, embedder);
     console.log(`cerebro listening on :${server.port}`);
     const shutdown = async () => {

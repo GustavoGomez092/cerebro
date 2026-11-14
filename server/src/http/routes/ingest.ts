@@ -17,7 +17,7 @@ const batchSchema = z.object({
   events: z.array(z.object({
     key: z.string().min(1).max(500),
     sessionId: z.string().min(1).max(200),
-    seq: z.number().int().nonnegative(),
+    seq: z.number().int().nonnegative().max(2_147_483_647),
     ts: iso,
     kind: z.enum(["user", "assistant", "tool_call", "tool_result"]),
     text: z.string(),

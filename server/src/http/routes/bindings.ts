@@ -12,7 +12,12 @@ export function bindingRoutes({ sql }: AppDeps) {
   r.get("/bindings/resolve", async (c) => {
     const repo = c.req.query("repo");
     if (!repo) return c.json({ error: "repo_required" }, 400);
-    return c.json({ binding: await resolveBinding(sql, repo, c.req.query("subpath") ?? "") });
+    try {
+      return c.json({ binding: await resolveBinding(sql, repo, c.req.query("subpath") ?? "") });
+    } catch (e) {
+      if (e instanceof BindingError) return c.json({ error: e.message }, STATUS[e.code]);
+      throw e;
+    }
   });
   r.put("/bindings", async (c) => {
     const b = await parseBody(c, z.object({

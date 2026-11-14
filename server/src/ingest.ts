@@ -7,6 +7,15 @@ export class IngestError extends Error {
   }
 }
 
+/** Postgres text/jsonb cannot hold U+0000 (common in `find -print0` output); replace it. */
+const clean = (s: string) => s.replaceAll("\u0000", "\uFFFD");
+function cleanDeep(v: unknown): unknown {
+  if (typeof v === "string") return clean(v);
+  if (Array.isArray(v)) return v.map(cleanDeep);
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [clean(k), cleanDeep(x)]));
+  return v;
+}
+
 /** Stores sessions and events in one transaction. Replays are harmless: events dedupe on `key`. */
 export async function ingestBatch(sql: SQL, machineId: string, batch: IngestBatch): Promise<IngestResult> {
   return sql.begin(async (tx) => {
@@ -30,10 +39,10 @@ export async function ingestBatch(sql: SQL, machineId: string, batch: IngestBatc
     }
     let inserted = 0;
     for (const e of batch.events) {
-      const toolInput = e.toolInput === undefined ? null : JSON.stringify(e.toolInput);
+      const toolInput = e.toolInput === undefined ? null : JSON.stringify(cleanDeep(e.toolInput));
       const rows = await tx`
         insert into events (key, session_id, seq, ts, kind, text, tool_name, tool_input)
-        values (${e.key}, ${e.sessionId}, ${e.seq}, ${e.ts}, ${e.kind}, ${e.text}, ${e.toolName ?? null}, ${toolInput}::text::jsonb)
+        values (${e.key}, ${e.sessionId}, ${e.seq}, ${e.ts}, ${e.kind}, ${clean(e.text)}, ${e.toolName ?? null}, ${toolInput}::text::jsonb)
         on conflict (key) do nothing returning id`;
       inserted += rows.length;
     }

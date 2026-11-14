@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AppDeps, Env } from "../app";
 import { search } from "../../search";
 import { parseBody, uuid } from "../validate";
+import { BindingError } from "../../bindings";
 
 const iso = z.string().datetime({ offset: true });
 const schema = z.object({
@@ -21,8 +22,13 @@ export function searchRoutes({ sql, embedder }: AppDeps) {
   r.post("/search", async (c) => {
     const b = await parseBody(c, schema);
     if (b instanceof Response) return b;
-    const { scope, hits, degraded } = await search(sql, embedder, b);
-    return c.json({ scope: scope.kind, hits, degraded });
+    try {
+      const { scope, hits, degraded } = await search(sql, embedder, b);
+      return c.json({ scope: scope.kind, hits, degraded });
+    } catch (e) {
+      if (e instanceof BindingError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
   });
   return r;
 }
