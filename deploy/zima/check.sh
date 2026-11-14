@@ -7,7 +7,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/lib.sh"
 command -v jq >/dev/null || die "needs jq"
 
-BACKUPS=/DATA/Backup/cerebro
+BACKUP_MOUNT=/DATA/Backup
+BACKUPS=$BACKUP_MOUNT/cerebro
 TOKEN_FILE=$SECRETS/check.token # the `check` machine token (bun server/src/cli.ts token create check)
 
 FAILED=""
@@ -109,6 +110,18 @@ if [[ $timer == active ]]; then ok backup-timer "cerebro-backup.timer active"; e
 
 recent=$(zssh "sudo find $BACKUPS -name '*.dump' -mmin -1560 2>/dev/null | head -n 1" || true)
 if [[ -n $recent ]]; then ok backup-age "$(basename "$recent") is under 26 h old"; else fail backup-age "no dump under $BACKUPS in the last 26 h"; fi
+
+# The backup drive is shared (zima-backup snapshots, postgres-backup); backup.sh keeps a reserve, this warns earlier.
+used=$(zssh "df -P $BACKUP_MOUNT | awk -v m=$BACKUP_MOUNT 'NR == 2 { print (\$6 == m ? \$5 : \"unmounted\") }'" || true)
+if [[ $used == unmounted ]]; then
+  warn backup-disk "$BACKUP_MOUNT is not mounted"
+elif [[ ! $used =~ ^[0-9]+%$ ]]; then
+  warn backup-disk "could not read the use of $BACKUP_MOUNT"
+elif ((${used%\%} > 80)); then
+  warn backup-disk "$BACKUP_MOUNT $used used (shared with the zima-backup snapshots; prune or free space)"
+else
+  ok backup-disk "$BACKUP_MOUNT $used used"
+fi
 
 # Usage as a share of each container's hard memory limit (no swap, so 100 % means the OOM killer).
 stats=$(zssh "sudo docker stats --no-stream --format '{{.Name}} {{.MemPerc}}'" || true)

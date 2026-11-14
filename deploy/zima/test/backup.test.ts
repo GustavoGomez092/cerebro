@@ -32,10 +32,12 @@ const psql = (sql: string, db = "cerebro") => run(["docker", "exec", DB, "psql",
 const count = (table: string, db = "cerebro") => Number(psql(`select count(*) from ${table}`, db).out.trim());
 const TABLES = ["clients", "projects", "bindings", "sessions", "events", "chunks"];
 
-// Env for the scripts under test. The mount check points at "/" (always a mountpoint) unless a test says otherwise.
+// Env for the scripts under test. The mount check points at "/" (always a mountpoint) unless a test says otherwise;
+// no free-space reserve unless a test sets one ("" = the script's default), so the dev disk's free space doesn't matter.
 function senv(target: string, extra: Record<string, string> = {}) {
-  return { CEREBRO_DB_CONTAINER: DB, CEREBRO_BACKUP_ROOT: target, CEREBRO_BACKUP_MOUNT: "/", ...extra };
+  return { CEREBRO_DB_CONTAINER: DB, CEREBRO_BACKUP_ROOT: target, CEREBRO_BACKUP_MOUNT: "/", CEREBRO_BACKUP_RESERVE_GB: "0", ...extra };
 }
+const GB_KB = 1024 * 1024;
 const backup = (target: string, extra: Record<string, string> = {}) => run(["bash", join(ZIMA, "backup.sh")], senv(target, extra));
 const dumps = (dir: string) => (existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".dump")).sort() : []);
 
@@ -162,6 +164,77 @@ describe("backup.sh", () => {
     const r = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-02", CEREBRO_BACKUP_DOW: "1", CEREBRO_BACKUP_AVAIL_KB: "1" });
     expect(r.code).toBe(1);
     expect(r.out + r.err).toMatch(/not enough free space/i);
+    expect(dumps(join(target, "nightly"))).toEqual([]);
+  }, 60_000);
+
+  dockerTest("the default 20 GB reserve on the shared drive is never used", () => {
+    const target = join(root, "t4r");
+    const r = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-02", CEREBRO_BACKUP_DOW: "1", CEREBRO_BACKUP_RESERVE_GB: "", CEREBRO_BACKUP_AVAIL_KB: String(20 * GB_KB + 1) });
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.out + r.err).toMatch(/not enough free space.*20 GB reserve/i);
+    expect(dumps(join(target, "nightly"))).toEqual([]);
+    const ok = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-02", CEREBRO_BACKUP_DOW: "1", CEREBRO_BACKUP_RESERVE_GB: "", CEREBRO_BACKUP_AVAIL_KB: String(21 * GB_KB) });
+    expect(ok.code, ok.out + ok.err).toBe(0);
+    expect(dumps(join(target, "nightly"))).toEqual(["2026-11-02.dump"]);
+  }, 60_000);
+
+  dockerTest("the estimate is the newest dump of the same kind, not the biggest of any kind", () => {
+    const target = join(root, "t4e");
+    mkdirSync(join(target, "nightly"), { recursive: true });
+    mkdirSync(join(target, "weekly"), { recursive: true });
+    run(["truncate", "-s", "200T", join(target, "nightly", "2026-10-01.dump")]); // old and huge
+    writeFileSync(join(target, "nightly", "2026-10-02.dump"), "PGDMP-small"); // the newest nightly
+    run(["truncate", "-s", "200T", join(target, "weekly", "2026-09-27.dump")]); // weekly: not taken on a Wednesday
+    const r = backup(target, { CEREBRO_BACKUP_DATE: "2026-11-11", CEREBRO_BACKUP_DOW: "3", CEREBRO_BACKUP_AVAIL_KB: String(GB_KB) });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(dumps(join(target, "nightly"))).toContain("2026-11-11.dump");
+  }, 60_000);
+
+  dockerTest("on Sundays the nightly and the full dump must both fit above the reserve", () => {
+    const target = join(root, "t4s");
+    mkdirSync(join(target, "weekly"), { recursive: true });
+    run(["truncate", "-s", "15G", join(target, "weekly", "2026-11-08.dump")]); // last full dump: 15 GB
+    const env = { CEREBRO_BACKUP_DATE: "2026-11-15", CEREBRO_BACKUP_DOW: "7", CEREBRO_BACKUP_RESERVE_GB: "20" };
+    const r = backup(target, { ...env, CEREBRO_BACKUP_AVAIL_KB: String(30 * GB_KB) }); // 30 < 20 + 15 + nightly
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.out + r.err).toMatch(/not enough free space/i);
+    expect(dumps(join(target, "nightly"))).toEqual([]);
+    const ok = backup(target, { ...env, CEREBRO_BACKUP_AVAIL_KB: String(36 * GB_KB) });
+    expect(ok.code, ok.out + ok.err).toBe(0);
+    expect(dumps(join(target, "weekly"))).toContain("2026-11-15.dump");
+  }, 60_000);
+
+  // pg_isready fails FLAKY_FAILS times (as right after a power loss, when Persistent=true fires the timer at boot).
+  function flakyDocker() {
+    const dir = join(root, "flaky");
+    if (!existsSync(dir)) {
+      mkdirSync(dir);
+      writeFileSync(join(dir, "docker"), `#!/bin/sh
+case "$*" in *pg_isready*)
+  n=$(cat "$FLAKY_COUNT" 2>/dev/null || echo 0); echo $((n + 1)) > "$FLAKY_COUNT"
+  [ "$n" -ge "$FLAKY_FAILS" ] || exit 2 ;;
+esac
+exec "${REAL_DOCKER}" "$@"
+`, { mode: 0o755 });
+    }
+    return { PATH: `${dir}:${process.env.PATH}`, FLAKY_COUNT: join(root, `flaky-count-${Math.random()}`) };
+  }
+
+  dockerTest("backup waits for the database to accept connections before dumping", () => {
+    const target = join(root, "t4w");
+    const env = flakyDocker();
+    const r = backup(target, { ...env, FLAKY_FAILS: "2", CEREBRO_BACKUP_DATE: "2026-11-11", CEREBRO_BACKUP_DOW: "3" });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toMatch(/waiting for the database/i);
+    expect(Number(readFileSync(env.FLAKY_COUNT, "utf8"))).toBe(3);
+    expect(dumps(join(target, "nightly"))).toEqual(["2026-11-11.dump"]);
+  }, 60_000);
+
+  dockerTest("backup gives up when the database never becomes ready", () => {
+    const target = join(root, "t4x");
+    const r = backup(target, { ...flakyDocker(), FLAKY_FAILS: "1000", CEREBRO_BACKUP_DB_WAIT: "3", CEREBRO_BACKUP_DATE: "2026-11-11", CEREBRO_BACKUP_DOW: "3" });
+    expect(r.code).toBe(1);
+    expect(r.out + r.err).toMatch(/database not ready after 3 s/);
     expect(dumps(join(target, "nightly"))).toEqual([]);
   }, 60_000);
 

@@ -510,6 +510,7 @@ describe("check.sh", () => {
     FAKE_OLLAMA_LIST: "NAME             ID              SIZE      MODIFIED\nbge-m3:latest    790764642607    1.2 GB    2 days ago",
     FAKE_STATS: "cerebro-db 12.50%\ncerebro-ollama 40.00%\ncerebro-server 20.00%",
     FAKE_TIMER_STATE: "active",
+    FAKE_DF_PCT: "40%",
   };
 
   function checkSandbox(opts: { token?: boolean; backupHoursAgo?: number } = {}) {
@@ -561,6 +562,16 @@ describe("check.sh", () => {
     expect(warn.code, show(warn)).toBe(0);
     expect(warn.out).toMatch(/^warn +db-size /m);
     expect(warn.out).toContain("ALL OK");
+  });
+
+  test("check warns when the shared backup drive is over 80% full", () => {
+    const s = checkSandbox();
+    const ok = s.run("check.sh", [], GOOD);
+    expect(ok.out).toMatch(/^ok +backup-disk +\/DATA\/Backup 40% used$/m);
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_DF_PCT: "85%" });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +backup-disk +\/DATA\/Backup 85% used/m);
+    expect(r.out).toContain("ALL OK (1 warning(s))");
   });
 
   test("check fails the status check without the check token", () => {

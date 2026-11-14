@@ -1,0 +1,8 @@
+#!/bin/bash
+# Fake df: with FAKE_DF_PCT (e.g. 85%) every path is its own mountpoint at that use; otherwise the real df.
+if [[ -n ${FAKE_DF_PCT-} ]]; then
+  echo "Filesystem     1024-blocks      Used Available Capacity Mounted on"
+  echo "/dev/sdb1        250000000 200000000  50000000 $FAKE_DF_PCT ${*: -1}"
+  exit 0
+fi
+exec /bin/df "$@"
