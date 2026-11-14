@@ -86,11 +86,34 @@ test("oversized text is truncated with the marker", () => {
   const r = normalizeEntries([{ lineNo: 0, text: JSON.stringify({ type: "user", uuid: "00000000-0000-4000-a000-000000000001", timestamp: "2026-10-20T05:00:00.000Z", message: { role: "user", content: big } }) }], "s", new Map());
   const t = r.events[0]!.text;
   expect(t.endsWith(`\n[truncated by cerebro: ${big.length} bytes total]`)).toBe(true);
-  expect(t.length).toBeLessThan(8 * 1024 * 1024 + 100);
+  expect(t.length).toBeLessThan(4 * 1024 * 1024 + 100);
+});
+
+const userLine = (content: unknown) =>
+  JSON.stringify({ type: "user", uuid: "00000000-0000-4000-a000-000000000001", timestamp: "2026-10-20T05:00:00.000Z", message: { role: "user", content } });
+
+test("text that grows when JSON-encoded (newlines, quotes, terminal escapes) is cut so its encoding fits 4 MB", () => {
+  const big = "\n\"\u001b[0m".repeat(1024 * 1024); // 5 MB raw, ~17 MB as JSON
+  const t = normalizeEntries([{ lineNo: 0, text: userLine(big) }], "s", new Map()).events[0]!.text;
+  expect(t.endsWith(`\n[truncated by cerebro: ${Buffer.byteLength(big)} bytes total]`)).toBe(true);
+  expect(Buffer.byteLength(JSON.stringify(t))).toBeLessThan(4 * 1024 * 1024 + 100);
+});
+
+test("an oversized tool input becomes a size note with a preview; small inputs are kept", () => {
+  const command = "x".repeat(2 * 1024 * 1024);
+  const content = [
+    { type: "tool_use", id: "t1", name: "Bash", input: { command } },
+    { type: "tool_use", id: "t2", name: "Read", input: { file_path: "/a" } },
+  ];
+  const line = JSON.stringify({ type: "assistant", uuid: "00000000-0000-4000-a000-000000000002", timestamp: "2026-10-20T05:00:00.000Z", message: { role: "assistant", content } });
+  const [big, small] = normalizeEntries([{ lineNo: 0, text: line }], "s", new Map()).events;
+  const serialized = JSON.stringify({ command });
+  expect(big!.toolInput).toEqual({ truncated_by_cerebro: Buffer.byteLength(serialized), preview: serialized.slice(0, 2000) });
+  expect(small!.toolInput).toEqual({ file_path: "/a" });
 });
 
 test("a PEM key straddling the truncation cut is redacted, not cut", () => {
-  const limit = 8 * 1024 * 1024;
+  const limit = 4 * 1024 * 1024;
   const body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(40);
   const pem = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----`;
   // key starts 100 bytes before the limit, so the cut would land inside it and drop the END line
@@ -100,7 +123,7 @@ test("a PEM key straddling the truncation cut is redacted, not cut", () => {
   expect(t).toContain("[REDACTED:private-key]");
   expect(t).not.toContain("MIIEvQIBADANBg");
   expect(t).not.toContain("BEGIN PRIVATE KEY");
-  expect(t).toContain("[truncated by cerebro:");
+  expect(t.includes("[truncated by cerebro:")).toBe(true);
 });
 
 test("a secret in gitBranch is redacted in meta and sessionMeta", () => {

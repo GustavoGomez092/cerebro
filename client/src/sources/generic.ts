@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync,
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { storable, type EventKind, type IngestEvent } from "@cerebro/shared";
-import { clean, cleanDeep } from "./claude-code";
+import { clean, cleanDeep, cleanToolInput } from "./claude-code";
 import { headLines, readCompleteLines } from "./lines";
 import type { HistorySource, SourceFile, SourceRead } from "./types";
 
@@ -50,7 +50,7 @@ function parseEvent(line: string, sessionId: string, seq: number): IngestEvent |
   return {
     key: storable(e.key), sessionId, seq, ts, kind: e.kind as EventKind, text: clean(e.text),
     ...(typeof e.toolName === "string" ? { toolName: clean(e.toolName) } : {}),
-    ...(e.toolInput !== undefined ? { toolInput: cleanDeep(e.toolInput) } : {}),
+    ...(e.toolInput !== undefined ? { toolInput: cleanToolInput(e.toolInput) } : {}),
     ...(isObj(e.meta) ? { meta: cleanDeep(e.meta) as Obj } : {}),
   };
 }

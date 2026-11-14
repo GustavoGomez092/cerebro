@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IngestEvent, IngestSession } from "@cerebro/shared";
 import { createToken, revokeToken } from "../../server/src/auth";
 import { ApiClient } from "../src/api";
+import { captureTranscript } from "../src/capture";
 import { flush } from "../src/flush";
 import { Store } from "../src/store";
 import { liveServer, TEST_URL, type LiveServer } from "./harness";
@@ -440,4 +441,28 @@ test("an unexpected failure records lastError", async () => {
   broken.unsentSessions = () => { throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }); };
   await flush(broken, h.clientFor(broken));
   expect(store.get("lastError")).toContain("SQLITE_BUSY");
+});
+
+test("a 9 MB tool output uploads truncated instead of being quarantined", async () => {
+  const store = newStore();
+  const sid = crypto.randomUUID();
+  const dir = mkdtempSync(join(tmpdir(), "cerebro-flush-big-"));
+  dirs.push(dir);
+  const path = join(dir, `${sid}.jsonl`);
+  const entry = (i: number, message: unknown) => JSON.stringify({
+    type: i ? "user" : "assistant", uuid: `00000000-0000-4000-a000-00000000000${i + 1}`, timestamp: `2026-10-20T04:00:0${i}.000Z`,
+    entrypoint: "cli", sessionId: sid, cwd: "/w", message,
+  }) + "\n";
+  const output = "line of build output\n".repeat(450_000); // ~9 MB
+  writeFileSync(path,
+    entry(0, { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "bun run build" } }] }) +
+    entry(1, { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: output }] }));
+  const ident = { repo: "github.com/acme/flush", subpath: "", root: "/w", isGit: true };
+  store.cacheBinding(ident.repo, "", (await h.api.resolve(ident.repo, "")).binding);
+  expect(captureTranscript(store, { sessionId: sid, transcriptPath: path, cwd: "/w" }, ident).status).toBe("recorded");
+
+  const r = await flush(store, h.clientFor(store));
+  expect(r).toMatchObject({ outcome: "done", sent: 2, quarantined: 0 });
+  const [row] = await h.sql`select text from events where session_id = ${sid} and kind = 'tool_result'`;
+  expect(row.text.endsWith(`[truncated by cerebro: ${Buffer.byteLength(output)} bytes total]`)).toBe(true);
 });

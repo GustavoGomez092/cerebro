@@ -90,6 +90,26 @@ test("codex rollout → user/assistant/tool events, repo identity from the git u
   expect(r.sessionMeta).toMatchObject({ originator: "codex_cli_rs", cliVersion: "0.58.0", gitBranch: "main" });
 });
 
+/** What any adapter puts in place of a tool input whose JSON is over 1 MB. */
+const cappedInput = (input: unknown) => {
+  const json = JSON.stringify(input);
+  return { truncated_by_cerebro: Buffer.byteLength(json), preview: json.slice(0, 2000) };
+};
+
+test("codex and cerebro-jsonl tool inputs over 1 MB become a size note with a preview", async () => {
+  const huge = "y".repeat(2 * 1024 * 1024);
+  const { home } = codexHome(fixture("codex-rollout.jsonl").replace("placeholder command 11", huge));
+  const [codexFile] = await codexSource.discover({ home });
+  const call = codexSource.read(codexFile!, start).events.find((e) => e.kind === "tool_call")!;
+  expect(call.toolInput).toEqual(cappedInput({ command: [huge, "placeholder command 12"], workdir: "placeholder workdir 13" }));
+
+  const inboxHome = tmp();
+  write(join(inboxHome, ".cerebro", "inbox", "big.jsonl"), fixture("generic.jsonl").replace('"placeholder/path.txt"', JSON.stringify(huge)));
+  const [genericFile] = await genericSource.discover({ home: inboxHome });
+  const tool = genericSource.read(genericFile!, start).events.find((e) => e.kind === "tool_call")!;
+  expect(tool.toolInput).toEqual(cappedInput({ path: huge }));
+});
+
 test("codex: a growing rollout yields only the new lines; scripted runs are headless", async () => {
   const { home, path } = codexHome();
   const [file] = await codexSource.discover({ home });

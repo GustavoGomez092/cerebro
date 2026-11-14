@@ -2,7 +2,7 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { storable, type EventKind, type IngestEvent } from "@cerebro/shared";
-import { clean, cleanDeep } from "./claude-code";
+import { clean, cleanToolInput } from "./claude-code";
 import { headLines, readCompleteLines } from "./lines";
 import type { HistorySource, SourceFile, SourceRead } from "./types";
 
@@ -173,7 +173,7 @@ export const codexSource: HistorySource = {
             if (!name) { skipped++; break; }
             const callId = str(p.call_id);
             if (callId) toolNames.set(callId, name);
-            push("tool_call", "", { toolName: storable(name), toolInput: cleanDeep(toolInputOf(p)), ...(callId ? { meta: { callId: clean(callId) } } : {}) });
+            push("tool_call", "", { toolName: storable(name), toolInput: cleanToolInput(toolInputOf(p)), ...(callId ? { meta: { callId: clean(callId) } } : {}) });
             break;
           }
           case "function_call_output":

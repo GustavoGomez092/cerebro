@@ -5,7 +5,11 @@ import { redactSecrets, storable, type EventKind, type IngestEvent } from "@cere
 import { readCompleteLines } from "./lines";
 import type { HistorySource, SourceFile, SourceRead } from "./types";
 
-const MAX_TEXT_BYTES = 8 * 1024 * 1024;
+/** Event text over this (JSON-encoded) is truncated; with a capped tool input an event stays well under a batch (8 MB). */
+const MAX_TEXT_BYTES = 4 * 1024 * 1024;
+/** A tool input whose JSON is over this is replaced by its size and a preview. */
+const MAX_TOOL_INPUT_BYTES = 1024 * 1024;
+const TOOL_INPUT_PREVIEW_CHARS = 2000;
 const MAX_BLOCKS = 16;
 const MAX_TOOL_NAMES = 5000;
 
@@ -23,19 +27,26 @@ type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v : undefined);
 
+/** Bytes a string takes inside a JSON batch (escapes included, quotes not). */
+const encodedBytes = (s: string): number => Buffer.byteLength(JSON.stringify(s)) - 2;
+
 /**
  * Makes text storable and redacts secrets FIRST, then truncates, so a secret straddling the cut
- * (e.g. a PEM key losing its END line) can never survive unredacted.
+ * (e.g. a PEM key losing its END line) can never survive unredacted. The cut keeps the JSON encoding
+ * (where newlines, quotes and terminal escapes grow) within 4 MB, so one event always fits a batch.
  */
 export function clean(text: string): string {
   const t = redactSecrets(storable(text));
-  if (t.length * 3 > MAX_TEXT_BYTES) {
-    const bytes = Buffer.byteLength(t);
-    if (bytes > MAX_TEXT_BYTES) {
-      return storable(Buffer.from(t).subarray(0, MAX_TEXT_BYTES).toString("utf8")) + `\n[truncated by cerebro: ${bytes} bytes total]`;
-    }
+  // Each UTF-16 unit encodes to at most 6 JSON bytes, so shorter text can never be over the limit.
+  if (t.length * 6 <= MAX_TEXT_BYTES || encodedBytes(t) <= MAX_TEXT_BYTES) return t;
+  const raw = Buffer.from(t);
+  let keep = Math.min(raw.length, MAX_TEXT_BYTES);
+  for (;;) {
+    const cut = storable(raw.subarray(0, keep).toString("utf8"));
+    const size = encodedBytes(cut);
+    if (size <= MAX_TEXT_BYTES) return cut + `\n[truncated by cerebro: ${raw.length} bytes total]`;
+    keep = Math.floor((keep * MAX_TEXT_BYTES) / size) - 6; // shrink by the escape ratio seen, a little more each round
   }
-  return t;
 }
 
 /** Cleans every string value (keys go through `storable` only). */
@@ -44,6 +55,18 @@ export function cleanDeep(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(cleanDeep);
   if (isObj(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [storable(k), cleanDeep(x)]));
   return v;
+}
+
+/**
+ * Cleans a tool input like `cleanDeep`; when its JSON is over 1 MB it is replaced by its size and the
+ * start of that JSON, so a huge input (a file written in one call) never makes its event too big to upload.
+ */
+export function cleanToolInput(v: unknown): unknown {
+  const cleaned = cleanDeep(v);
+  const json = JSON.stringify(cleaned) ?? "";
+  // Each UTF-16 unit is at most 3 UTF-8 bytes, so shorter JSON can never be over the limit.
+  if (json.length * 3 <= MAX_TOOL_INPUT_BYTES || Buffer.byteLength(json) <= MAX_TOOL_INPUT_BYTES) return cleaned;
+  return { truncated_by_cerebro: Buffer.byteLength(json), preview: storable(json.slice(0, TOOL_INPUT_PREVIEW_CHARS)) };
 }
 
 function resultText(content: unknown): string {
@@ -141,7 +164,7 @@ export function normalizeEntries(
             if (!name) { skipped++; return; }
             const id = str(b.id);
             if (id) toolNames.set(id, name);
-            push(index, "tool_call", "", { toolName: storable(name), toolInput: cleanDeep(b.input ?? {}) });
+            push(index, "tool_call", "", { toolName: storable(name), toolInput: cleanToolInput(b.input ?? {}) });
             break;
           }
           case "tool_result": {
