@@ -41,6 +41,8 @@ run("image runs the pinned Claude Code CLI", () => {
 run("image runs as uid 10010 with the documented environment", () => {
   expect(sh("docker", "run", "--rm", IMAGE, "id", "-u").out).toBe("10010");
   expect(sh("docker", "run", "--rm", IMAGE, "sh", "-c", "echo $CLAUDE_CONFIG_DIR $SUMMARISER_CMD").out).toBe("/data/claude claude");
+  // The CLI is pinned: it must never update itself inside the container.
+  expect(sh("docker", "run", "--rm", IMAGE, "sh", "-c", "echo $DISABLE_AUTOUPDATER").out).toBe("1");
   expect(sh("docker", "run", "--rm", IMAGE, "sh", "-c", "touch /data/claude/w && echo ok").out).toBe("ok");
   const hc = JSON.parse(sh("docker", "inspect", IMAGE, "--format", "{{json .Config.Healthcheck}}").out);
   expect(hc.Interval).toBe(30_000_000_000);
