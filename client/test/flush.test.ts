@@ -297,7 +297,7 @@ test("many consecutive 413s from a small proxy limit never quarantine events tha
     }
     return h.fetch(req);
   }) as typeof fetch;
-  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped), { maxBytes: 1_000_000 });
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped), { maxBytes: 1_200_000 });
   expect(r.quarantined).toBe(0);
   expect(store.pendingCount()).toBe(0);
   expect(await serverCount(sid)).toBe(40);
@@ -319,6 +319,7 @@ test("a single event bigger than the proxy limit is quarantined as too_large aft
   }) as typeof fetch;
   const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
   expect(r.quarantined).toBe(1);
+  expect(store.pendingCount()).toBe(0);
   expect(await serverCount(sid)).toBe(4);
 });
 
@@ -380,18 +381,42 @@ test("a session row the server refuses on its own is retired and the reason reco
   expect(store.unsentSessions(10)).toEqual([]);
 });
 
-test("an end the server rejects with a 400 is dropped and the next end is still sent", async () => {
+test("a 408 backs off and quarantines nothing", async () => {
+  const { store } = seeded(3);
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, refusing(408, "request_timeout")));
+  expect(r.outcome).toBe("unreachable");
+  expect(store.quarantineCount()).toBe(0);
+  expect(store.pendingCount()).toBe(3);
+});
+
+test("a 403 on an end keeps it pending and backs off", async () => {
+  const store = newStore();
+  const a = uid();
+  store.upsertSession(session(a));
+  store.addPendingEnd(a, endedAt);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "forbidden", message: "no" }, { status: 403 });
+    return h.fetch(req);
+  }) as typeof fetch;
+  const r = await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
+  expect(r.outcome).toBe("unreachable");
+  expect(store.pendingEnds().length).toBe(1);
+  expect(store.get(`endRejected:${a}`)).toBeUndefined();
+});
+
+test("an end the server rejects as invalid data is dropped and the next end is still sent", async () => {
   const store = newStore();
   const [a, b] = [uid(), uid()];
   for (const id of [a, b]) { store.upsertSession(session(id)); store.enqueueEvents(events(id, 1)); store.addPendingEnd(id, endedAt); }
   const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
-    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "invalid_ended_at", message: "bad" }, { status: 400 });
+    if (new URL(req.url).pathname === `/v1/sessions/${a}/end`) return Response.json({ error: "invalid_ended_at", message: "bad" }, { status: 422 });
     return h.fetch(req);
   }) as typeof fetch;
   await flush(store, new ApiClient({ serverUrl: TEST_URL, token: h.token }, wrapped));
   expect(store.pendingEnds()).toEqual([]);
-  expect(store.get(`endRejected:${a}`)).toContain("400");
+  expect(store.get(`endRejected:${a}`)).toContain("invalid_ended_at");
   expect(await serverEnded(b)).toBe(endedAt);
 });
 
