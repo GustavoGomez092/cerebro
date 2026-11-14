@@ -2,49 +2,17 @@ import { test, expect, afterEach } from "bun:test";
 import { failoverEmbedder, primaryBudgetMs, PRIMARY_DOWN_MS } from "../src/embed/failover";
 import { EmbedderError } from "../src/embed/embedder";
 import { ollamaEmbedder } from "../src/embed/ollama";
+import { fakeOllama, DIGEST, type OllamaMode } from "./fakes/ollama";
 
 const DIMS = 1024;
 const MODEL = "bge-m3";
-const DIGEST = "790764642607" + "b".repeat(52);
 
-type Mode = "ok" | "503" | "400" | "hang" | "dims768";
-
-/** A stand-in Ollama on a random port: /api/tags and /api/embed, answering vectors filled with `fill`. */
-function fakeOllama(fill: number) {
-  const s = {
-    mode: "ok" as Mode,
-    models: [{ name: `${MODEL}:latest`, digest: DIGEST }] as { name: string; digest: string }[],
-    embedCalls: 0, tagCalls: 0, aborted: 0,
-    inputs: [] as string[][],
-    started: Promise.withResolvers<void>(),
-  };
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const path = new URL(req.url).pathname;
-      if (path === "/api/tags") { s.tagCalls++; return Response.json({ models: s.models }); }
-      if (path !== "/api/embed") return new Response("no", { status: 404 });
-      s.embedCalls++;
-      const body = (await req.json()) as { input: string[] };
-      s.inputs.push(body.input);
-      s.started.resolve();
-      if (s.mode === "hang") {
-        await new Promise((r) => req.signal.addEventListener("abort", () => { s.aborted++; r(null); }));
-        return new Response("", { status: 500 });
-      }
-      if (s.mode === "503") return new Response("busy", { status: 503 });
-      if (s.mode === "400") return new Response("bad input", { status: 400 });
-      const dims = s.mode === "dims768" ? 768 : DIMS;
-      return Response.json({ embeddings: body.input.map(() => new Array(dims).fill(fill)) });
-    },
-  });
-  return Object.assign(s, { url: `http://127.0.0.1:${server.port}`, server });
-}
+type Mode = OllamaMode;
 
 const servers: { server: ReturnType<typeof Bun.serve> }[] = [];
 afterEach(() => { for (const s of servers.splice(0)) s.server.stop(true); });
 
-function setup(opts: { digest?: string | null; primary?: boolean; budgetMs?: number } = {}) {
+function setup(opts: { digest?: string | null; primary?: boolean; budgetMs?: number; graceMs?: number } = {}) {
   const primary = fakeOllama(1);
   const fallback = fakeOllama(2);
   servers.push(primary, fallback);
@@ -57,6 +25,7 @@ function setup(opts: { digest?: string | null; primary?: boolean; budgetMs?: num
     now: () => t,
     log: (l) => logs.push(JSON.parse(l)),
     ...(opts.budgetMs ? { primaryBudgetMs: () => opts.budgetMs! } : {}),
+    ...(opts.graceMs ? { primaryGraceMs: () => opts.graceMs! } : {}),
   });
   return { primary, fallback, embedder, logs, advance: (ms: number) => { t += ms; } };
 }
@@ -111,15 +80,39 @@ test("after the 60 s window the primary is probed again: used when back, down ag
   expect(embedder.routing()).toMatchObject({ primary: { state: "up", lastError: null }, lastUsed: "primary" });
 });
 
-test("a primary that doesn't answer within its budget falls back, and its request is cancelled", async () => {
-  const { primary, embedder } = setup({ budgetMs: 100 });
+test("a primary that doesn't answer within its budget: this call falls back; down only once its grace runs out", async () => {
+  const { primary, embedder } = setup({ budgetMs: 100, graceMs: 400 });
   primary.mode = "hang";
   const started = performance.now();
   expect(from(await embedder.embed(["a"]))).toEqual([2]);
-  expect(performance.now() - started).toBeLessThan(2000);
-  await Bun.sleep(20);
+  expect(performance.now() - started).toBeLessThan(350);
+  expect(embedder.routing().primary.state).toBe("unknown"); // maybe just loading the model
+  expect(from(await embedder.embed(["b"]))).toEqual([2]); // a request is still out: straight to the fallback
+  expect(primary.embedCalls).toBe(1);
+  await Bun.sleep(450);
   expect(primary.aborted).toBe(1);
-  expect(embedder.routing().primary.state).toBe("down");
+  expect(embedder.routing().primary).toMatchObject({ state: "down", lastError: expect.stringContaining("no answer") });
+});
+
+test("a cold model load is not 'down': the slow call falls back once, the load finishes, the next call uses the primary", async () => {
+  const { primary, fallback, embedder } = setup({ budgetMs: 100, graceMs: 2000 });
+  primary.mode = "slow";
+  primary.delayMs = 300;
+  expect(from(await embedder.embed(["q1"]))).toEqual([2]);
+  await Bun.sleep(350);
+  expect(embedder.routing().primary.state).toBe("up");
+  primary.mode = "ok";
+  expect(from(await embedder.embed(["q2"]))).toEqual([1]);
+  expect(fallback.embedCalls).toBe(1);
+});
+
+test("machine endpoints are asked to keep the model loaded 30 minutes; the fallback keeps its own setting (-1)", async () => {
+  const { primary, fallback, embedder } = setup();
+  await embedder.embed(["a"]);
+  primary.mode = "503";
+  await embedder.embed(["b"]);
+  expect(primary.keepAlive).toEqual(["30m", "30m"]);
+  expect(fallback.keepAlive).toEqual([-1]);
 });
 
 test("a primary answering with the wrong dims never yields vectors: it falls back and is marked down", async () => {

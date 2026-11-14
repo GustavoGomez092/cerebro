@@ -2,9 +2,12 @@ import { EmbedderError, type Embedder } from "./embedder";
 
 export { EmbedderError };
 
-/** Embeddings from an Ollama server (`POST /api/embed`); keeps the model loaded between calls. */
+/**
+ * Embeddings from an Ollama server (`POST /api/embed`). `keepAlive` is how long Ollama keeps the model loaded after
+ * the call: -1 (forever) for the Zima's own container.
+ */
 export function ollamaEmbedder(
-  url: string, model: string, dims: number, fetchFn: typeof fetch = fetch, timeoutMs = 120_000,
+  url: string, model: string, dims: number, fetchFn: typeof fetch = fetch, timeoutMs = 120_000, keepAlive: number | string = -1,
 ): Embedder {
   const endpoint = `${url.replace(/\/+$/, "")}/api/embed`;
   return {
@@ -16,7 +19,7 @@ export function ollamaEmbedder(
         const res = await fetchFn(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model, input: texts, keep_alive: -1 }),
+          body: JSON.stringify({ model, input: texts, keep_alive: keepAlive }),
           signal: AbortSignal.any(signals),
         });
         if (!res.ok) {

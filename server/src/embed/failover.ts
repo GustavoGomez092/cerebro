@@ -16,10 +16,28 @@ export const PRIMARY_DOWN_MS = 60_000;
 export const PRIMARY_BASE_MS = 2000;
 const PRIMARY_MS_PER_CHAR = 0.4;
 const PRIMARY_MAX_MS = 60_000;
+const charsOf = (texts: string[]) => texts.reduce((n, t) => n + t.length, 0);
 export function primaryBudgetMs(texts: string[]): number {
-  const chars = texts.reduce((n, t) => n + t.length, 0);
-  return Math.min(PRIMARY_MAX_MS, PRIMARY_BASE_MS + Math.ceil(chars * PRIMARY_MS_PER_CHAR));
+  return Math.min(PRIMARY_MAX_MS, PRIMARY_BASE_MS + Math.ceil(charsOf(texts) * PRIMARY_MS_PER_CHAR));
 }
+
+/**
+ * How long an endpoint may take before it counts as down. A Mac's Ollama that unloaded bge-m3 reloads it on the
+ * next call (1.6 s measured, ~2 s budgeted); a query that can't wait falls back after primaryBudgetMs while the
+ * request carries on, so the load completes and the endpoint stays up. 15 s (plus the per-char allowance) covers
+ * a cold load on a busy Mac; a sleeping Mac (the connect hangs) is marked down when it runs out.
+ */
+export const PRIMARY_GRACE_MS = 15_000;
+export function primaryGraceMs(texts: string[]): number {
+  return Math.min(PRIMARY_MAX_MS, PRIMARY_GRACE_MS + Math.ceil(charsOf(texts) * PRIMARY_MS_PER_CHAR));
+}
+
+/**
+ * keep_alive sent to the machine endpoints: a Mac's Ollama unloads a model after 5 idle minutes by default, and a
+ * cold call costs ~1.6 s against ~0.2 s warm. 30 minutes keeps it warm through a working session without pinning
+ * ~1.2 GB on the Mac forever. Not sent to the Zima fallback, whose container sets OLLAMA_KEEP_ALIVE=-1.
+ */
+export const MACHINE_KEEP_ALIVE = "30m";
 
 /** The URL for status and logs: credentials (if any) removed. */
 function displayUrl(url: string): string {
@@ -57,8 +75,10 @@ export interface EndpointOptions {
   digest?: string | null;
   now?: () => number;
   log?: (line: string) => void;
-  /** The per-call budget (tests shorten it). */
+  /** How long a caller that can fall back waits before it does (tests shorten it). */
   primaryBudgetMs?: (texts: string[]) => number;
+  /** How long before an unanswered call marks the endpoint down (tests shorten it). */
+  primaryGraceMs?: (texts: string[]) => number;
   fetchFn?: typeof fetch;
 }
 
@@ -76,6 +96,9 @@ export class Endpoint {
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private readonly budget: (texts: string[]) => number;
+  private readonly grace: (texts: string[]) => number;
+  /** A call that outran its budget is still out (maybe loading the model): fallback-capable callers skip ahead. */
+  private slowPending = 0;
   private readonly digest: string | null;
   private state: EndpointState = "unknown";
   private lastError: string | null = null;
@@ -91,9 +114,10 @@ export class Endpoint {
     this.now = o.now ?? Date.now;
     this.log = o.log ?? ((l: string) => console.log(l));
     this.budget = o.primaryBudgetMs ?? primaryBudgetMs;
+    this.grace = o.primaryGraceMs ?? primaryGraceMs;
     this.digest = o.digest ?? null;
     this.verified = !this.digest;
-    this.ollama = ollamaEmbedder(o.url, o.model, o.dims, o.fetchFn ?? fetch, PRIMARY_MAX_MS);
+    this.ollama = ollamaEmbedder(o.url, o.model, o.dims, o.fetchFn ?? fetch, PRIMARY_MAX_MS, MACHINE_KEEP_ALIVE);
   }
 
   /** Sitting out a down or mismatch window: not to be tried yet. */
@@ -102,6 +126,9 @@ export class Endpoint {
   }
 
   get lastFailure(): string | null { return this.lastError; }
+
+  /** How long a caller that can fall back waits for this endpoint. */
+  budgetFor(texts: string[]): number { return this.budget(texts); }
 
   private setDown(next: "down" | "digest_mismatch", error: string) {
     if (this.state !== next) {
@@ -164,28 +191,44 @@ export class Endpoint {
   }
 
   /**
-   * Embeds here. Null when the endpoint is not usable or failed (it is then down for PRIMARY_DOWN_MS). The
-   * caller's abort and a bad-input answer (an error status other than 404/5xx) are thrown: neither says the
-   * endpoint is broken, and the fallback would refuse bad input too.
+   * Embeds here. Null when the endpoint is not usable or failed (it is then down for PRIMARY_DOWN_MS), or, with
+   * `fallbackAfterMs`, when it hasn't answered by then: the request carries on (a cold model load finishes and
+   * the endpoint stays up) and only marks the endpoint down if it fails or outlasts its grace. The caller's abort
+   * and a bad-input answer (an error status other than 404/5xx) are thrown: neither says the endpoint is broken,
+   * and the fallback would refuse bad input too.
    */
-  async tryEmbed(texts: string[], signal?: AbortSignal): Promise<number[][] | null> {
+  async tryEmbed(texts: string[], signal?: AbortSignal, opts: { fallbackAfterMs?: number } = {}): Promise<number[][] | null> {
+    const canFallBack = opts.fallbackAfterMs !== undefined;
+    if (canFallBack && this.slowPending > 0) return null;
     if (!(await this.usable(signal))) return null;
-    const deadline = AbortSignal.timeout(this.budget(texts));
-    try {
-      const v = await this.ollama.embed(texts, signal ? AbortSignal.any([signal, deadline]) : deadline);
-      this.setUp();
-      this.lastUsedAt = new Date(this.now()).toISOString();
-      return v;
-    } catch (e) {
-      if (signal?.aborted) throw e;
-      const err = e as EmbedderError;
-      if (!deadline.aborted && !err.transient && err.status !== undefined) {
-        this.setUp(); // it answered
-        throw e;
-      }
-      this.setDown("down", deadline.aborted ? `no answer within ${this.budget(texts)} ms` : err.message);
-      return null;
-    }
+    const graceMs = this.grace(texts);
+    const deadline = AbortSignal.timeout(graceMs);
+    const settled = this.ollama.embed(texts, signal ? AbortSignal.any([signal, deadline]) : deadline).then(
+      (v) => {
+        this.setUp();
+        this.lastUsedAt = new Date(this.now()).toISOString();
+        return v;
+      },
+      (e) => {
+        if (signal?.aborted) throw e;
+        const err = e as EmbedderError;
+        if (!deadline.aborted && !err.transient && err.status !== undefined) {
+          this.setUp(); // it answered
+          throw e;
+        }
+        this.setDown("down", deadline.aborted ? `no answer within ${graceMs} ms` : err.message);
+        return null;
+      },
+    );
+    if (!canFallBack) return settled;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const slow = Symbol("slow");
+    const first = await Promise.race([settled, new Promise<typeof slow>((r) => { timer = setTimeout(() => r(slow), opts.fallbackAfterMs); })])
+      .finally(() => clearTimeout(timer));
+    if (first !== slow) return first;
+    this.slowPending++;
+    settled.catch(() => {}).finally(() => { this.slowPending--; });
+    return null;
   }
 
   status(): EndpointStatus {
@@ -220,7 +263,7 @@ function withFallback(endpoint: Endpoint, fallback: Embedder, used: (which: "pri
   return {
     dims: fallback.dims,
     async embed(texts, signal) {
-      const v = await endpoint.tryEmbed(texts, signal);
+      const v = await endpoint.tryEmbed(texts, signal, { fallbackAfterMs: endpoint.budgetFor(texts) });
       if (v) { used("primary"); return v; }
       const fb = await fallback.embed(texts, signal);
       used("fallback");

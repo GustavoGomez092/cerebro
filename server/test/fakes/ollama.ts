@@ -1,5 +1,5 @@
 /** A stand-in Ollama on a random port (Bun.serve, port 0): /api/tags and /api/embed. Never the real one. */
-export type OllamaMode = "ok" | "503" | "400" | "hang" | "dims768";
+export type OllamaMode = "ok" | "503" | "400" | "hang" | "dims768" | "slow";
 export const DIGEST = "790764642607" + "b".repeat(52);
 
 /** Vectors are 1024 dims filled with `fill`, so a test can tell which Ollama answered. */
@@ -8,7 +8,10 @@ export function fakeOllama(fill: number, dims = 1024) {
     mode: "ok" as OllamaMode,
     models: [{ name: "bge-m3:latest", digest: DIGEST }] as { name: string; digest: string }[],
     embedCalls: 0, tagCalls: 0, aborted: 0,
+    /** "slow": answers after this long (a cold model load), unless the request is aborted first. */
+    delayMs: 300,
     inputs: [] as string[][],
+    keepAlive: [] as unknown[],
     started: Promise.withResolvers<void>(),
   };
   const server = Bun.serve({
@@ -18,12 +21,20 @@ export function fakeOllama(fill: number, dims = 1024) {
       if (path === "/api/tags") { s.tagCalls++; return Response.json({ models: s.models }); }
       if (path !== "/api/embed") return new Response("no", { status: 404 });
       s.embedCalls++;
-      const body = (await req.json()) as { input: string[] };
+      const body = (await req.json()) as { input: string[]; keep_alive?: unknown };
       s.inputs.push(body.input);
+      s.keepAlive.push(body.keep_alive);
       s.started.resolve();
       if (s.mode === "hang") {
         await new Promise((r) => req.signal.addEventListener("abort", () => { s.aborted++; r(null); }));
         return new Response("", { status: 500 });
+      }
+      if (s.mode === "slow") {
+        const aborted = await new Promise<boolean>((r) => {
+          setTimeout(() => r(false), s.delayMs);
+          req.signal.addEventListener("abort", () => { s.aborted++; r(true); });
+        });
+        if (aborted) return new Response("", { status: 500 });
       }
       if (s.mode === "503") return new Response("busy", { status: 503 });
       if (s.mode === "400") return new Response("bad input", { status: 400 });
