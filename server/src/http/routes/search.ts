@@ -21,8 +21,8 @@ export function searchRoutes({ sql, embedder }: AppDeps) {
   r.post("/search", async (c) => {
     const b = await parseBody(c, schema);
     if (b instanceof Response) return b;
-    const { scope, hits } = await search(sql, embedder, b);
-    return c.json({ scope: scope.kind, hits });
+    const { scope, hits, degraded } = await search(sql, embedder, b);
+    return c.json({ scope: scope.kind, hits, degraded });
   });
   return r;
 }

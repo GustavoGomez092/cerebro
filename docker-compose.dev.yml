@@ -15,4 +15,17 @@ services:
     image: ollama/ollama:0.12.6
     profiles: ["embed"]
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:11435:11434"
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    profiles: ["app"]
+    environment:
+      DATABASE_URL: postgres://cerebro:cerebro@db:5432/cerebro
+      EMBED_URL: http://ollama:11434
+    ports:
+      - "127.0.0.1:8790:8790"
+    depends_on:
+      db:
+        condition: service_healthy

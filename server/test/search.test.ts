@@ -111,3 +111,21 @@ test("limit is capped at 50 and invalid bodies are 400", async () => {
     expect((await t.call("POST", "/v1/search", { nope: 1 })).status).toBe(400);
   } finally { await t.drop(); }
 });
+
+test("search falls back to full-text when the embedder is down", async () => {
+  const { t } = await world();
+  try {
+    const { createApp } = await import("../src/http/app");
+    const { EmbedderError } = await import("../src/embed/embedder");
+    const app = createApp({ sql: t.sql, embedder: { dims: 1024, embed: async () => { throw new EmbedderError("down"); } } });
+    const res = await app.request("/v1/search", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${t.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "renewal" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hits.map((h: any) => h.sessionId)).toEqual(["s2"]);
+    expect(body.degraded).toBe(true);
+  } finally { await t.drop(); }
+});

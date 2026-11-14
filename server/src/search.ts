@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import type { SearchHit, SearchRequest, SearchScope } from "@cerebro/shared";
 import { resolveBinding } from "./bindings";
-import type { Embedder } from "./embed/embedder";
+import { EmbedderError, type Embedder } from "./embed/embedder";
 import { toVector } from "./indexer";
 
 const CANDIDATES = 50;
@@ -16,12 +16,24 @@ export async function scopeFor(sql: SQL, req: SearchRequest): Promise<SearchScop
   return { kind: "open", clientId: req.clientId, projectId: req.projectId };
 }
 
-export async function search(sql: SQL, embedder: Embedder, req: SearchRequest): Promise<{ scope: SearchScope; hits: SearchHit[] }> {
+/**
+ * Hybrid search (full-text + vector, merged by reciprocal-rank fusion). If the embedder is
+ * unavailable, falls back to full-text only and reports `degraded: true`.
+ */
+export async function search(
+  sql: SQL, embedder: Embedder, req: SearchRequest,
+): Promise<{ scope: SearchScope; hits: SearchHit[]; degraded: boolean }> {
   const scope = await scopeFor(sql, req);
   const query = req.query.trim();
-  if (!query) return { scope, hits: [] };
+  if (!query) return { scope, hits: [], degraded: false };
   const limit = Math.min(req.limit ?? 10, 50);
-  const [qvec] = await embedder.embed([query]);
+  let qvec: number[] | null = null;
+  try {
+    [qvec] = await embedder.embed([query]);
+  } catch (e) {
+    if (!(e instanceof EmbedderError)) throw e;
+    console.error(`search: embedder unavailable, full-text only: ${e.message}`);
+  }
 
   const where: string[] = [];
   const params: unknown[] = [query];
@@ -41,18 +53,21 @@ export async function search(sql: SQL, embedder: Embedder, req: SearchRequest): 
     const fts = await tx.unsafe(
       `select c.id ${scoped} and c.tsv @@ websearch_to_tsquery('simple', $1)
        order by ts_rank(c.tsv, websearch_to_tsquery('simple', $1)) desc limit ${CANDIDATES}`, params);
-    params.push(toVector(qvec));
-    const vec = await tx.unsafe(
+    let vec: any[] = [];
+    if (qvec) {
+      params.push(toVector(qvec));
+      vec = await tx.unsafe(
       // $1 (the query text) is unused here but shares the parameter list; reference it so Postgres can type it.
       `select c.id ${scoped} and $1::text is not null
        order by c.embedding <=> $${params.length}::text::vector limit ${CANDIDATES}`, params);
+    }
 
     const score = new Map<number, number>();
     for (const list of [fts, vec]) {
       list.forEach((r: any, i: number) => score.set(Number(r.id), (score.get(Number(r.id)) ?? 0) + 1 / (RRF_K + i + 1)));
     }
     const top = [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
-    if (!top.length) return { scope, hits: [] };
+    if (!top.length) return { scope, hits: [], degraded: !qvec };
 
     const rows = await tx.unsafe(
       `select c.id, c.session_id, c.first_seq, c.last_seq, c.ts_from, c.ts_to,
@@ -72,6 +87,6 @@ export async function search(sql: SQL, embedder: Embedder, req: SearchRequest): 
         clientName: r.client_name, projectName: r.project_name,
       };
     });
-    return { scope, hits };
+    return { scope, hits, degraded: !qvec };
   });
 }
