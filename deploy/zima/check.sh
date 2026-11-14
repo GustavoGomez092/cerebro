@@ -94,13 +94,22 @@ else
     fail embedder "$pending pending, last success $last"
   fi
 
+  # summariser.paused.reason (server/src/summarise/loop.ts PauseReason): login and unavailable need the owner;
+  # budget and usage_limit are normal deferral that ends by itself; disabled is SUMMARISER_ENABLED=false.
   reason=$(jq -r '.summariser.paused.reason // empty' <<<"$status")
-  if ! jq -e 'has("summariser")' >/dev/null <<<"$status"; then
+  until=$(jq -r '.summariser.paused.until // empty' <<<"$status")
+  if ! jq -e '.summariser | type == "object"' >/dev/null <<<"$status"; then
     warn summariser "not reported by /v1/status"
   elif [[ $reason == login ]]; then
     fail summariser "paused: Claude login expired (ssh -t zima sudo docker exec -it -u cerebro cerebro-server claude auth login)"
+  elif [[ $reason == unavailable ]]; then
+    fail summariser "paused: Claude CLI unavailable / outage (probing again ${until:-soon}; see docker logs cerebro-server)"
+  elif [[ $reason == budget || $reason == usage_limit ]]; then
+    ok summariser "paused: $reason until ${until:-unknown} (jobs wait, nothing is lost)"
+  elif [[ $reason == disabled ]]; then
+    ok summariser "disabled (SUMMARISER_ENABLED); jobs stay queued"
   elif [[ -n $reason ]]; then
-    ok summariser "paused: $reason (jobs wait, nothing is lost)"
+    warn summariser "paused: unknown reason $reason"
   else
     ok summariser "running"
   fi

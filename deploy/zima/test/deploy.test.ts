@@ -736,6 +736,43 @@ describe("check.sh", () => {
     expect(r.out).toMatch(/^FAIL +status .*check\.token/m);
   });
 
+  test("summariser: an expired login and an outage fail the check", () => {
+    const s = checkSandbox();
+    const login = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ paused: "login" }) });
+    expect(login.code, show(login)).toBe(1);
+    expect(login.out).toMatch(/^FAIL +summariser +paused: Claude login expired /m);
+    expect(login.out).toContain("FAILED: summariser");
+    const down = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ paused: "unavailable" }) });
+    expect(down.code, show(down)).toBe(1);
+    expect(down.out).toMatch(/^FAIL +summariser +paused: Claude CLI unavailable \/ outage/m);
+    expect(down.out).toContain("FAILED: summariser");
+  });
+
+  test("summariser: budget and usage-limit pauses are normal deferral, reported without failing", () => {
+    const s = checkSandbox();
+    for (const reason of ["budget", "usage_limit"]) {
+      const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ paused: reason }) });
+      expect(r.code, show(r)).toBe(0);
+      expect(r.out).toMatch(new RegExp(`^(ok|warn) +summariser +paused: ${reason} `, "m"));
+      expect(r.out).toContain("ALL OK");
+    }
+  });
+
+  test("summariser: disabled by config is reported, and a missing block warns", () => {
+    const s = checkSandbox();
+    const off = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ paused: "disabled" }) });
+    expect(off.code, show(off)).toBe(0);
+    expect(off.out).toMatch(/^ok +summariser +disabled \(SUMMARISER_ENABLED\)/m);
+    const running = s.run("check.sh", [], GOOD);
+    expect(running.out).toMatch(/^ok +summariser +running$/m);
+    const missing = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ summariser: false }) });
+    expect(missing.code, show(missing)).toBe(0);
+    expect(missing.out).toMatch(/^warn +summariser +not reported by \/v1\/status/m);
+    const nul = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: JSON.stringify({ ...JSON.parse(status()), summariser: null }) });
+    expect(nul.code, show(nul)).toBe(0);
+    expect(nul.out).toMatch(/^warn +summariser +not reported by \/v1\/status/m);
+  });
+
   test("an idle embedder with an empty queue is fine", () => {
     const s = checkSandbox();
     const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ lastSuccessMinutes: null, pending: 0 }) });

@@ -35,7 +35,9 @@ never retry quickly and never open parallel connections).
    ssh -t zima sudo docker exec -it -u cerebro -e CLAUDE_CONFIG_DIR=/data/claude cerebro-server claude auth login
    ssh -t zima sudo docker exec -it -u cerebro -e CLAUDE_CONFIG_DIR=/data/claude cerebro-server claude auth status
    ```
-   `check.sh` fails `summariser` with "Claude login expired" when it has to be repeated.
+   `check.sh` fails `summariser` with "Claude login expired" when it has to be repeated, and with "Claude CLI
+   unavailable / outage" while the CLI is missing or the API is unreachable (the summariser probes and resumes by
+   itself; a budget or usage-limit pause is normal deferral and only reported).
 5. **A token per Mac**, created on the server in a plain terminal (never inside a recorded Claude Code session:
    the token is printed once):
    ```sh
