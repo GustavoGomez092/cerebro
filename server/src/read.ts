@@ -25,15 +25,15 @@ export async function listSessions(
   const add = (cond: string, v: unknown) => { params.push(v); where.push(cond.replace("?", `$${params.length}`)); };
   if (f.from) add("coalesce(s.last_event_at, s.started_at) >= ?::timestamptz", f.from);
   if (f.to) add("s.started_at <= ?::timestamptz", f.to);
-  if (f.before) {
-    const [ts, id] = f.before.split("|");
-    params.push(ts, id ?? "");
+  const cursor = f.before ? parseCursor(f.before) : null;
+  if (cursor) {
+    params.push(cursor.ts, cursor.id);
     where.push(`(s.started_at, s.id) < ($${params.length - 1}::timestamptz, $${params.length})`);
   }
   const limit = Math.min(f.limit ?? 50, 200);
   const rows = await sql.unsafe(
     `select s.id, cl.name as client_name, p.name as project_name, m.name as machine, s.cwd,
-            s.started_at, s.last_event_at, s.ended_at, s.imported
+            s.started_at, ${cursorTs("s.started_at")} as cursor_ts, s.last_event_at, s.ended_at, s.imported
      from sessions s join bindings b on b.id = s.binding_id join machines m on m.id = s.machine_id
      left join clients cl on cl.id = b.client_id left join projects p on p.id = b.project_id
      where ${where.join(" and ")}
@@ -43,8 +43,24 @@ export async function listSessions(
     startedAt: r.started_at.toISOString(), lastEventAt: r.last_event_at?.toISOString() ?? null,
     endedAt: r.ended_at?.toISOString() ?? null, imported: r.imported,
   }));
-  const last = sessions[sessions.length - 1];
-  return { sessions, next: sessions.length === limit && last ? `${last.startedAt}|${last.id}` : null };
+  const last = rows[rows.length - 1];
+  return { sessions, next: rows.length === limit && last ? `${last.cursor_ts}|${last.id}` : null };
+}
+
+const CURSOR_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+
+/**
+ * SQL for a timestamptz as UTC text at full (microsecond) precision. Page cursors use it: a JS Date
+ * keeps only milliseconds, so rows sharing a millisecond would be skipped.
+ */
+export const cursorTs = (col: string) => `to_char(${col} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+
+/** Splits a `<utc timestamp>|<id>` page cursor (the id may itself contain "|"); null when malformed. */
+export function parseCursor(s: string): { ts: string; id: string } | null {
+  const i = s.indexOf("|");
+  if (i < 0) return null;
+  const ts = s.slice(0, i), id = s.slice(i + 1);
+  return CURSOR_TS.test(ts) && id ? { ts, id } : null;
 }
 
 /**

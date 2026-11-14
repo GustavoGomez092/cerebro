@@ -5,9 +5,19 @@ import { embedPending, newWorkerState } from "../src/worker";
 import { fakeEmbedder } from "../src/embed/fake";
 import { EmbedderError, type Embedder } from "../src/embed/embedder";
 import { embedSummary, summaryEmbedText } from "../src/summarise/summarise";
+import { search } from "../src/search";
 
 const down: Embedder = { dims: 1024, embed: async () => { throw new EmbedderError("down", { transient: true }); } };
 const day = (d: number, h = 12) => new Date(Date.UTC(2026, 9, d, h)).toISOString();
+
+/** Polls `check` until it returns true (or fails after `ms`). */
+async function until(check: () => Promise<boolean>, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!(await check())) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await Bun.sleep(20);
+  }
+}
 
 /**
  * Two clients: Acme (project P1 on a/one, client-only a/three) and Beta (project P2 on b/two),
@@ -124,6 +134,24 @@ test("summaries list pages and filters by date", async () => {
     expect((await get(`/v1/summaries?scope=open&clientId=${A.id}`)).body.summaries).toHaveLength(4);
     expect((await get("/v1/summaries")).status).toBe(400);
 
+    // Equal timestamps down to the microsecond page by id: nothing skipped, nothing repeated.
+    const tie = [
+      await summary(b2, { title: "Tie one", overview: "t", tsFrom: day(20), tsTo: day(20) }),
+      await summary(b2, { title: "Tie two", overview: "t", tsFrom: day(21), tsTo: day(21) }),
+    ];
+    await t.sql`update summaries set ts_to = '2026-10-21T00:00:00.123456Z' where id = ${tie[0]} or id = ${tie[1]}`;
+    const seen: number[] = [];
+    let next: string | null = "";
+    while (next !== null && seen.length < 10) {
+      const page = await get(`/v1/summaries?scope=open&projectId=${P2.id}&limit=1${next ? `&before=${encodeURIComponent(next)}` : ""}`);
+      expect(page.status).toBe(200);
+      seen.push(...page.body.summaries.map((s: any) => s.id));
+      next = page.body.next;
+    }
+    expect(seen.slice(0, 2)).toEqual([tie[1], tie[0]]);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen).toHaveLength(3);
+
     // A folder re-bound to another client takes its summaries out of the old client's scope.
     await bind("github.com/a/three", B.id, P2.id, "active", "", true);
     expect((await get(`/v1/summaries?scope=open&clientId=${A.id}`)).body.summaries.map((s: any) => s.title)).not.toContain("Acme misc");
@@ -164,7 +192,7 @@ test("initial history is stored for the bound folder only and redacted", async (
     }
     expect(row.text).toContain("[REDACTED:anthropic-key]");
     expect(row.body.overview).toContain("Zebra importer");
-    expect((await t.sql`select 1 from summary_embeddings where summary_id = ${row.id}`).length).toBe(1);
+    await until(async () => (await t.sql`select 1 from summary_embeddings where summary_id = ${row.id}`).length === 1);
     const [st] = await t.sql`select dirty from project_states where scope = ${`project:${P1.id}`}`;
     expect(st.dirty).toBe(true);
     expect((await t.sql`select count(*)::int as n from usage_ledger`)[0].n).toBe(0);
@@ -176,7 +204,25 @@ test("initial history is stored for the bound folder only and redacted", async (
     expect((await again.json()).summary.id).toBe(summary.id);
     const rows = await t.sql`select title from summaries`;
     expect(rows.map((r: any) => r.title)).toEqual(["Rewritten history"]);
+    await until(async () => (await t.sql`select 1 from summary_embeddings where summary_id = ${row.id}`).length === 1);
   } finally { await t.drop(); }
+});
+
+test("saving a history answers at once and embeds in the background", async () => {
+  let release!: () => void;
+  const answered = new Promise<void>((r) => { release = r; });
+  const slow: Embedder = { dims: 1024, embed: async (texts) => { await answered; return fakeEmbedder().embed(texts); } };
+  const { t } = await world({ embedder: slow });
+  try {
+    const started = Date.now();
+    const res = await t.call("POST", "/v1/summaries", { repo: "github.com/a/one", subpath: "", title: "Slow history", text: "the zebra importer", tsFrom: day(1), tsTo: day(2) });
+    expect(res.status).toBe(201);
+    expect(Date.now() - started).toBeLessThan(1000);
+    const { summary } = await res.json();
+    expect((await t.sql`select count(*)::int as n from summary_embeddings`)[0].n).toBe(0);
+    release();
+    await until(async () => (await t.sql`select 1 from summary_embeddings where summary_id = ${summary.id}`).length === 1);
+  } finally { release(); await t.drop(); }
 });
 
 test("an un-embedded history is still stored and found by full text", async () => {
@@ -230,6 +276,25 @@ test("search returns summary hits with kind, and include=raw excludes them", asy
     expect((await t.call("POST", "/v1/search", { query: "x", scope: "open", include: "bogus" })).status).toBe(400);
   } finally { await t.drop(); }
 });
+
+test("degraded reasons come back sorted", async () => {
+  const { t, b1, summary } = await world();
+  const lock = await t.sql.reserve();
+  try {
+    await summary(b1, { title: "Zebra summary", overview: "zebra", tsFrom: day(1), tsTo: day(1) });
+    // The summaries table is locked, so its full-text leg hits the 5 s statement timeout; the query
+    // embedding fails later (5.5 s), so the reasons arrive out of order.
+    await lock`begin`;
+    await lock`lock table summaries in access exclusive mode`;
+    const hang: Embedder = { dims: 1024, embed: (_x, signal) => new Promise((_r, rej) => signal?.addEventListener("abort", () => rej(new EmbedderError("aborted")))) };
+    const r = await search(t.sql, hang, { query: "zebra", repo: "github.com/a/one" }, { embedTimeoutMs: 5500 });
+    expect(r.degradedReasons).toEqual(["embedder", "summary_fts_timeout"]);
+  } finally {
+    await lock`rollback`;
+    lock.release();
+    await t.drop();
+  }
+}, 20_000);
 
 test("summary legs degrade on their own", async () => {
   const { t, b1, summary } = await world({ embedder: down });

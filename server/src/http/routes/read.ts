@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppDeps, Env } from "../app";
-import { getEvents, listSessions } from "../../read";
+import { getEvents, listSessions, parseCursor } from "../../read";
 import { scopeFor, ScopeError } from "../../search";
 import type { Binding, SearchScope } from "@cerebro/shared";
 import { BindingError } from "../../bindings";
@@ -22,7 +22,7 @@ const listQuery = z.object({
   from: iso.optional(),
   to: iso.optional(),
   limit: int(1, 200).optional(),
-  before: z.string().max(300).optional(),
+  before: z.string().max(300).refine((s) => parseCursor(s) !== null, { message: "before must be a cursor from a previous page's next" }).optional(),
 }).refine((q) => !q.from || !q.to || Date.parse(q.from) <= Date.parse(q.to), { message: "from must not be after to" });
 const eventsQuery = z.object({ ...scopeParams, afterSeq: int(-1, 2_147_483_647).optional(), limit: int(1, 1000).optional(), full: z.literal("1").optional() });
 

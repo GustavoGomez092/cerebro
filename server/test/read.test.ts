@@ -55,6 +55,28 @@ test("session list pages with a cursor", async () => {
   } finally { await t.drop(); }
 });
 
+test("the session cursor keeps sub-millisecond precision: nothing skipped, nothing repeated", async () => {
+  const t = await authedApp();
+  try {
+    const { binding } = await boundFolder(t);
+    await ingest(t, { sessions: ["sx", "sy", "sz"].map((id) => sess(id, binding.id)) });
+    await t.sql`update sessions set started_at = '2026-10-01T00:00:00.123456Z' where id in ('sx', 'sy')`;
+    await t.sql`update sessions set started_at = '2026-10-01T00:00:00.123789Z' where id = 'sz'`;
+    const seen: string[] = [];
+    let next: string | null = "";
+    while (next !== null) {
+      const res = await t.call("GET", `/v1/sessions?scope=open&limit=1${next ? `&before=${encodeURIComponent(next)}` : ""}`);
+      expect(res.status).toBe(200);
+      const page: any = await res.json();
+      seen.push(...page.sessions.map((s: any) => s.id));
+      next = page.next;
+      if (seen.length > 5) break;
+    }
+    expect(seen).toEqual(["sz", "sy", "sx"]);
+    expect((await t.call("GET", "/v1/sessions?scope=open&before=garbage")).status).toBe(400);
+  } finally { await t.drop(); }
+});
+
 test("events page by seq and truncate tool output in SQL", async () => {
   const t = await authedApp();
   try {

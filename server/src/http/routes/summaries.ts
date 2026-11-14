@@ -11,12 +11,12 @@ import { SUMMARY_FROM, summaryScopeClause } from "../../search";
 import { embedSummary, summaryEmbedText, type SummaryBody } from "../../summarise/summarise";
 import { markScopesDirty, scopeKey } from "../../summarise/state";
 import { parseBody } from "../validate";
+import { cursorTs, parseCursor } from "../../read";
 import { int, iso, scopeParams, withScope } from "./read";
 
-const beforeCursor = z.string().max(100).refine((s) => {
-  const [ts, id, extra] = s.split("|");
-  return extra === undefined && !Number.isNaN(Date.parse(ts)) && /^\d{1,18}$/.test(id ?? "");
-}, { message: "before must be a cursor from a previous page's next" });
+const beforeCursor = z.string().max(100).refine((s) => /^\d{1,18}$/.test(parseCursor(s)?.id ?? ""), {
+  message: "before must be a cursor from a previous page's next",
+});
 const notInverted = (q: { from?: string; to?: string }) => !q.from || !q.to || Date.parse(q.from) <= Date.parse(q.to);
 const listQuery = z.object({
   ...scopeParams,
@@ -52,17 +52,17 @@ async function listSummaries(
 ): Promise<{ summaries: SummaryView[]; next: string | null }> {
   const params: unknown[] = [];
   let where = summaryScopeClause(scope, f, params);
-  if (f.before) {
-    const [ts, id] = f.before.split("|");
-    params.push(ts, id);
+  const cursor = f.before ? parseCursor(f.before) : null;
+  if (cursor) {
+    params.push(cursor.ts, cursor.id);
     where += ` and (sm.ts_to, sm.id) < ($${params.length - 1}::timestamptz, $${params.length}::bigint)`;
   }
   const limit = Math.min(f.limit ?? 20, 100);
   const rows = await sql.unsafe(
-    `select ${VIEW_COLS} ${SUMMARY_FROM} ${NAMES} where ${where} order by sm.ts_to desc, sm.id desc limit ${limit}`, params);
+    `select ${VIEW_COLS}, ${cursorTs("sm.ts_to")} as cursor_ts ${SUMMARY_FROM} ${NAMES} where ${where} order by sm.ts_to desc, sm.id desc limit ${limit}`, params);
   const summaries = rows.map(toView);
-  const last = summaries[summaries.length - 1];
-  return { summaries, next: summaries.length === limit && last ? `${last.tsTo}|${last.id}` : null };
+  const last = rows[rows.length - 1];
+  return { summaries, next: rows.length === limit && last ? `${last.cursor_ts}|${last.id}` : null };
 }
 
 /**
@@ -79,7 +79,7 @@ function stateKey(scope: SearchScope, active: Binding | null): string | null {
 /** Model-free cleaning for client-written text: secrets redacted, made storable. */
 const clean = (s: string) => storable(redactSecrets(s)).trim();
 
-export function summaryRoutes({ sql, embedder }: AppDeps) {
+export function summaryRoutes({ sql, embedder, log = (l: string) => console.log(l) }: AppDeps) {
   const r = new Hono<Env>();
 
   r.get("/state", async (c) => {
@@ -151,8 +151,10 @@ export function summaryRoutes({ sql, embedder }: AppDeps) {
       return { id: row.id, created: !old };
     });
     if (!saved) return declined();
-    // Best effort: un-embedded, the history is still found by full-text search.
-    await embedSummary(sql, embedder, saved.id, summaryEmbedText({ title, body }));
+    // In the background, so a slow embedder never makes a committed save look failed. Best effort:
+    // un-embedded, the history is still found by full-text search. Logs carry no user content.
+    embedSummary(sql, embedder, saved.id, summaryEmbedText({ title, body })).catch((e) =>
+      log(JSON.stringify({ level: "error", t: new Date().toISOString(), what: "history_embed", error: (e as Error)?.name ?? "Error" })));
     const [row] = await sql.unsafe(`select ${VIEW_COLS} from summaries sm ${NAMES} where sm.id = $1`, [saved.id]);
     return c.json({ summary: toView(row) }, saved.created ? 201 : 200);
   });

@@ -223,7 +223,8 @@ export async function search(
   summaryVec.forEach((r: any, i: number) => add("summary", Number(r.id), i, "vec", Number(r.distance)));
   const kindOrder = (k: HitKind) => (k === "summary" ? 0 : 1);
   const ranked = [...fused.values()].sort((a, b) => b.score - a.score || kindOrder(a.kind) - kindOrder(b.kind) || b.id - a.id);
-  const degraded = { degraded: reasons.length > 0, degradedReasons: reasons };
+  // Legs finish in any order; a sorted list keeps the response stable.
+  const degraded = { degraded: reasons.length > 0, degradedReasons: reasons.sort() };
   if (!ranked.length) return { ...base, hits: [], ...degraded };
 
   const top = ranked.slice(0, limit * 4);
@@ -233,20 +234,22 @@ export async function search(
     `case when $1 <> '' and ${alias}.tsv @@ to_tsquery('cerebro', $1)
           then ts_headline('cerebro', left(${alias}.text, 4000), to_tsquery('cerebro', $1))
           else left(${alias}.text, 300) end as snippet`;
+  const chunkIds = idsOf("chunk"), summaryIds = idsOf("summary");
+  const none = Promise.resolve([] as any[]);
   const [chunkRows, summaryRows] = await Promise.all([
-    sql.unsafe(
+    !chunkIds.length ? none : sql.unsafe(
       `select c.id, c.session_id, c.first_seq, c.last_seq, c.ts_from, c.ts_to, ${snippet("c")},
               cl.name as client_name, p.name as project_name
        from chunks c join sessions s on s.id = c.session_id join bindings b on b.id = s.binding_id
        left join clients cl on cl.id = b.client_id left join projects p on p.id = b.project_id
        where c.id = any($2::bigint[])`,
-      [headlineQuery, idsOf("chunk")]),
-    sql.unsafe(
+      [headlineQuery, chunkIds]),
+    !summaryIds.length ? none : sql.unsafe(
       `select sm.id, sm.session_id, sm.first_seq, sm.last_seq, sm.ts_from, sm.ts_to, sm.title, ${snippet("sm")},
               cl.name as client_name, p.name as project_name
        from summaries sm left join clients cl on cl.id = sm.client_id left join projects p on p.id = sm.project_id
        where sm.id = any($2::bigint[])`,
-      [headlineQuery, idsOf("summary")]),
+      [headlineQuery, summaryIds]),
   ]);
   const rowsByKind: Record<HitKind, Map<number, any>> = {
     chunk: new Map(chunkRows.map((r: any) => [Number(r.id), r])),
