@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { ApiClient } from "./api";
+import { ApiClient, VERIFIED_KEY } from "./api";
 import { loadClientConfig, type ClientConfig } from "./config";
 import { flush, type FlushOptions, type FlushResult } from "./flush";
 import { handleHook, HOOK_EVENTS, type HookEvent } from "./hooks";
@@ -205,12 +205,17 @@ const resetInstance: Command = {
   async run() {
     const store = new Store();
     try {
+      // Everything the old server told us goes with it: the new one has its own machine names, bindings and history.
       store.set("instanceId", null);
+      store.set(VERIFIED_KEY, null);
+      store.set("machine", null);
+      store.clearBindingCache();
+      store.clearPrefix("imported:");
       if (store.get("blocked") === "instance_mismatch") store.set("blocked", null);
     } finally {
       store.close();
     }
-    await Bun.write(Bun.stdout, "Cleared the pinned instance; the next upload pins whichever server it reaches.\n");
+    await Bun.write(Bun.stdout, "Cleared the pinned instance, machine name, cached bindings and import markers; the next upload pins whichever server it reaches.\n");
   },
 };
 

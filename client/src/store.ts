@@ -184,6 +184,9 @@ export class Store {
     return r ? { binding: r.json ? JSON.parse(r.json) : null, at: r.at } : undefined;
   }
 
+  /** Forgets every cached binding (they belong to the server that answered). */
+  clearBindingCache(): void { this.db.run("delete from bindings"); }
+
   // session ends not yet delivered to the server
   /** Records that a session ended; a later time replaces an earlier one. */
   addPendingEnd(sessionId: string, endedAt: string): void {
@@ -207,6 +210,11 @@ export class Store {
   get(key: string): string | undefined {
     const r = this.db.query("select value from state where key = ?").get(key) as { value: string | null } | null;
     return r?.value ?? undefined;
+  }
+
+  /** Clears every key starting with `prefix`. */
+  clearPrefix(prefix: string): void {
+    this.db.query("delete from state where substr(key, 1, length(?1)) = ?1").run(prefix);
   }
 
   /** `null` clears the key. */

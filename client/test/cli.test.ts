@@ -122,6 +122,30 @@ test("reset-instance clears the pinned instanceId", async () => {
   s2.close();
 });
 
+test("reset-instance also forgets what the old server said: machine name, verification, bindings, import markers", async () => {
+  const home = tmp();
+  mkdirSync(join(home, ".cerebro"));
+  const store = new Store(join(home, ".cerebro", "cerebro.db"));
+  store.set("instanceId", "abc");
+  store.set("instanceVerified", JSON.stringify({ serverUrl: TEST_URL, instanceId: "abc", at: Date.now() }));
+  store.set("machine", "old-mac");
+  store.set("imported:github.com/acme/a|", "2026-11-01T00:00:00.000Z");
+  store.set("imported:github.com/acme/b|pkg", "2026-11-01T00:00:00.000Z");
+  store.set("lastSyncAt", "2026-11-01T00:00:00.000Z");
+  store.cacheBinding("github.com/acme/a", "", { id: "b1", repo: "github.com/acme/a", subpath: "", status: "active", clientId: "c", projectId: null });
+  store.cacheBinding("github.com/acme/b", "pkg", null);
+  store.close();
+  expect((await cli(["reset-instance"], home)).code).toBe(0);
+  const s2 = new Store(join(home, ".cerebro", "cerebro.db"));
+  for (const k of ["instanceId", "instanceVerified", "machine", "imported:github.com/acme/a|", "imported:github.com/acme/b|pkg"]) {
+    expect({ k, v: s2.get(k) }).toEqual({ k, v: undefined });
+  }
+  expect(s2.cachedBinding("github.com/acme/a", "")).toBeUndefined();
+  expect(s2.cachedBinding("github.com/acme/b", "pkg")).toBeUndefined();
+  expect(s2.get("lastSyncAt")).toBe("2026-11-01T00:00:00.000Z");
+  s2.close();
+});
+
 test("the skill file has the required frontmatter and names every MCP tool it uses", () => {
   const text = readFileSync(join(import.meta.dir, "../../plugin/skills/cerebro/SKILL.md"), "utf8");
   const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
