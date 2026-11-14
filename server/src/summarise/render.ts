@@ -23,7 +23,14 @@ const PREVIEW = 300;
 const TOOL_NAME_MAX = 100;
 /** Everything a reader (or model) may treat as a line break. */
 const LINE_BREAKS = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/g;
-const CEREBRO_TOOL = "mcp__cerebro__";
+/**
+ * Cerebro's own MCP tools. Inside the plugin, Claude Code names them `mcp__plugin_cerebro_cerebro__<tool>`
+ * (plugin "cerebro", server "cerebro" in plugin/.mcp.json); a non-plugin install names them `mcp__cerebro__<tool>`.
+ */
+const CEREBRO_TOOL = /^mcp__(?:plugin_cerebro_)?cerebro__/;
+
+/** Whether a tool name is one of Cerebro's own tools (recall must not become new memory). */
+export const isCerebroTool = (toolName: string | null | undefined): boolean => !!toolName && CEREBRO_TOOL.test(toolName);
 
 const iso = (ts: string | Date) => new Date(ts).toISOString();
 // `\s` covers every break in LINE_BREAKS except NEL (U+0085).
@@ -41,13 +48,13 @@ function line(e: EventRow, toolName: string | null): string | null {
       return text ? `${e.kind === "user" ? "User" : "Assistant"}: ${text.replace(LINE_BREAKS, "\n  ")}` : null;
     }
     case "tool_call": {
-      if (toolName?.startsWith(CEREBRO_TOOL)) return null;
+      if (isCerebroTool(toolName)) return null;
       const input = e.tool_input == null ? "" : oneLine(JSON.stringify(e.tool_input)).slice(0, PREVIEW);
       const name = toolName ? oneLine(toolName).slice(0, TOOL_NAME_MAX) : "";
       return `Tool ${name || "unknown"}: ${input}`;
     }
     case "tool_result": {
-      if (toolName?.startsWith(CEREBRO_TOOL)) return null;
+      if (isCerebroTool(toolName)) return null;
       const out = oneLine(e.text).slice(0, PREVIEW);
       return out ? `Result: ${out}` : null;
     }

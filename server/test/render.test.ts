@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { renderRange, type EventRow } from "../src/summarise/render";
+import { isCerebroTool, renderRange, type EventRow } from "../src/summarise/render";
 
 const at = (min: number) => new Date(Date.UTC(2026, 10, 1, 9, min)).toISOString();
 const row = (seq: number, kind: EventRow["kind"], text: string, extra: Partial<EventRow> = {}): EventRow => ({
@@ -12,8 +12,8 @@ test("render excludes cerebro tool results and caps tool output", () => {
     row(2, "assistant", "", { meta: { thinking: "SECRET-THOUGHTS" } }),
     row(3, "tool_call", "", { tool_name: "Bash", tool_input: { command: "x".repeat(1000) } }),
     row(4, "tool_result", "y".repeat(1000), { tool_name: "Bash" }),
-    row(5, "tool_call", "", { tool_name: "mcp__cerebro__search", tool_input: { query: "CEREBRO-QUERY" } }),
-    row(6, "tool_result", "CEREBRO-RESULT named", { tool_name: "mcp__cerebro__search" }),
+    row(5, "tool_call", "", { tool_name: "mcp__plugin_cerebro_cerebro__cerebro_search", tool_input: { query: "CEREBRO-QUERY" } }),
+    row(6, "tool_result", "CEREBRO-RESULT named", { tool_name: "mcp__plugin_cerebro_cerebro__cerebro_search" }),
     row(7, "tool_result", "CEREBRO-RESULT unnamed"),
     row(8, "user", "META-CAVEAT", { meta: { isMeta: true } }),
     row(9, "assistant", "Fixed it in auth.ts"),
@@ -83,4 +83,40 @@ test("tool names are one line and capped", () => {
   const shown = lines[1].slice("[09:01] Tool ".length, lines[1].indexOf(": {"));
   expect(shown.length).toBeLessThanOrEqual(100);
   expect(p.text).not.toMatch(/[\u2028\u2029\v\f\u0085\r]/);
+});
+
+test("render drops Cerebro's own tool calls and results under the real plugin name and the bare form", () => {
+  const events: EventRow[] = [
+    row(1, "user", "Look up what we did before"),
+    // Inside the cerebro plugin, Claude Code names the tools mcp__plugin_<plugin>_<server>__<tool>.
+    row(2, "tool_call", "", { tool_name: "mcp__plugin_cerebro_cerebro__cerebro_search", tool_input: { query: "PLUGIN-QUERY" } }),
+    row(3, "tool_result", "PLUGIN-RESULT client B detail", { tool_name: "mcp__plugin_cerebro_cerebro__cerebro_search" }),
+    row(4, "tool_call", "", { tool_name: "mcp__plugin_cerebro_cerebro__cerebro_read", tool_input: { id: "PLUGIN-READ" } }),
+    row(5, "tool_result", "PLUGIN-READ-RESULT unnamed"),
+    // A non-plugin install registers the server as plain "cerebro".
+    row(6, "tool_call", "", { tool_name: "mcp__cerebro__cerebro_state", tool_input: { scope: "BARE-QUERY" } }),
+    row(7, "tool_result", "BARE-RESULT", { tool_name: "mcp__cerebro__cerebro_state" }),
+    // Other plugins' tools, and lookalikes, stay.
+    row(8, "tool_call", "", { tool_name: "mcp__plugin_other_cerebro__search", tool_input: { q: "OTHER-PLUGIN" } }),
+    row(9, "tool_call", "", { tool_name: "mcp__cerebrox__search", tool_input: { q: "LOOKALIKE" } }),
+    row(10, "assistant", "Found it"),
+  ];
+  const [p] = renderRange(events);
+  expect(p.text).not.toContain("PLUGIN-QUERY");
+  expect(p.text).not.toContain("PLUGIN-RESULT");
+  expect(p.text).not.toContain("PLUGIN-READ");
+  expect(p.text).not.toContain("BARE-");
+  expect(p.text).toContain("OTHER-PLUGIN");
+  expect(p.text).toContain("LOOKALIKE");
+  expect(p.text).toContain("Assistant: Found it");
+});
+
+test("isCerebroTool matches both the plugin and the bare server names only", () => {
+  expect(isCerebroTool("mcp__plugin_cerebro_cerebro__cerebro_search")).toBe(true);
+  expect(isCerebroTool("mcp__cerebro__cerebro_search")).toBe(true);
+  expect(isCerebroTool("mcp__plugin_cloudflare_cloudflare-docs__search_cloudflare_documentation")).toBe(false);
+  expect(isCerebroTool("mcp__plugin_other_cerebro__search")).toBe(false);
+  expect(isCerebroTool("mcp__cerebrox__search")).toBe(false);
+  expect(isCerebroTool("Bash")).toBe(false);
+  expect(isCerebroTool(null)).toBe(false);
 });

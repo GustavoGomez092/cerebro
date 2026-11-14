@@ -18,7 +18,7 @@ async function endedSession(t: any, n = 6) {
   const { client, project, binding } = await boundFolder(t, { project: "Web" });
   const events = Array.from({ length: n }, (_, i) =>
     ev("s1", i + 1, i % 2 ? "assistant" : "user", i % 2 ? `Done step ${i + 1}` : `Please do step ${i + 1}`));
-  events.push(ev("s1", n + 1, "tool_call", "", { toolName: "mcp__cerebro__search", toolInput: { query: "q" } }));
+  events.push(ev("s1", n + 1, "tool_call", "", { toolName: "mcp__plugin_cerebro_cerebro__cerebro_search", toolInput: { query: "q" } }));
   await ingest(t, { sessions: [sess("s1", binding.id)], events });
   await endSession(t.sql, "s1", new Date().toISOString());
   const job = await claimSummaryJob(t.sql);
