@@ -204,6 +204,17 @@ test("bind and decline from a subfolder are visible to capture under the folder'
   expect(d.store.cachedBinding(b.remote, "pkg")?.binding?.status).toBe("declined");
 });
 
+test("a whole-repo bind from a subfolder with its own binding caches that subfolder's binding, not the repo's", async () => {
+  const a = repo("ownsub");
+  const sub = await bindRepo(a.remote, "pkg/a", "SubB");
+  const { call, store } = await connect(join(a.root, "pkg", "a"));
+  const r = await call("cerebro_bind", { client: "Root A", project: "Whole" });
+  expect(r.isError).toBe(false);
+  const root = store.cachedBinding(a.remote, "")?.binding;
+  expect(root?.subpath).toBe("");
+  expect(store.cachedBinding(a.remote, "pkg/a")?.binding?.id).toBe(sub.id);
+});
+
 test("whole_repo false at the repo root says it binds the whole repo", async () => {
   const a = repo("rootnote");
   const { call } = await connect(a.root);

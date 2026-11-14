@@ -156,8 +156,14 @@ export function createMcpServer(deps: McpDeps): McpServer {
         repo: scope.repo, subpath, status: "active", clientId: client.id, projectId: project?.id ?? null, rebind: a.rebind,
       });
       store.cacheBinding(scope.repo, subpath, binding);
-      // Capture looks up this folder's own subpath; the server resolves it to the wider binding.
-      if (scope.subpath !== subpath) store.cacheBinding(scope.repo, scope.subpath, binding);
+      // Capture looks up this folder's own subpath, which may have a binding of its own: cache the server's answer.
+      if (scope.subpath !== subpath) {
+        try {
+          store.cacheBinding(scope.repo, scope.subpath, (await api.resolve(scope.repo, scope.subpath)).binding);
+        } catch (e) {
+          logError("mcp bind resolve", e); // the bind stands; the next SessionStart or sync looks the folder up
+        }
+      }
       spawn(["import", "--cwd", deps.cwd]);
       let text = `Bound ${subpath || "the repo root"} to ${name(client.name, project?.name ?? null)}. Importing past conversations in the background.`;
       if (a.whole_repo === false && !scope.subpath) text += " This folder is the repo root, so this binds the whole repo.";
