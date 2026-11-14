@@ -4,6 +4,7 @@ import { createToken, revokeToken } from "./auth";
 import { redactSession } from "./redact-session";
 import { requeueDead } from "./worker";
 import { requeueDeadSummaries } from "./summarise/jobs";
+import { summaryEmbedText } from "./summarise/summarise";
 import { ollamaEmbedder } from "./embed/ollama";
 import { toVector, type Embedder } from "./embed/embedder";
 import type { SQL } from "bun";
@@ -20,7 +21,8 @@ const usage = [
 
 /**
  * Queues (priority 1) every chunk that has neither a vector nor a queue row, and re-embeds summaries
- * without a vector. `summaries` is null when the summary tables do not exist yet.
+ * without a vector, embedding the same text as the live summariser (summaryEmbedText), so a re-embed after
+ * a restore yields the same vectors. `summaries` is null when the summary tables do not exist yet.
  */
 export async function requeueMissingEmbeddings(
   sql: SQL,
@@ -42,12 +44,12 @@ export async function requeueMissingEmbeddings(
   let embedder: Embedder | undefined;
   for (;;) {
     const batch = await sql`
-      select s.id, s.title, s.text from summaries s
+      select s.id, s.title, s.body from summaries s
       where not exists (select 1 from summary_embeddings e where e.summary_id = s.id)
       order by s.id limit 32`;
     if (!batch.length) break;
     embedder ??= await makeEmbedder();
-    const vectors = await embedder.embed(batch.map((r: any) => `${r.title}\n${r.text}`));
+    const vectors = await embedder.embed(batch.map((r: any) => summaryEmbedText(r)));
     if (vectors.length !== batch.length)
       throw new Error(`embedder returned ${vectors.length} vector(s) for ${batch.length} summaries; aborting without writing this batch`);
     for (let i = 0; i < batch.length; i++)

@@ -4,8 +4,20 @@ import { boundFolder, sess, ingest } from "./fixtures";
 import { requeueMissingEmbeddings } from "../src/cli";
 import { fakeEmbedder } from "../src/embed/fake";
 import { toVector } from "../src/embed/embedder";
+import { summaryEmbedText } from "../src/summarise/summarise";
 
 const CLI = new URL("../src/cli.ts", import.meta.url).pathname;
+
+/** A stored summary as the summariser leaves it (real schema: title, body jsonb, text), without a vector. */
+async function seedSummary(t: any, binding: any, sessionId: string, seq: number, s: { title: string; overview: string; facts: string[] }) {
+  const body = { title: s.title, period: "Nov 2026", overview: s.overview, decisions: ["a decision"], changes: [], facts: s.facts, open_threads: [], resolved_threads: [] };
+  const [row] = await t.sql`
+    insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+    values (${sessionId}, 'session', ${binding.id}, ${binding.clientId}, ${binding.projectId ?? null}, ${seq}, ${seq}, now(), now(),
+            ${s.title}, ${JSON.stringify(body)}::text::jsonb, ${"searchable text that is not the embed text " + seq}, 'test')
+    returning id`;
+  return { id: Number(row.id), title: s.title, body };
+}
 
 async function seedChunks(t: any, n: number) {
   const sql = t.sql;
@@ -29,28 +41,42 @@ test("requeue-missing-embeddings queues exactly the chunks without vectors", asy
     await db.sql`insert into chunk_embeddings (chunk_id, embedding) values (${ids[0]}, ${toVector(vec)}::halfvec)`;
     await db.sql`insert into embed_queue (chunk_id, priority, dead, attempts) values (${ids[3]}, 0, true, 5)`; // already queued: untouched
     const r = await requeueMissingEmbeddings(db.sql);
-    expect(r).toEqual({ chunks: 2, summaries: null });
+    expect(r).toEqual({ chunks: 2, summaries: 0 });
     const q = await db.sql`select chunk_id, priority from embed_queue order by chunk_id`;
     expect(q.map((x: any) => [Number(x.chunk_id), x.priority])).toEqual([[ids[1], 1], [ids[2], 1], [ids[3], 0]]);
     expect((await requeueMissingEmbeddings(db.sql)).chunks).toBe(0); // idempotent
   } finally { await db.drop(); }
 });
 
-test("requeue-missing-embeddings re-embeds summaries only when summary_embeddings exists", async () => {
+test("requeue-missing-embeddings skips summaries when the summary tables do not exist", async () => {
   const db = await freshDb();
   try {
+    await db.sql`drop table summary_embeddings`;
     expect((await requeueMissingEmbeddings(db.sql)).summaries).toBeNull();
-    // Minimal stand-in for plan 3's tables (only the columns the command relies on).
-    await db.sql.unsafe(`
-      create table summaries (id bigserial primary key, title text not null, text text not null);
-      create table summary_embeddings (summary_id bigint primary key references summaries(id) on delete cascade, embedding halfvec(1024) not null)`);
-    await db.sql`insert into summaries (title, text) values ('a', 'one'), ('b', 'two'), ('c', 'three')`;
+  } finally { await db.drop(); }
+});
+
+test("requeue-missing-embeddings re-embeds summaries with the live path's summaryEmbedText (real schema)", async () => {
+  const db = await authedApp();
+  try {
+    const { binding } = await boundFolder(db);
+    await ingest(db, { sessions: [sess("s1", binding.id)] });
+    const a = await seedSummary(db, binding, "s1", 1, { title: "Auth rework", overview: "Moved tokens to argon2.", facts: ["tokens hashed"] });
+    const b = await seedSummary(db, binding, "s1", 2, { title: "Deploy", overview: "Compose on Zima.", facts: [] });
+    const c = await seedSummary(db, binding, "s1", 3, { title: "Search", overview: "Hybrid RRF.", facts: ["k=60", "halfvec"] });
     const e = fakeEmbedder();
     const [vec] = await e.embed(["x"]);
-    await db.sql`insert into summary_embeddings (summary_id, embedding) select id, ${toVector(vec)}::halfvec from summaries where title = 'a'`;
-    expect((await requeueMissingEmbeddings(db.sql, async () => e)).summaries).toBe(2);
-    const [{ n }] = await db.sql`select count(*)::int as n from summary_embeddings`;
-    expect(n).toBe(3);
+    await db.sql`insert into summary_embeddings (summary_id, embedding) values (${a.id}, ${toVector(vec)}::halfvec)`;
+    const seen: string[] = [];
+    const recording = { dims: e.dims, embed: async (texts: string[]) => { seen.push(...texts); return e.embed(texts); } };
+    expect((await requeueMissingEmbeddings(db.sql, async () => recording)).summaries).toBe(2);
+    // Exactly the text the live summariser embeds, so a re-embed after a restore yields the same vectors.
+    expect(seen).toEqual([summaryEmbedText(b), summaryEmbedText(c)]);
+    const rows = await db.sql`select summary_id, embedding::text as v from summary_embeddings order by summary_id`;
+    expect(rows.map((r: any) => Number(r.summary_id))).toEqual([a.id, b.id, c.id]);
+    const [live] = await e.embed([summaryEmbedText(c)]);
+    const [{ v: want }] = await db.sql`select ${toVector(live)}::halfvec::text as v`;
+    expect(rows[2].v).toBe(want);
   } finally { await db.drop(); }
 });
 
@@ -73,12 +99,12 @@ test("cli migrate applies migrations and exits 0; requeue-missing-embeddings pri
 });
 
 test("requeue-missing-embeddings fails clearly when the embedder returns the wrong number of vectors", async () => {
-  const db = await freshDb();
+  const db = await authedApp();
   try {
-    await db.sql.unsafe(`
-      create table summaries (id bigserial primary key, title text not null, text text not null);
-      create table summary_embeddings (summary_id bigint primary key references summaries(id) on delete cascade, embedding halfvec(1024) not null)`);
-    await db.sql`insert into summaries (title, text) values ('a', 'one'), ('b', 'two')`;
+    const { binding } = await boundFolder(db);
+    await ingest(db, { sessions: [sess("s1", binding.id)] });
+    await seedSummary(db, binding, "s1", 1, { title: "a", overview: "one", facts: [] });
+    await seedSummary(db, binding, "s1", 2, { title: "b", overview: "two", facts: [] });
     const short = { dims: 1024, embed: async () => [new Array(1024).fill(0)] };
     await expect(requeueMissingEmbeddings(db.sql, async () => short)).rejects.toThrow(/1 vector\(s\) for 2 summaries/);
     const [{ n }] = await db.sql`select count(*)::int as n from summary_embeddings`;
