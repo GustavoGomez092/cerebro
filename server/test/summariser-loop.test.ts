@@ -360,6 +360,40 @@ test("dirty scopes are rebuilt two per tick, keeping a quarter of the budget for
   }
 });
 
+test("a scope invalidated by a re-bind is rebuilt before imported jobs, after live ones", async () => {
+  const { t, state } = await setup();
+  const cli = fakeCli();
+  const loop = startSummariser(t.sql, t.embedder, CFG, { run: cli.run, state, manual: true, log: quiet });
+  try {
+    const { binding: imp } = await boundFolder(t, { client: "Importer", project: "Big", repo: "github.com/acme/big" });
+    for (let i = 1; i <= 12; i++) await endedSession(t, imp.id, `imp${i}`, `import${i}`, { imported: true });
+    const { binding: live } = await boundFolder(t, { client: "Live", project: "Now", repo: "github.com/acme/now" });
+    await endedSession(t, live.id, "live1", "heron");
+    // A folder bound to client A by mistake, then re-bound to client B: both scopes are invalidated.
+    const { client: B } = await boundFolder(t, { client: "Beta", repo: "github.com/beta/home" });
+    const mover = (await (await t.call("PUT", "/v1/bindings", {
+      repo: "github.com/acme/moving", subpath: "", status: "active", clientId: (await boundFolder(t, { client: "Acme", repo: "github.com/acme/keep" })).client.id,
+    })).json()).binding;
+    await dirtyScope(t, mover, "Zanzibar");
+    await t.call("PUT", "/v1/bindings", { repo: "github.com/acme/moving", subpath: "", status: "active", clientId: B.id, rebind: true });
+    const scopeB = scopeKey(B.id, null);
+    expect((await t.sql`select dirty from project_states where scope = ${scopeB}`)[0].dirty).toBe(true);
+
+    await loop.tick();
+    const kinds = cli.calls.map((c) =>
+      c.prompt.includes("Zanzibar") ? "rebuild" : summaryCalls([c]).length ? (c.prompt.includes("heron") ? "live" : "import") : "state");
+    const firstImport = kinds.indexOf("import");
+    expect(kinds.indexOf("live")).toBe(0);
+    expect(kinds.indexOf("rebuild")).toBeGreaterThan(0);
+    expect(firstImport).toBeGreaterThan(kinds.indexOf("rebuild"));
+    expect((await t.sql`select dirty, text from project_states where scope = ${scopeB}`)[0]).toMatchObject({ dirty: false });
+    expect((await t.sql`select text from project_states where scope = ${scopeB}`)[0].text).toContain("Zanzibar");
+  } finally {
+    await loop.stop();
+    await t.drop();
+  }
+});
+
 test("a scope whose update fails is not retried every tick", async () => {
   const { t, state } = await setup();
   const c = clock();

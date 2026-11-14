@@ -149,7 +149,8 @@ export function summaryRoutes({ sql, embedder, log = (l: string) => console.log(
       if (old?.client_id) scopes.push(scopeKey(old.client_id, old.project_id));
       // A replaced history keeps its id, which the state already counts as folded, and its old text
       // may be woven into the state: rebuild rather than fold. A new one is folded like any summary.
-      if (old) await invalidateStates(tx, scopes);
+      const lost = old?.client_id && scopes[1] !== scopes[0] ? [scopes[1]] : [];
+      if (old) await invalidateStates(tx, scopes, lost);
       else await markScopesDirty(tx, scopes);
       return { id: row.id, created: !old };
     });

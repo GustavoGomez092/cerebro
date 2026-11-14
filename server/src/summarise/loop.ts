@@ -4,7 +4,7 @@ import { pgState } from "../db";
 import type { Embedder } from "../embed/embedder";
 import { budgetState, estimateTokens, record } from "./budget";
 import { HEALTH_PROBE, runClaude, type ClaudeInput } from "./claude";
-import { claimSummaryJob, scheduleGrowingSessions } from "./jobs";
+import { claimSummaryJob, releaseSummaryJob, scheduleGrowingSessions } from "./jobs";
 import { updateState, type StateResult } from "./state";
 import { embedSummary, summariseJob, summaryEmbedText, type SummariseResult } from "./summarise";
 
@@ -253,7 +253,10 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
    * within three quarters of the window. A scope that fails backs off (5 min, doubling up to 6 h).
    */
   const updateDirtyScopes = async () => {
-    const rows = await sql`select scope from project_states where dirty order by updated_at, scope`;
+    // Invalidated scopes (a re-bind or move: no sources) first; they may be serving nothing meanwhile.
+    const rows = await sql`
+      select scope from project_states where dirty
+      order by cardinality(source_summary_ids) = 0 desc, updated_at, scope`;
     let done = 0;
     for (const { scope } of rows) {
       if (done >= DIRTY_PER_TICK || stopped) return;
@@ -285,9 +288,10 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
     await sweepEmbeddings();
     if (!(await mayRun())) return false;
     await scheduleGrowingSessions(sql);
+    let dirtyDone = false;
     for (let n = 0; !stopped; n++) {
       if (n >= JOBS_PER_TICK) {
-        await updateDirtyScopes();
+        if (!dirtyDone) await updateDirtyScopes();
         return true;
       }
       const b = await budgetState(sql, budget);
@@ -297,6 +301,15 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       }
       const job = await claimSummaryJob(sql);
       if (!job) break;
+      // Dirty scopes (a re-bind's rebuild above all) go before imported history, so a long import
+      // never starves them: give the job back, update them, then carry on.
+      if (job.priority > 0 && !dirtyDone) {
+        dirtyDone = true;
+        await releaseSummaryJob(sql, job.sessionId);
+        await updateDirtyScopes();
+        if (state.paused) return false;
+        continue;
+      }
       const res = await summariseJob(sql, embedder, job, { run, budget, signal });
       noteRun(res);
       if (res.status === "deferred" && (res.reason === "login" || res.reason === "unavailable")) probeDeferred.add(job.sessionId);
@@ -308,7 +321,7 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
         if (handle("state", r)) return false;
       }
     }
-    if (!stopped) await updateDirtyScopes();
+    if (!stopped && !dirtyDone) await updateDirtyScopes();
     return false;
   };
 

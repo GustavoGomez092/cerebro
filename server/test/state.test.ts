@@ -213,6 +213,40 @@ test("re-binding a folder to another client rebuilds both scopes and the old one
   } finally { await t.drop(); }
 });
 
+test("a scope that lost summaries to a re-bind stops serving its stale state at once; one that gained keeps its own", async () => {
+  const t = await authedApp();
+  try {
+    const { client: A, binding: keep } = await boundFolder(t, { client: "Acme", repo: "github.com/acme/keep" });
+    const { client: B, binding: other } = await boundFolder(t, { client: "Beta", repo: "github.com/beta/other" });
+    const mover = (await (await t.call("PUT", "/v1/bindings", {
+      repo: "github.com/acme/moving", subpath: "", status: "active", clientId: A.id,
+    })).json()).binding;
+    const scopeA = scopeKey(A.id, null);
+    const scopeB = scopeKey(B.id, null);
+    await addSummary(t, keep, { title: "Keep work", day: 1, facts: ["Alpha stays with Acme"] });
+    await addSummary(t, mover, { title: "Moving work", day: 2, facts: ["Beta project detail"] });
+    await addSummary(t, other, { title: "Other work", day: 3, facts: ["Beta own fact"] });
+    for (const scope of [scopeA, scopeB]) expect((await rebuildState(t.sql, scope, deps())).status).toBe("updated");
+    const brief = async (repo: string) =>
+      (await (await t.call("GET", `/v1/state?repo=${encodeURIComponent(repo)}&subpath=`)).json()).state;
+    expect((await brief("github.com/acme/keep")).text).toContain("Beta project detail");
+
+    await t.call("PUT", "/v1/bindings", { repo: "github.com/acme/moving", subpath: "", status: "active", clientId: B.id, rebind: true });
+    // Acme's other folders no longer get a brief describing the moved work, even before any rebuild runs.
+    expect(await brief("github.com/acme/keep")).toBeNull();
+    const a = await stateRow(t, scopeA);
+    expect([a.text, a.doc, a.dirty]).toEqual(["", {}, true]);
+    // Beta gained summaries: its own state stays readable until its rebuild.
+    expect((await brief("github.com/beta/other")).text).toContain("Beta own fact");
+    expect((await stateRow(t, scopeB)).dirty).toBe(true);
+
+    expect((await rebuildState(t.sql, scopeA, deps())).status).toBe("updated");
+    const rebuilt = await brief("github.com/acme/keep");
+    expect(rebuilt.text).toContain("Alpha stays with Acme");
+    expect(rebuilt.text).not.toContain("Beta project detail");
+  } finally { await t.drop(); }
+});
+
 test("an update of a scope that lost summaries rebuilds instead of folding", async () => {
   const t = await authedApp();
   try {

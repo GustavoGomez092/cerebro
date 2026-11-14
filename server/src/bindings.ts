@@ -69,7 +69,8 @@ async function rescopeSummaries(
   const target = to.status === "active" && to.clientId ? scopeKey(to.clientId, to.projectId) : null;
   const left = moved.map((m) => (m.client_id ? scopeKey(m.client_id, m.project_id) : null));
   if (!left.some((k) => k !== target)) return;
-  await invalidateStates(tx, [...left, target].filter((k): k is string => k !== null));
+  const lost = left.filter((k): k is string => k !== null && k !== target);
+  await invalidateStates(tx, [...left, target].filter((k): k is string => k !== null), lost);
 }
 
 export interface BindingInput {

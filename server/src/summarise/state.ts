@@ -104,14 +104,19 @@ export async function markScopesDirty(sql: SQL, keys: string[]): Promise<void> {
 /**
  * For scopes whose set of summaries changed (summaries moved in or out): marks them dirty and empties
  * `source_summary_ids` with a version bump, so the next update rebuilds and one in flight loses its
- * compare-and-set. The old `doc`/`text` stay readable until then.
+ * compare-and-set. Scopes in `lost` (summaries moved out) also have `doc`/`text` emptied at once: their
+ * state describes work that now belongs elsewhere (another client, after a re-bind), so it is not served
+ * (GET /v1/state answers null) until the rebuild. Scopes that only gained summaries stay readable.
  */
-export async function invalidateStates(sql: SQL, keys: string[]): Promise<void> {
-  const sorted = [...new Set(keys)].sort();
+export async function invalidateStates(sql: SQL, keys: string[], lost: string[] = []): Promise<void> {
+  const sorted = [...new Set([...keys, ...lost])].sort();
   await touchRows(sql, sorted, true);
   if (sorted.length) {
+    const gone = [...new Set(lost)];
     await sql`
-      update project_states set source_summary_ids = '{}', version = version + 1
+      update project_states set source_summary_ids = '{}', version = version + 1,
+        doc = case when scope = any(${sql.array(gone, "text")}) then '{}'::jsonb else doc end,
+        text = case when scope = any(${sql.array(gone, "text")}) then '' else text end
       where scope = any(${sql.array(sorted, "text")})`;
   }
 }
