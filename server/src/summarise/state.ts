@@ -6,7 +6,7 @@ import { STATE_SCHEMA, stateRequest } from "./prompts";
 
 export { STATE_SCHEMA };
 
-/** Summaries a rebuild reads: the scope's newest, folded oldest first. */
+/** Session summaries a rebuild reads: the scope's newest, folded oldest first (initial histories come on top). */
 const REBUILD_WINDOW = 40;
 /** Summaries per model call at most. */
 const BATCH_SIZE = 10;
@@ -327,16 +327,23 @@ function rebuildEstimate(sc: Scope, rows: SummaryRow[]): number {
   return tokens;
 }
 
+/** Oldest first: by end of period, then id. */
+const byAge = (a: SummaryRow, b: SummaryRow) =>
+  new Date(a.ts_to).getTime() - new Date(b.ts_to).getTime() || Number(BigInt(a.id) - BigInt(b.id));
+
 /**
- * The summaries a rebuild uses, oldest first, and their estimated cost: the scope's newest 40, or, when
- * that would cost more than half the budget window, the newest N that fit in half. So a rebuild always
- * finishes within one window and leaves the other half for live summaries. When even the newest one
- * alone costs more than half, it is used on its own.
+ * The summaries a rebuild uses, oldest first, and their estimated cost: the scope's initial histories
+ * (always: they seed the state of a project Cerebro joined late) plus its newest 40 session summaries,
+ * or, when that would cost more than half the budget window, the newest N that fit in half. So a rebuild
+ * always finishes within one window and leaves the other half for live summaries. When even the newest
+ * one alone (with the histories) costs more than half, it is used on its own.
  */
-function rebuildPlan(sc: Scope, newestFirst: SummaryRow[], limit: number): { rows: SummaryRow[]; estimate: number } {
+function rebuildPlan(
+  sc: Scope, newestFirst: SummaryRow[], histories: SummaryRow[], limit: number,
+): { rows: SummaryRow[]; estimate: number } {
   const half = Math.floor(limit / 2);
   const plan = (n: number) => {
-    const rows = newestFirst.slice(0, n).reverse();
+    const rows = [...histories, ...newestFirst.slice(0, n)].sort(byAge);
     return { rows, estimate: rebuildEstimate(sc, rows) };
   };
   const full = plan(newestFirst.length);
@@ -361,13 +368,22 @@ function rebuildPlan(sc: Scope, newestFirst: SummaryRow[], limit: number): { row
 
 const SUMMARY_COLS = "id::text as id, ts_from, ts_to, title, body, text";
 
-/** The scope's newest summaries, newest first. */
+/** The scope's newest session summaries, newest first. */
 async function newestSummaries(sql: SQL, sc: Scope, limit: number): Promise<SummaryRow[]> {
   return sc.projectId
-    ? sql.unsafe(`select ${SUMMARY_COLS} from summaries where project_id = $1 order by ts_to desc, id desc limit $2`,
-      [sc.projectId, limit])
-    : sql.unsafe(`select ${SUMMARY_COLS} from summaries where client_id = $1 and project_id is null
+    ? sql.unsafe(`select ${SUMMARY_COLS} from summaries where project_id = $1 and kind <> 'history'
+       order by ts_to desc, id desc limit $2`, [sc.projectId, limit])
+    : sql.unsafe(`select ${SUMMARY_COLS} from summaries where client_id = $1 and project_id is null and kind <> 'history'
        order by ts_to desc, id desc limit $2`, [sc.clientId, limit]);
+}
+
+/** The scope's initial histories, oldest first. */
+async function historySummaries(sql: SQL, sc: Scope): Promise<SummaryRow[]> {
+  return sc.projectId
+    ? sql.unsafe(`select ${SUMMARY_COLS} from summaries where project_id = $1 and kind = 'history'
+       order by ts_to, id`, [sc.projectId])
+    : sql.unsafe(`select ${SUMMARY_COLS} from summaries where client_id = $1 and project_id is null and kind = 'history'
+       order by ts_to, id`, [sc.clientId]);
 }
 
 /** Those of `ids` that are summaries in this scope now. */
@@ -463,10 +479,11 @@ const isResult = (v: Folded | StateResult): v is StateResult => "status" in v;
 const failedScope: StateResult = { status: "failed", reason: "failed" };
 
 /**
- * Folds new summaries into a scope's state: the given ids plus any of the scope's newest 40 not yet
- * folded, whatever their period (an imported session or an initial history stored after the state was
- * built; a summary whose update was lost), except those the last rebuild deliberately left out to fit
- * the budget. Oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS per call.
+ * Folds new summaries into a scope's state: the given ids plus any of the scope's newest 40 session
+ * summaries not yet folded, whatever their period (an imported session stored after the state was built;
+ * a summary whose update was lost), except those the last rebuild deliberately left out to fit the
+ * budget, plus every initial history not yet folded, however old. Oldest first, ≤ 10 and
+ * ≤ MAX_INPUT_CHARS per call.
  * Each call's result replaces `doc` and `text`, bumps `version` and appends to `source_summary_ids`,
  * committed only if no other update landed meanwhile (else the update starts over from the new state).
  * `dirty` is cleared when everything is folded and no new mark arrived while it ran.
@@ -490,11 +507,10 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
     for (const r of await newestSummaries(sql, sc, REBUILD_WINDOW)) {
       if (!folded.has(r.id) && !excluded.has(r.id)) pending.set(r.id, r);
     }
-    for (const r of await summariesInScope(sql, sc, newSummaryIds.map(String))) {
+    for (const r of [...await historySummaries(sql, sc), ...await summariesInScope(sql, sc, newSummaryIds.map(String))]) {
       if (!folded.has(r.id)) pending.set(r.id, r);
     }
-    const rows = [...pending.values()].sort(
-      (a, b) => new Date(a.ts_to).getTime() - new Date(b.ts_to).getTime() || Number(BigInt(a.id) - BigInt(b.id)));
+    const rows = [...pending.values()].sort(byAge);
 
     if (!rows.length) {
       await sql`
@@ -529,9 +545,10 @@ export async function updateState(sql: SQL, scope: string, newSummaryIds: bigint
 }
 
 /**
- * Rebuilds a scope's state from scratch out of its newest 40 summaries (oldest first, ≤ 10 and
- * ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. When those would cost more than
- * half the budget window, only the newest that fit in half are used (rebuildPlan); the rest are recorded
+ * Rebuilds a scope's state from scratch out of its initial histories and newest 40 session summaries
+ * (oldest first, ≤ 10 and ≤ MAX_INPUT_CHARS per call), for a dirty scope or one with no state. When those
+ * would cost more than half the budget window, only the histories and the newest session summaries that
+ * fit in half are used (rebuildPlan); the session summaries left out are recorded
  * in `excluded_summary_ids` so later updates do not fold them back in one at a time. Nothing is spent
  * unless the remaining budget covers the whole planned rebuild, so it does not defer part-way through
  * its own spend. The one exception is a single summary costing more than the whole window: that estimate
@@ -550,10 +567,11 @@ export async function rebuildState(sql: SQL, scope: string, deps: StateDeps): Pr
     const st = await loadState(sql, sc);
     if (!st) return failedScope;
     const newest = await newestSummaries(sql, sc, REBUILD_WINDOW);
+    const histories = await historySummaries(sql, sc);
     let rows: SummaryRow[] = [];
-    if (newest.length) {
+    if (newest.length || histories.length) {
       const budget = await budgetState(sql, deps.budget);
-      const planned = rebuildPlan(sc, newest, budget.limit);
+      const planned = rebuildPlan(sc, newest, histories, budget.limit);
       rows = planned.rows;
       if (!canSpend(budget, Math.min(planned.estimate, budget.limit))) return done(ctx, overBudget(budget.resumesAt));
     }

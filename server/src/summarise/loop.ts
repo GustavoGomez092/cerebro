@@ -1,0 +1,287 @@
+import type { SQL } from "bun";
+import type { Config } from "../config";
+import { pgState } from "../db";
+import type { Embedder } from "../embed/embedder";
+import { budgetState, record } from "./budget";
+import { runClaude, type ClaudeInput } from "./claude";
+import { claimSummaryJob, scheduleGrowingSessions } from "./jobs";
+import { updateState, type StateResult } from "./state";
+import { embedSummary, summariseJob, summaryEmbedText, type SummariseResult } from "./summarise";
+
+export type SummariserConfig = Config["summariser"];
+export type PauseReason = "budget" | "usage_limit" | "login" | "disabled";
+
+/** What /v1/status reports about the summariser (plus backlog and budget, read from the database). */
+export interface SummariserState {
+  enabled: boolean;
+  paused: null | { reason: PauseReason; until: string | null };
+  /** When a job or state update last ran. */
+  lastRunAt: string | null;
+  /** The last failure as "<where>: <class>" (never model, CLI or transcript text). */
+  lastError: string | null;
+  credentialExpiresAt: string | null;
+}
+
+export const newSummariserState = (enabled: boolean): SummariserState => ({
+  enabled,
+  paused: enabled ? null : { reason: "disabled", until: null },
+  lastRunAt: null,
+  lastError: null,
+  credentialExpiresAt: null,
+});
+
+export interface SummariserDeps {
+  /** The CLI runner (default: runClaude with SUMMARISER_CMD from the config). */
+  run?: typeof runClaude;
+  /** State object to report through (shared with /v1/status). */
+  state?: SummariserState;
+  /** Clock for pauses, login probes and the embedding sweep (tests move it). */
+  now?: () => Date;
+  /** Pause between ticks (default 30 s). */
+  tickMs?: number;
+  /** No timer: ticks run only when `tick()` is called (tests). */
+  manual?: boolean;
+  log?: (line: string) => void;
+}
+
+export interface Summariser {
+  state: SummariserState;
+  /** Runs one tick now (after the one in progress, if any). */
+  tick(): Promise<void>;
+  /** Stops ticking; resolves once the job in progress (if any) is finished. */
+  stop(): Promise<void>;
+}
+
+const TICK_MS = 30_000;
+/** A paused-for-login loop retries the login this often, with a tiny call. */
+const PROBE_MS = 15 * 60_000;
+/** Summaries left without an embedding (embedder down when they were stored) are retried this often. */
+const SWEEP_MS = 10 * 60_000;
+const SWEEP_BATCH = 8;
+/** Jobs per tick before dirty scopes get their turn (the next tick then follows at once). */
+const JOBS_PER_TICK = 10;
+const DIRTY_PER_TICK = 2;
+/** Share of the budget window that dirty-scope rebuilds leave for live summaries. */
+const LIVE_RESERVE = 0.25;
+const SCOPE_BACKOFF_MIN_MS = 5 * 60_000;
+const SCOPE_BACKOFF_MAX_MS = 6 * 3600_000;
+const RETRY_LATER_MS = 30 * 60_000;
+
+const LOGIN_PROBE: ClaudeInput = {
+  systemPrompt: 'Reply with the JSON object {"ok": true} and nothing else.',
+  prompt: "ping",
+  schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+  timeoutMs: 60_000,
+};
+
+/**
+ * Runs the summariser in the background: every 30 s it queues growing sessions, then claims and
+ * summarises jobs one at a time (live before imported), folds each new summary into its scope's state,
+ * and updates up to two dirty scopes (re-binds, histories), which may use at most three quarters of the
+ * budget window. Single-flight throughout: one Claude call at a time, ever.
+ *
+ * Pauses (reported in `state.paused`): over budget until the window frees up; a usage limit until the
+ * reset the CLI reports; an expired login until a tiny probe call (every 15 min) succeeds. Raw capture
+ * and search are never affected. A disabled summariser leaves its jobs queued.
+ */
+export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserConfig, deps: SummariserDeps = {}): Summariser {
+  const state = deps.state ?? newSummariserState(cfg.enabled);
+  const run = deps.run ?? ((input: ClaudeInput) => runClaude(input, { ...process.env, SUMMARISER_CMD: cfg.cmd }));
+  const clock = deps.now ?? (() => new Date());
+  const log = deps.log ?? ((l: string) => console.log(l));
+  const budget = { share: cfg.share, windowTokens: cfg.windowTokens };
+  const dirtyBudget = { share: cfg.share * (1 - LIVE_RESERVE), windowTokens: cfg.windowTokens };
+
+  let stopped = false;
+  let lastProbeAt = 0;
+  let lastSweepAt: number | null = null;
+  /** Jobs deferred by a login failure: due again as soon as the login works. */
+  const loginDeferred = new Set<string>();
+  const scopeBackoff = new Map<string, { until: number; ms: number }>();
+
+  const pause = (reason: PauseReason, until: Date | null) => {
+    state.paused = { reason, until: until ? until.toISOString() : null };
+    if (reason === "login") lastProbeAt = clock().getTime();
+    log(JSON.stringify({ level: "info", msg: "summariser paused", reason, until: state.paused.until }));
+  };
+  const resume = () => {
+    log(JSON.stringify({ level: "info", msg: "summariser resumed", reason: state.paused?.reason }));
+    state.paused = null;
+  };
+  const noteRun = (r: { credentialExpiresAt?: string | null }) => {
+    state.lastRunAt = new Date().toISOString();
+    if (r.credentialExpiresAt) state.credentialExpiresAt = r.credentialExpiresAt;
+  };
+
+  /**
+   * Acts on a job or state result: pauses for budget, usage limit or login (true when it did); records
+   * other failures in lastError. Timeouts, bad output and inactive bindings never stop the loop.
+   */
+  const handle = (where: "summary" | "state", r: SummariseResult | StateResult): boolean => {
+    if (r.status !== "deferred" && r.status !== "failed") return false;
+    const reason = r.reason ?? "failed";
+    if (reason === "budget") {
+      pause("budget", r.until ?? new Date(Date.now() + RETRY_LATER_MS));
+      return true;
+    }
+    if (reason === "binding") return false;
+    state.lastError = `${where}: ${reason}`;
+    if (reason === "usage_limit") {
+      pause("usage_limit", r.until ?? new Date(clock().getTime() + RETRY_LATER_MS));
+      return true;
+    }
+    if (reason === "login") {
+      pause("login", null);
+      return true;
+    }
+    return false;
+  };
+
+  /** Whether work may run now; lifts a pause whose time has come (a login pause only after a good probe). */
+  const mayRun = async (): Promise<boolean> => {
+    const p = state.paused;
+    if (!p) return true;
+    const now = clock().getTime();
+    if (p.reason === "disabled") {
+      resume();
+      return true;
+    }
+    if (p.reason !== "login") {
+      if (p.until && now < Date.parse(p.until)) return false;
+      resume();
+      return true;
+    }
+    if (now - lastProbeAt < PROBE_MS) return false;
+    lastProbeAt = now;
+    const probe = await run(LOGIN_PROBE);
+    // Any answer from the model (even one off-schema) means the login works.
+    if (!probe.ok && probe.kind !== "bad_output") {
+      if (probe.kind === "usage_limit") {
+        pause("usage_limit", probe.resetAt ?? new Date(now + RETRY_LATER_MS));
+      } else if (probe.kind !== "auth") {
+        state.lastError = `probe: ${probe.kind}`;
+      }
+      return false;
+    }
+    if (probe.ok) {
+      await record(sql, probe.tokens, "summary");
+      noteRun(probe);
+    }
+    resume();
+    if (loginDeferred.size) {
+      await sql`
+        update summary_jobs set due_at = now()
+        where session_id = any(${sql.array([...loginDeferred], "text")}) and (locked_until is null or locked_until < now())`;
+      loginDeferred.clear();
+    }
+    return true;
+  };
+
+  /** Embeds a few summaries that have no vector yet (stored while the embedder was down). */
+  const sweepEmbeddings = async () => {
+    const now = clock().getTime();
+    if (lastSweepAt !== null && now - lastSweepAt < SWEEP_MS) return;
+    lastSweepAt = now;
+    // Older than a minute: a summary stored just now is still being embedded by whoever stored it.
+    const rows = await sql`
+      select s.id, s.title, s.body from summaries s
+      where not exists (select 1 from summary_embeddings e where e.summary_id = s.id)
+        and s.created_at < now() - interval '1 minute'
+      order by s.id limit ${SWEEP_BATCH}`;
+    for (const r of rows) {
+      if (stopped) return;
+      if (!(await embedSummary(sql, embedder, r.id, summaryEmbedText(r)))) return; // embedder still failing
+    }
+  };
+
+  /**
+   * Updates up to two dirty scopes (folding, or rebuilding when needed), each only while the spend stays
+   * within three quarters of the window. A scope that fails backs off (5 min, doubling up to 6 h).
+   */
+  const updateDirtyScopes = async () => {
+    const rows = await sql`select scope from project_states where dirty order by updated_at, scope`;
+    let done = 0;
+    for (const { scope } of rows) {
+      if (done >= DIRTY_PER_TICK || stopped) return;
+      const now = clock().getTime();
+      const backoff = scopeBackoff.get(scope);
+      if (backoff && now < backoff.until) continue;
+      if ((await budgetState(sql, dirtyBudget)).remaining <= 0) return;
+      done++;
+      const r = await updateState(sql, scope, [], { run, budget: dirtyBudget });
+      noteRun(r);
+      if (r.status === "updated") {
+        scopeBackoff.delete(scope);
+        continue;
+      }
+      // Out of the rebuild share: the rest of the window stays for live summaries.
+      if (r.reason === "budget") return;
+      if (handle("state", r)) return;
+      const ms = Math.min(SCOPE_BACKOFF_MAX_MS, Math.max(SCOPE_BACKOFF_MIN_MS, (backoff?.ms ?? 0) * 2));
+      scopeBackoff.set(scope, { until: now + ms, ms });
+    }
+  };
+
+  /** One pass; true when jobs remain that this pass left for the next. */
+  const tick = async (): Promise<boolean> => {
+    if (!cfg.enabled) {
+      state.paused = { reason: "disabled", until: null };
+      return false;
+    }
+    await sweepEmbeddings();
+    if (!(await mayRun())) return false;
+    await scheduleGrowingSessions(sql);
+    for (let n = 0; !stopped; n++) {
+      if (n >= JOBS_PER_TICK) {
+        await updateDirtyScopes();
+        return true;
+      }
+      const b = await budgetState(sql, budget);
+      if (b.resumesAt) {
+        pause("budget", b.resumesAt);
+        return false;
+      }
+      const job = await claimSummaryJob(sql);
+      if (!job) break;
+      const res = await summariseJob(sql, embedder, job, { run, budget });
+      noteRun(res);
+      if (res.status === "deferred" && res.reason === "login") loginDeferred.add(job.sessionId);
+      if (handle("summary", res)) return false;
+      for (const scope of res.scopes) {
+        const r = await updateState(sql, scope, [], { run, budget });
+        noteRun(r);
+        if (handle("state", r)) return false;
+      }
+    }
+    if (!stopped) await updateDirtyScopes();
+    return false;
+  };
+
+  let current: Promise<boolean> = Promise.resolve(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const runTick = () => {
+    current = current.then(() => (stopped ? false : tick())).catch((e) => {
+      // Class and SQLSTATE only: error messages can quote stored conversation text.
+      const code = pgState(e);
+      state.lastError = `loop: ${(e as Error)?.name ?? "Error"}${code ? ` ${code}` : ""}`;
+      log(JSON.stringify({ level: "error", msg: "summariser", error: (e as Error)?.name ?? "Error", pg: code }));
+      return false;
+    });
+    return current;
+  };
+  const schedule = (delay: number) => {
+    if (stopped || deps.manual) return;
+    timer = setTimeout(async () => schedule((await runTick()) ? 0 : deps.tickMs ?? TICK_MS), delay);
+  };
+  schedule(0);
+
+  return {
+    state,
+    async tick() { await runTick(); },
+    async stop() {
+      stopped = true;
+      clearTimeout(timer);
+      await current;
+    },
+  };
+}

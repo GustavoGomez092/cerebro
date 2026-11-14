@@ -422,8 +422,11 @@ test("a rebuild uses the scope's last 40 summaries, oldest first, ten per call",
   try {
     const { client, project, binding } = await boundFolder(t, { project: "Web" });
     const scope = scopeKey(client.id, project.id);
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
     const all: bigint[] = [];
-    for (let i = 1; i <= 45; i++) all.push(await addSummary(t, binding, { title: `S${i}`, day: 1 + (i % 28), facts: [`f${i}`] }));
+    for (let i = 1; i <= 45; i++) {
+      all.push(await addSummary(t, binding, { title: `S${i}`, day: 1 + (i % 28), facts: [`f${i}`], sessionId: "s1" }));
+    }
     const prompts: string[] = [];
     const spy = async (input: ClaudeInput) => { prompts.push(input.prompt); return fakeRun("ok")(input); };
     expect((await rebuildState(t.sql, scope, { run: spy, budget: BUDGET })).status).toBe("updated");
@@ -595,8 +598,9 @@ test("a rebuild too big for the budget shrinks to the newest summaries and leave
     const SMALL = { share: 1, windowTokens: 200_000 };
     const { client, project, binding } = await boundFolder(t, { project: "Web" });
     const scope = scopeKey(client.id, project.id);
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
     const all: bigint[] = [];
-    for (let i = 0; i < 40; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: 1 + (i >> 1), big: true }));
+    for (let i = 0; i < 40; i++) all.push(await addSummary(t, binding, { title: `Big ${i}`, day: 1 + (i >> 1), big: true, sessionId: "s1" }));
     // Tokens reported in proportion to the input, as the real CLI does.
     const run = fakeRun("maxstate", { FAKE_CLAUDE_TOKENS: "input", FAKE_CLAUDE_RECORD: rec });
 
@@ -618,7 +622,7 @@ test("a rebuild too big for the budget shrinks to the newest summaries and leave
     expect(calls()).toBe(used.length);
 
     // Live work still fits in the same window.
-    const live = await addSummary(t, binding, { title: "Live", day: 25, big: true });
+    const live = await addSummary(t, binding, { title: "Live", day: 25, big: true, sessionId: "s1" });
     expect((await updateState(t.sql, scope, [live], { run, budget: SMALL })).status).toBe("updated");
     expect(ids(await stateRow(t, scope))).toContain(live);
 
@@ -727,5 +731,43 @@ test("re-sending a history period puts its new text in the state", async () => {
     const st = await stateRow(t, scope);
     expect(st.text).toContain("giraffes");
     expect(st.text).not.toContain("zebras");
+  } finally { await t.drop(); }
+});
+
+test("initial histories always inform a rebuild, however many later summaries there are", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    const history = await addSummary(t, binding, { title: "How it began", day: 1, facts: ["Started as a weekend prototype"] });
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
+    for (let i = 0; i < 45; i++) await addSummary(t, binding, { title: `Later ${i}`, day: 2 + (i % 27), sessionId: "s1" });
+    const prompts: string[] = [];
+    const spy = async (input: ClaudeInput) => { prompts.push(input.prompt); return fakeRun("ok")(input); };
+    expect((await rebuildState(t.sql, scope, { run: spy, budget: BUDGET })).status).toBe("updated");
+    expect(prompts.some((p) => p.includes("How it began"))).toBe(true);
+    const st = await stateRow(t, scope);
+    expect(ids(st)).toContain(history);
+    expect(ids(st)).toHaveLength(41); // the newest 40 plus the history
+    expect(st.doc.facts).toContain("Started as a weekend prototype");
+    expect(sortedIds(st.excluded_summary_ids)).not.toContain(history);
+  } finally { await t.drop(); }
+});
+
+test("an update folds a history outside the newest 40", async () => {
+  const t = await authedApp();
+  try {
+    const { client, project, binding } = await boundFolder(t, { project: "Web" });
+    const scope = scopeKey(client.id, project.id);
+    await ingest(t, { sessions: [sess("s1", binding.id)], events: [] });
+    for (let i = 0; i < 41; i++) await addSummary(t, binding, { title: `Later ${i}`, day: 2 + (i % 27), facts: [`later ${i}`], sessionId: "s1" });
+    expect((await rebuildState(t.sql, scope, deps())).status).toBe("updated");
+    // Posted afterwards, covering a period older than everything in the window.
+    const history = await addSummary(t, binding, { title: "How it began", day: 1, facts: ["Started as a weekend prototype"] });
+    expect((await updateState(t.sql, scope, [], deps())).status).toBe("updated");
+    const st = await stateRow(t, scope);
+    expect(ids(st)).toContain(history);
+    expect(st.doc.facts).toContain("Started as a weekend prototype");
+    expect(st.dirty).toBe(false);
   } finally { await t.drop(); }
 });

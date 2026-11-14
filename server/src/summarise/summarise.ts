@@ -99,8 +99,15 @@ export function summaryEmbedText(row: { title: string; body: { overview?: string
   return [row.title, row.body.overview ?? "", ...(row.body.facts ?? [])].filter(Boolean).join("\n");
 }
 
-/** Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it). */
-export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<void> {
+/**
+ * Embeds `text`, the summaryEmbedText of summary `id`, and stores the vector only if the summary still
+ * yields that text: a history replaced while its old text was being embedded must not get the old vector.
+ * The row is share-locked while checking and writing, so a replacement in flight either commits first
+ * (and the check fails) or waits for this write and then deletes the vector itself.
+ * Best effort: a failure or timeout leaves the summary un-embedded (full-text search still finds it; the
+ * summariser loop retries later). True when the vector was stored.
+ */
+export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, text: string): Promise<boolean> {
   const ctl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -111,11 +118,17 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
       }, EMBED_TIMEOUT_MS);
     });
     const [vec] = await Promise.race([embedder.embed([text], ctl.signal), timeout]);
-    await sql`
-      insert into summary_embeddings (summary_id, embedding) values (${id}, ${toVector(vec)}::text::halfvec)
-      on conflict (summary_id) do update set embedding = excluded.embedding`;
+    return await sql.begin(async (tx) => {
+      const [row] = await tx`select title, body from summaries where id = ${id} for share`;
+      if (!row || summaryEmbedText(row) !== text) return false;
+      await tx`
+        insert into summary_embeddings (summary_id, embedding) values (${id}, ${toVector(vec)}::text::halfvec)
+        on conflict (summary_id) do update set embedding = excluded.embedding`;
+      return true;
+    });
   } catch {
-    // un-embedded; nothing queued
+    // un-embedded; the loop's sweep retries
+    return false;
   } finally {
     clearTimeout(timer);
   }
@@ -232,6 +245,6 @@ export async function summariseJob(
   }
 
   const hitCap = events.length >= maxEvents;
-  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, hitCap ? { dueAt: new Date() } : {});
+  await completeSummaryJob(sql, sessionId, events[events.length - 1].seq, { dueNow: hitCap });
   return result("done");
 }

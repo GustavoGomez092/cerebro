@@ -307,3 +307,32 @@ test("summary legs degrade on their own", async () => {
     expect(r.hits[0].matched).toEqual(["fts"]);
   } finally { await t.drop(); }
 });
+
+test("an embedding of replaced history text is dropped, not stored over the new text's", async () => {
+  const { t, b1 } = await world();
+  try {
+    const post = (text: string) => t.call("POST", "/v1/summaries", {
+      repo: b1.repo, subpath: "", title: "History", text, tsFrom: day(1), tsTo: day(2),
+    });
+    const first = await post("First draft about zebras");
+    expect(first.status).toBe(201);
+    const id = (await first.json()).summary.id;
+    const vector = async () => (await t.sql`select embedding::text as v from summary_embeddings where summary_id = ${id}`)[0]?.v;
+    await until(async () => !!(await vector()));
+    const [old] = await t.sql`select title, body from summaries where id = ${id}`;
+
+    // A slow embed of the old text is still in flight when the history is replaced.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const slow: Embedder = { dims: 1024, embed: async (texts, signal) => { await gate; return fakeEmbedder().embed(texts, signal); } };
+    const stale = embedSummary(t.sql, slow, id, summaryEmbedText(old));
+
+    expect((await post("Second draft about giraffes")).status).toBe(200);
+    await until(async () => !!(await vector()));
+    const fresh = await vector();
+    release();
+    const wrote = await stale;
+    expect(await vector()).toBe(fresh);
+    expect(wrote).toBe(false);
+  } finally { await t.drop(); }
+});

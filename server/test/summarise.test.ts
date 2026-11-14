@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, setSystemTime } from "bun:test";
 import { authedApp } from "./helpers";
 import { boundFolder, ev, sess, ingest } from "./fixtures";
 import { endSession } from "../src/ingest";
@@ -258,11 +258,19 @@ test("a job stopped at the event cap is due again now, not in two hours", async 
   const t = await authedApp();
   try {
     const { job } = await endedSession(t, 6);
-    expect((await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET, maxEvents: 3 })).status).toBe("done");
+    // The app host's clock running ahead of the database's must not push the job into the future.
+    setSystemTime(new Date(Date.now() + 3600_000));
+    try {
+      expect((await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET, maxEvents: 3 })).status).toBe("done");
+    } finally {
+      setSystemTime();
+    }
     const [j] = await t.sql`select covered_seq, due_at, locked_until from summary_jobs where session_id = 's1'`;
     expect(j.covered_seq).toBe(3);
     expect(j.locked_until).toBeNull();
-    expect(Math.abs(j.due_at.getTime() - Date.now())).toBeLessThan(5000);
+    // Due by the database's clock (which claims compare with), not the app host's.
+    const [{ due }] = await t.sql`select due_at <= statement_timestamp() as due from summary_jobs where session_id = 's1'`;
+    expect(due).toBe(true);
   } finally { await t.drop(); }
 });
 

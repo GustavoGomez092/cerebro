@@ -1,7 +1,26 @@
 import { Hono } from "hono";
+import type { SQL } from "bun";
 import type { AppDeps, Env } from "../app";
+import { budgetState } from "../../summarise/budget";
 
-export function statusRoutes({ sql, workerState }: AppDeps) {
+/** The summariser's state with its backlog (summary jobs) and budget window, or null when not configured. */
+async function summariserStatus(sql: SQL, s: AppDeps["summariser"]) {
+  if (!s) return null;
+  const [jobs] = await sql`
+    select count(*) filter (where not dead and priority = 0)::int as live,
+           count(*) filter (where not dead and priority <> 0)::int as imported,
+           count(*) filter (where dead)::int as dead
+    from summary_jobs`;
+  const b = await budgetState(sql, s.budget);
+  const { enabled, paused, lastRunAt, lastError, credentialExpiresAt } = s.state;
+  return {
+    enabled, paused, lastRunAt, lastError, credentialExpiresAt,
+    backlog: { live: jobs.live, imported: jobs.imported, dead: jobs.dead },
+    budget: { used: b.used, limit: b.limit, resumesAt: b.resumesAt?.toISOString() ?? null },
+  };
+}
+
+export function statusRoutes({ sql, workerState, summariser }: AppDeps) {
   const r = new Hono<Env>();
   r.get("/status", async (c) => {
     const [q] = await sql`
@@ -18,6 +37,7 @@ export function statusRoutes({ sql, workerState }: AppDeps) {
         lastError: workerState?.lastError ?? null,
         pausedUntil: workerState && workerState.pausedUntil > Date.now() ? new Date(workerState.pausedUntil).toISOString() : null,
       },
+      summariser: await summariserStatus(sql, summariser),
       dbBytes: bytes,
     });
   });
