@@ -1,8 +1,11 @@
 import type { SQL } from "bun";
-import { normalizeIdentity, type Binding } from "@cerebro/shared";
+import { normalizeIdentity, pathIdentityMachine, type Binding } from "@cerebro/shared";
+import type { Machine } from "./auth";
+
+export type BindingErrorCode = "invalid" | "conflict" | "not_found" | "forbidden" | "rebind_required";
 
 export class BindingError extends Error {
-  constructor(public code: "invalid" | "conflict" | "not_found", message: string) { super(message); }
+  constructor(public code: BindingErrorCode, message: string) { super(message); }
 }
 
 /** Canonical subpath: no leading/trailing or doubled slashes, no "." segments; ".." is rejected. */
@@ -13,6 +16,20 @@ export function normalizeSubpath(subpath: string): string {
 }
 
 const COLS = `id, repo, subpath, status, client_id as "clientId", project_id as "projectId"`;
+const view = (b: Binding | null) => b && { status: b.status, clientId: b.clientId, projectId: b.projectId, repo: b.repo, subpath: b.subpath };
+
+/** A `path:<machine>:` identity may only be written by that machine. */
+function assertOwnPath(repo: string, machine?: Machine) {
+  const owner = pathIdentityMachine(repo);
+  if (owner !== null && machine && owner !== machine.name)
+    throw new BindingError("forbidden", `path identities belong to the machine that created them (${owner})`);
+}
+
+async function record(sql: SQL, bindingId: string, machine: Machine | undefined, action: string, before: unknown, after: unknown) {
+  await sql`
+    insert into binding_history (binding_id, machine_id, action, before, after)
+    values (${bindingId}, ${machine?.id ?? null}, ${action}, ${JSON.stringify(before)}::text::jsonb, ${JSON.stringify(after)}::text::jsonb)`;
+}
 
 export interface BindingInput {
   repo: string;
@@ -23,39 +40,48 @@ export interface BindingInput {
 }
 
 /**
- * Creates or updates the binding for (repo, subpath). Sessions reference the binding,
- * so changing client/project here moves all of that folder's history.
+ * Creates the binding for (repo, subpath), or changes an existing one when `rebind` is set.
+ * Sessions reference the binding, so a change moves all of that folder's history; without
+ * `rebind` a change is refused so two machines can't silently overwrite each other.
  */
-export async function upsertBinding(sql: SQL, input: BindingInput): Promise<Binding> {
-  const b = { ...input, subpath: normalizeSubpath(input.subpath) };
-  const declined = b.status === "declined";
-  const clientId = declined ? null : b.clientId ?? null;
-  const projectId = declined ? null : b.projectId ?? null;
+export async function upsertBinding(
+  sql: SQL, input: BindingInput, opts: { machine?: Machine; rebind?: boolean } = {},
+): Promise<Binding> {
+  const repo = normalizeIdentity(input.repo);
+  const subpath = normalizeSubpath(input.subpath);
+  if (!repo) throw new BindingError("invalid", "repo is required");
+  assertOwnPath(repo, opts.machine);
+  const declined = input.status === "declined";
+  const clientId = declined ? null : input.clientId ?? null;
+  const projectId = declined ? null : input.projectId ?? null;
   if (!declined && !clientId) throw new BindingError("invalid", "an active binding needs a clientId");
-  if (projectId) {
-    const [p] = await sql`select client_id from projects where id = ${projectId}`;
-    if (!p || p.client_id !== clientId) throw new BindingError("invalid", "project does not belong to client");
-  }
   if (clientId) {
     const [c] = await sql`select id from clients where id = ${clientId}`;
     if (!c) throw new BindingError("invalid", "unknown client");
   }
-  if (declined) {
-    const [hist] = await sql`
-      select 1 from bindings bd join sessions s on s.binding_id = bd.id
-      where bd.repo = ${b.repo} and bd.subpath = ${b.subpath} limit 1`;
-    if (hist) throw new BindingError("conflict", "this folder already has recorded history; re-bind it instead of declining");
+  if (projectId) {
+    const [p] = await sql`select client_id from projects where id = ${projectId}`;
+    if (!p || p.client_id !== clientId) throw new BindingError("invalid", "project does not belong to client");
   }
-  const [row] = await sql.unsafe(
-    `insert into bindings (repo, subpath, status, client_id, project_id)
-     values ($1, $2, $3, $4, $5)
-     on conflict (repo, subpath) do update
-       set status = excluded.status, client_id = excluded.client_id,
-           project_id = excluded.project_id, updated_at = now()
-     returning ${COLS}`,
-    [b.repo, b.subpath, b.status, clientId, projectId],
-  );
-  return row;
+  return sql.begin(async (tx) => {
+    const [existing] = await tx.unsafe(`select ${COLS} from bindings where repo = $1 and subpath = $2 for update`, [repo, subpath]);
+    if (existing) {
+      const same = existing.status === input.status && existing.clientId === clientId && existing.projectId === projectId;
+      if (same) return existing;
+      if (!opts.rebind)
+        throw new BindingError("rebind_required", "this folder is already bound; send rebind: true to move it (and its history)");
+      const [row] = await tx.unsafe(
+        `update bindings set status = $2, client_id = $3, project_id = $4, updated_at = now() where id = $1 returning ${COLS}`,
+        [existing.id, input.status, clientId, projectId]);
+      await record(tx, row.id, opts.machine, "rebind", view(existing), view(row));
+      return row;
+    }
+    const [row] = await tx.unsafe(
+      `insert into bindings (repo, subpath, status, client_id, project_id) values ($1, $2, $3, $4, $5) returning ${COLS}`,
+      [repo, subpath, input.status, clientId, projectId]);
+    await record(tx, row.id, opts.machine, "create", null, view(row));
+    return row;
+  });
 }
 
 /** The most specific binding for a folder: longest subpath that equals or is a path-boundary prefix. */
@@ -80,14 +106,52 @@ export async function getBinding(sql: SQL, id: string): Promise<Binding | null> 
 }
 
 /** Re-points a binding at a new folder identity (e.g. after a remote rename). */
-export async function repointBinding(sql: SQL, id: string, repo: string, rawSubpath: string): Promise<Binding> {
+export async function repointBinding(sql: SQL, id: string, rawRepo: string, rawSubpath: string, machine?: Machine): Promise<Binding> {
+  const repo = normalizeIdentity(rawRepo);
   const subpath = normalizeSubpath(rawSubpath);
-  const [clash] = await sql`select id from bindings where repo = ${repo} and subpath = ${subpath} and id <> ${id}`;
-  if (clash) throw new BindingError("conflict", "that folder identity is already bound");
-  const rows = await sql.unsafe(
-    `update bindings set repo = $2, subpath = $3, updated_at = now() where id = $1 returning ${COLS}`,
-    [id, repo, subpath],
-  );
-  if (!rows[0]) throw new BindingError("not_found", "unknown binding");
-  return rows[0];
+  assertOwnPath(repo, machine);
+  return sql.begin(async (tx) => {
+    const before = await getBinding(tx, id);
+    if (!before) throw new BindingError("not_found", "unknown binding");
+    const [clash] = await tx`select id from bindings where repo = ${repo} and subpath = ${subpath} and id <> ${id}`;
+    if (clash) throw new BindingError("conflict", "that folder identity is already bound");
+    const [row] = await tx.unsafe(`update bindings set repo = $2, subpath = $3, updated_at = now() where id = $1 returning ${COLS}`, [id, repo, subpath]);
+    await record(tx, id, machine, "repoint", view(before), view(row));
+    return row;
+  });
+}
+
+/**
+ * Moves sessions recorded under a less specific binding of the same repo into this binding,
+ * when their folder lies under it (monorepo subfolder bound after work already happened there).
+ */
+export async function adoptSessions(sql: SQL, bindingId: string, machine?: Machine): Promise<number> {
+  return sql.begin(async (tx) => {
+    const b = await getBinding(tx, bindingId);
+    if (!b) throw new BindingError("not_found", "unknown binding");
+    if (b.status !== "active") throw new BindingError("invalid", "only an active binding can adopt sessions");
+    const moved = await tx`
+      update sessions s set binding_id = ${b.id}
+      from bindings cur
+      where cur.id = s.binding_id and cur.repo = ${b.repo} and length(cur.subpath) < length(${b.subpath})
+        and s.repo = ${b.repo}
+        and (${b.subpath} = '' or s.subpath = ${b.subpath} or starts_with(s.subpath, ${b.subpath} || '/'))
+      returning s.id, cur.id as from_binding`;
+    if (moved.length) await record(tx, b.id, machine, "adopt", null, { sessions: moved.map((m: any) => ({ id: m.id, from: m.from_binding })) });
+    return moved.length;
+  });
+}
+
+/** Moves one session to another active binding. Returns false when the session is unknown. */
+export async function moveSession(sql: SQL, sessionId: string, bindingId: string, machine?: Machine): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    const target = await getBinding(tx, bindingId);
+    if (!target) throw new BindingError("invalid", "unknown binding");
+    if (target.status !== "active") throw new BindingError("invalid", "sessions can only move to an active binding");
+    const [s] = await tx`select binding_id from sessions where id = ${sessionId} for update`;
+    if (!s) return false;
+    await tx`update sessions set binding_id = ${bindingId} where id = ${sessionId}`;
+    await record(tx, bindingId, machine, "session_move", { sessionId, bindingId: s.binding_id }, { sessionId, bindingId });
+    return true;
+  });
 }
