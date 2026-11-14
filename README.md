@@ -51,18 +51,35 @@ DATABASE_URL=… bun server/src/cli.ts token revoke my-macbook
 
 ### API overview
 
-All `/v1` routes need `Authorization: Bearer <token>`.
+All `/v1` routes need `Authorization: Bearer <token>`. Errors are `{ "error": "<code>", "message": "…" }`;
+a revoked token gets `401 token_revoked` (stop retrying, ask the owner), an unknown one `401 unauthorized`.
+
+**Scope.** Every search and read names the folder it comes from (`repo` + `subpath`) or asks for
+`scope: "open"` explicitly. A folder whose nearest active binding has a project is locked to that
+project; anything else may search all clients. Repo spellings are normalised server-side.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /health` | Liveness + DB check (no auth) |
-| `GET /v1/status` | Calling machine, events waiting to be indexed |
+| `GET /health` | `{ok, db, apiVersion, instanceId}` — no auth; clients check `instanceId` before sending data |
+| `GET /v1/status` | Calling machine, embed queue (`pending`, `dead`, `oldestPendingSeconds`), embedder state, DB size |
 | `GET/POST /v1/clients`, `GET /v1/clients/:id/projects`, `POST /v1/projects` | Clients and projects (create is idempotent by name) |
 | `GET /v1/bindings/resolve?repo=&subpath=` | Most specific binding for a folder |
-| `PUT /v1/bindings` | Bind / re-bind / decline a folder (re-binding moves its history) |
+| `PUT /v1/bindings` | Bind or decline a folder; changing an existing binding needs `rebind: true` (moves/holds its history) |
 | `PATCH /v1/bindings/:id/identity` | Re-point a binding after a remote rename |
-| `POST /v1/ingest` | Idempotent batch of sessions + events |
-| `POST /v1/sessions/:id/end` | Mark a session ended |
-| `POST /v1/search` | Hybrid search; a project-bound `repo` locks results to that project |
-| `GET /v1/sessions` | List sessions (filters: clientId, projectId, from, to, limit) |
-| `GET /v1/sessions/:id/events` | Raw events (fromSeq, toSeq, `full=1` for untruncated tool output) |
+| `POST /v1/bindings/:id/adopt` | Move earlier sessions recorded under a broader binding into this subfolder binding |
+| `PATCH /v1/sessions/:id` | Move one session to another active binding |
+| `POST /v1/ingest` | Batch of ≤ 2000 events / ≤ 200 sessions (≤ 10 MB). Returns `{sessions, inserted, duplicates, rejected[]}`; bad items are rejected individually, the rest is stored. Event keys are unique per session. |
+| `POST /v1/sessions/:id/end` | Mark a session ended (later events reopen it) |
+| `POST /v1/search` | Hybrid search → `{scope, binding, hits[], degraded, degradedReasons[]}`; hits carry `matched` (`fts`/`vec`) and `distance` |
+| `GET /v1/sessions` | Sessions in scope, newest first (`from`, `to`, `limit`, cursor `before`) |
+| `GET /v1/sessions/:id/events` | Raw events in scope (`afterSeq`, `limit` ≤ 1000, `nextSeq`; `full=1` for untruncated tool output, capped at 2 MB per page) |
+
+### Maintenance
+
+```sh
+DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret, rebuild its search index
+```
+
+Secrets are redacted at ingest (known key formats, bearer tokens, URL passwords, `*_PASSWORD=`-style
+lines). Events are chunked at ingest, so full-text search works immediately; a background worker
+embeds chunks (live sessions before imported history) and the vector half of search fills in.
