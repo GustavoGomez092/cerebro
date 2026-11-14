@@ -102,5 +102,6 @@ start), import existing history with `~/.cerebro/bin/cerebro retention`. Optiona
 `~/.cerebro/bin/cerebro schedule` to also pick up other agents' history.
 
 Maintainers publish a release with `scripts/release-plugin.sh <version>` (`--dry-run`
-to preview): it compiles the arm64 and x64 binaries and force-pushes `plugin/` as a
+to preview, `--remote <url>` to publish somewhere other than `origin`, which must be
+this GitHub repo): it compiles the arm64 and x64 binaries and force-pushes `plugin/` (atomically with the tag) as a
 single commit on `plugin-dist`, tagged `plugin-v<version>`.
