@@ -71,3 +71,17 @@ test("cli migrate applies migrations and exits 0; requeue-missing-embeddings pri
     expect(rout).toContain("queued 0 chunk(s)");
   } finally { await db.drop(); }
 });
+
+test("requeue-missing-embeddings fails clearly when the embedder returns the wrong number of vectors", async () => {
+  const db = await freshDb();
+  try {
+    await db.sql.unsafe(`
+      create table summaries (id bigserial primary key, title text not null, text text not null);
+      create table summary_embeddings (summary_id bigint primary key references summaries(id) on delete cascade, embedding halfvec(1024) not null)`);
+    await db.sql`insert into summaries (title, text) values ('a', 'one'), ('b', 'two')`;
+    const short = { dims: 1024, embed: async () => [new Array(1024).fill(0)] };
+    await expect(requeueMissingEmbeddings(db.sql, async () => short)).rejects.toThrow(/1 vector\(s\) for 2 summaries/);
+    const [{ n }] = await db.sql`select count(*)::int as n from summary_embeddings`;
+    expect(n).toBe(0);
+  } finally { await db.drop(); }
+});

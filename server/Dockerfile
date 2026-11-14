@@ -5,6 +5,7 @@ FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3
 # Claude Code CLI, pinned to the version on the owner's Mac (summariser runs it headless).
 ARG CLAUDE_CODE_VERSION=2.1.325
 RUN BUN_INSTALL=/usr/local bun install -g --trust "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && rm -rf /root/.bun/install/cache /usr/local/install/cache \
  && claude --version
 
 RUN groupadd --gid 10010 cerebro \

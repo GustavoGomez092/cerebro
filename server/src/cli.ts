@@ -46,6 +46,8 @@ export async function requeueMissingEmbeddings(
     if (!batch.length) break;
     embedder ??= await makeEmbedder();
     const vectors = await embedder.embed(batch.map((r: any) => `${r.title}\n${r.text}`));
+    if (vectors.length !== batch.length)
+      throw new Error(`embedder returned ${vectors.length} vector(s) for ${batch.length} summaries; aborting without writing this batch`);
     for (let i = 0; i < batch.length; i++)
       await sql`insert into summary_embeddings (summary_id, embedding) values (${batch[i].id}, ${toVector(vectors[i])}::halfvec) on conflict do nothing`;
     done += batch.length;

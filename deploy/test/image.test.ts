@@ -1,4 +1,7 @@
 import { test, expect, afterAll, beforeAll } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const ROOT = new URL("../../", import.meta.url).pathname;
 const sh = (...cmd: string[]) => {
@@ -64,3 +67,20 @@ run("migrate command and the healthcheck pass against a database", async () => {
   }
   expect(status).toBe("healthy");
 }, 180_000);
+
+run("build context excludes worktrees, secrets, keys and env files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cerebro-ctx-"));
+  try {
+    copyFileSync(join(ROOT, ".dockerignore"), join(dir, ".dockerignore"));
+    const plant = (rel: string) => { mkdirSync(join(dir, rel, ".."), { recursive: true }); writeFileSync(join(dir, rel), "x"); };
+    for (const f of [".claude/worktrees/x/.env", "server/.claude/y", ".worktrees/w/a", "worktrees/w/a", "secrets/x", "deploy/secrets/x", "tls/server.pem", "tls/server.key", "server/.env.prod", "keep/ok.txt"]) plant(f);
+    writeFileSync(join(dir, "Dockerfile"), "FROM oven/bun:1.4.4-slim\nCOPY . /ctx\nRUN find /ctx -type f | sort\n");
+    const b = sh("docker", "build", "--no-cache", "--progress=plain", dir);
+    expect(b.code).toBe(0);
+    const listing = b.out + "\n" + b.err;
+    expect(listing).toContain("/ctx/keep/ok.txt");
+    for (const bad of ["/.claude/", "/.worktrees/", "/worktrees/", "server.pem", "server.key"]) expect(listing).not.toContain(bad);
+    expect(listing).not.toMatch(/\/ctx\/\S*\.env/);
+    expect(listing).not.toMatch(/\/ctx\/\S*secrets\//);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 120_000);
