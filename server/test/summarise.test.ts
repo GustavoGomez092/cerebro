@@ -370,12 +370,40 @@ test("an outage (missing CLI, connection error, 5xx, 529, hung CLI) defers witho
       expect(j.last_error).toMatch(/^unavailable|^timeout/);
       job = await reclaim(t);
     }
-    // A hung call during an outage is not charged as if it had spent a whole transcript.
-    const [{ n }] = await t.sql`select coalesce(sum(tokens), 0)::int as n from usage_ledger`;
-    expect(n).toBeLessThan(1000);
+    // Only the two hung calls ran to their timeout: each is charged its estimate (it may have been processed and
+    // billed, N1). Failures that never reached the model (missing CLI, connection error, 5xx, crash) charge nothing.
+    const charged = await t.sql`select tokens from usage_ledger order by id`;
+    expect(charged).toHaveLength(2);
+    for (const r of charged) expect(r.tokens).toBeGreaterThan(4000);
     // Once the CLI is back the job is summarised as usual.
     expect(await summariseJob(t.sql, t.embedder, job, { run: fakeRun("ok"), budget: BUDGET })).toMatchObject({ status: "done" });
     expect(await t.sql`select 1 from summaries`).toHaveLength(1);
+  } finally { await t.drop(); }
+});
+
+test("N1: a summary call killed at its timeout is charged even when the probe fails too (slow API, not down)", async () => {
+  const t = await authedApp();
+  try {
+    let { job } = await endedSession(t);
+    const slow = (input: ClaudeInput) => fakeRun("slow")({ ...input, timeoutMs: 200 });
+    // The probe hangs too (elevated latency), answers with a usage limit, or says the login expired.
+    const cases: [(input: ClaudeInput) => Promise<any>, string][] = [
+      [slow, "unavailable"],
+      [(input) => isProbe(input) ? fakeRun("limit")(input) : slow(input), "usage_limit"],
+      [(input) => isProbe(input) ? fakeRun("auth")(input) : slow(input), "login"],
+    ];
+    for (const [i, [run, reason]] of cases.entries()) {
+      // The probe decides only the outcome: deferred, no attempt counted.
+      expect(await summariseJob(t.sql, t.embedder, job, { run, budget: BUDGET })).toMatchObject({ status: "deferred", reason });
+      const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+      expect(j).toEqual({ attempts: 0, dead: false });
+      // The killed summary call is charged its estimate every time; the probes that failed are not.
+      const rows = await t.sql`select tokens, kind from usage_ledger order by id`;
+      expect(rows).toHaveLength(i + 1);
+      expect(rows[i].kind).toBe("summary");
+      expect(rows[i].tokens).toBeGreaterThan(4000);
+      job = await reclaim(t);
+    }
   } finally { await t.drop(); }
 });
 
