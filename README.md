@@ -27,7 +27,7 @@ Tests create and drop their own throwaway databases on the dev Postgres
 | `EMBED_URL`    | required to run | Ollama base URL for embeddings           |
 | `EMBED_MODEL`  | `bge-m3` | Ollama embedding model                          |
 | `EMBED_DIMS`   | `1024`   | Embedding size; must match the schema's vector size |
-| `SUMMARISER_ENABLED` | `true` | `false` or `0` turns the summary loop off |
+| `SUMMARISER_ENABLED` | `true` | `false`, `0`, `no` or `off` (any case) turns the summary loop off; `true`, `1`, `yes`, `on` keep it on; any other value stops the server at startup |
 | `SUMMARISER_CMD` | `claude` | The Claude Code CLI to run (`claude -p`, the owner's subscription login; API-key variables are removed from its environment) |
 | `SUMMARY_SHARE` | `0.2` | Share of the 5-hour window the summariser may spend |
 | `SUBSCRIPTION_TOKENS_PER_5H` | `2000000` | Tokens the subscription allows per rolling 5-hour window; the summariser's budget is `SUMMARY_SHARE ×` this |

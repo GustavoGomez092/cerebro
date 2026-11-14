@@ -65,3 +65,15 @@ test("config validates share in (0, 1]", () => {
   }
   expect(() => loadConfig({ ...base, SUBSCRIPTION_TOKENS_PER_5H: "0" })).toThrow(/SUBSCRIPTION_TOKENS_PER_5H/);
 });
+
+test("SUMMARISER_ENABLED accepts the usual words, any case, and rejects anything else at startup", () => {
+  const base = { DATABASE_URL: "postgres://x" };
+  const enabled = (v: string | undefined) => loadConfig({ ...base, SUMMARISER_ENABLED: v }).summariser.enabled;
+  expect(enabled(undefined)).toBe(true);
+  expect(enabled("")).toBe(true);
+  for (const v of ["true", "1", "yes", "on", "TRUE", "Yes", " On "]) expect(enabled(v)).toBe(true);
+  for (const v of ["false", "0", "no", "off", "FALSE", "No", "OFF"]) expect(enabled(v)).toBe(false);
+  for (const v of ["disabled", "nope", "2", "enable", "f"]) {
+    expect(() => loadConfig({ ...base, SUMMARISER_ENABLED: v })).toThrow(/SUMMARISER_ENABLED/);
+  }
+});

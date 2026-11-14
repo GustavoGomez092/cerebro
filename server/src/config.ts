@@ -15,6 +15,18 @@ function shareEnv(env: Record<string, string | undefined>, name: string, fallbac
   return n;
 }
 
+const TRUE_WORDS = ["true", "1", "yes", "on"];
+const FALSE_WORDS = ["false", "0", "no", "off"];
+
+/** A yes/no setting: true/1/yes/on or false/0/no/off, any case; unset or empty means `fallback`; else a startup error. */
+function boolEnv(env: Record<string, string | undefined>, name: string, fallback: boolean): boolean {
+  const raw = (env[name] ?? "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  if (TRUE_WORDS.includes(raw)) return true;
+  if (FALSE_WORDS.includes(raw)) return false;
+  throw new Error(`${name} must be one of ${[...TRUE_WORDS, ...FALSE_WORDS].join(", ")}`);
+}
+
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
   const raw = env[name];
   if (raw === undefined || raw === "") return fallback;
@@ -33,7 +45,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     embedModel: env.EMBED_MODEL || "bge-m3",
     embedDims: intEnv(env, "EMBED_DIMS", 1024),
     summariser: {
-      enabled: !["false", "0"].includes((env.SUMMARISER_ENABLED ?? "").toLowerCase()),
+      enabled: boolEnv(env, "SUMMARISER_ENABLED", true),
       share: shareEnv(env, "SUMMARY_SHARE", 0.2),
       windowTokens: intEnv(env, "SUBSCRIPTION_TOKENS_PER_5H", 2000000),
       cmd: env.SUMMARISER_CMD || "claude",
