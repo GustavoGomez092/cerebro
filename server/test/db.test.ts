@@ -19,6 +19,27 @@ test("migrate creates schema and is idempotent", async () => {
   } finally { await drop(); }
 });
 
+/** The database-level settings (alter database … set), as "name=value" strings. */
+const dbSettings = async (sql: any): Promise<string[]> =>
+  (await sql`
+    select coalesce(s.setconfig, '{}') as c from pg_database d
+    left join pg_db_role_setting s on s.setdatabase = d.oid and s.setrole = 0
+    where d.datname = current_database()`)[0].c.slice().sort();
+
+test("M1: migrate re-applies the database-level timeouts a restore drops", async () => {
+  const { sql, drop } = await freshDb();
+  try {
+    const want = ["idle_in_transaction_session_timeout=60s", "statement_timeout=30s"];
+    expect(await dbSettings(sql)).toEqual(want);
+    // pg_restore into a createdb'd database (no --create) brings back schema_migrations with 001 in it, but
+    // not 001's `alter database … set`: the same state as resetting them here.
+    await sql.unsafe(`alter database ${(await sql`select current_database() as d`)[0].d} reset all`);
+    expect(await dbSettings(sql)).toEqual([]);
+    expect(await migrate(sql)).toEqual([]);
+    expect(await dbSettings(sql)).toEqual(want);
+  } finally { await drop(); }
+});
+
 test("concurrent migrations both succeed", async () => {
   const { sql, drop, url } = await freshDb({ migrate: false });
   try {

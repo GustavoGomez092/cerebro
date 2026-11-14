@@ -14,9 +14,17 @@ export function connect(url: string, opts: { max?: number } = {}): SQL {
 }
 
 /**
+ * Database-level backstops first set by migration 001. pg_dump writes `alter database … set` only with
+ * --create, so a restore into a createdb'd database drops them while schema_migrations says 001 ran:
+ * migrate re-asserts them every time (idempotent).
+ */
+const DB_SETTINGS = { statement_timeout: "30s", idle_in_transaction_session_timeout: "60s" } as const;
+
+/**
  * Applies pending migrations in name order under a session advisory lock, so concurrent
  * starters wait instead of colliding. A file whose first line is `-- no-transaction` runs
- * outside a transaction (needed for `create index concurrently`).
+ * outside a transaction (needed for `create index concurrently`). Then re-applies DB_SETTINGS
+ * (a warning, not a failure, if the role may not alter the database). New sessions get them.
  */
 export async function migrate(sql: SQL): Promise<string[]> {
   const conn = await sql.reserve();
@@ -42,6 +50,13 @@ export async function migrate(sql: SQL): Promise<string[]> {
           throw new Error(`migration ${name} failed: ${(e as Error).message}`);
         }
         applied.push(name);
+      }
+      try {
+        for (const [key, value] of Object.entries(DB_SETTINGS)) {
+          await conn.unsafe(`do $$ begin execute format('alter database %I set ${key} = %L', current_database(), '${value}'); end $$`);
+        }
+      } catch (e) {
+        console.log(JSON.stringify({ level: "warn", msg: "could not re-apply database settings", error: (e as Error).message }));
       }
       return applied;
     } finally {
