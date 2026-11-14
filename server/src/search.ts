@@ -151,6 +151,12 @@ async function vectorLeg(sql: SQL, src: Source, scope: SearchScope, req: SearchR
   });
 }
 
+/**
+ * Query-embed budget: one in-flight worker chunk (~4.5 s for bge-m3 on the Zima CPU, benchmark 2026-11-14)
+ * plus the query itself (~0.45 s). Past it, search falls back to full text (`degradedReasons: embedder`).
+ */
+export const QUERY_EMBED_TIMEOUT_MS = 6000;
+
 /** Embeds the query with a hard timeout that also cancels the request, ahead of the worker. */
 async function embedQuery(embedder: Embedder, query: string, timeoutMs: number, gate?: EmbedGate): Promise<number[]> {
   const ctrl = new AbortController();
@@ -189,7 +195,7 @@ export async function search(
   const terms = queryTerms(query);
   const reasons: Reason[] = [];
 
-  const qvec = embedQuery(embedder, query, opts.embedTimeoutMs ?? 3000, opts.gate).catch((e) => {
+  const qvec = embedQuery(embedder, query, opts.embedTimeoutMs ?? QUERY_EMBED_TIMEOUT_MS, opts.gate).catch((e) => {
     if (e instanceof EmbedderError) { reasons.push("embedder"); return null; }
     throw e;
   });

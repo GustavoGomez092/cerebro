@@ -127,3 +127,15 @@ test("a 200 KB message embeds end to end", async () => {
     expect(r.embedded).toBeGreaterThan(15);
   } finally { await t.drop(); }
 });
+
+test("by default the worker sends one chunk per embed call, so a query never waits behind a batch", async () => {
+  const t = await authedApp();
+  try {
+    await seed(t, [{ id: "s1", texts: ["a", "b", "c"] }]);
+    const sizes: number[] = [];
+    const spy: Embedder = { dims: 1024, embed: async (xs, s) => { sizes.push(xs.length); return fakeEmbedder().embed(xs, s); } };
+    const r = await embedPending(t.sql, spy, { state: newWorkerState() });
+    expect(r.embedded).toBe(3);
+    expect(sizes).toEqual([1, 1, 1]);
+  } finally { await t.drop(); }
+});

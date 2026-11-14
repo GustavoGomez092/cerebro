@@ -193,3 +193,15 @@ test("limit is capped at 50 and invalid bodies are 400", async () => {
     expect((await searchRaw({ nope: 1 })).status).toBe(400);
   } finally { await t.drop(); }
 });
+
+test("the default query-embed timeout covers one in-flight bge-m3 chunk on the Zima CPU (~4.5 s)", async () => {
+  const { t } = await world();
+  try {
+    const slow: Embedder = { dims: 1024, embed: (xs, signal) => new Promise((res, rej) => {
+      const timer = setTimeout(() => res(fakeEmbedder().embed(xs)), 4500);
+      signal?.addEventListener("abort", () => { clearTimeout(timer); rej(new EmbedderError("aborted")); });
+    }) };
+    const r = await search(t.sql, slow, { query: "pricing", scope: "open" });
+    expect(r.degradedReasons ?? []).not.toContain("embedder");
+  } finally { await t.drop(); }
+}, 15_000);

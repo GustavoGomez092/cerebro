@@ -41,7 +41,8 @@ export interface EmbedOptions {
   gate?: EmbedGate;
   /** Chunks claimed per run. */
   limit?: number;
-  /** Batch budget in characters and items (bge-m3 on a small CPU is slow; keep batches short). */
+  /** Batch budget in characters and items. Default: one chunk per call. bge-m3 takes ~4.5 s per 1 600-char chunk on
+   * the Zima CPU (benchmark 2026-11-14), and a search query waits behind the call in flight. */
   batchChars?: number;
   maxBatch?: number;
   leaseSeconds?: number;
@@ -56,7 +57,7 @@ export interface EmbedOptions {
  */
 export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOptions) {
   const { state } = opts;
-  const limit = opts.limit ?? 32, batchChars = opts.batchChars ?? 6000, maxBatch = opts.maxBatch ?? 8;
+  const limit = opts.limit ?? 32, batchChars = opts.batchChars ?? 6000, maxBatch = opts.maxBatch ?? 1;
   const leaseSeconds = opts.leaseSeconds ?? 600, maxAttempts = opts.maxAttempts ?? 5;
   const result = { claimed: 0, embedded: 0, failed: 0, dead: 0, paused: false };
   if (state.pausedUntil > Date.now()) return { ...result, paused: true };
