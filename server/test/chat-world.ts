@@ -10,8 +10,10 @@ import { ChatRuns } from "../src/chat/runs";
 import { embedPending, newWorkerState } from "../src/worker";
 
 export const FAKE_CHAT = `bun ${join(import.meta.dir, "fakes", "fake-claude-chat.ts")}`;
+/** SUMMARISER_CMD for the fake chat CLI: its options travel as words of the command (the CLI's env is an allowlist). */
+export const fakeChatCmd = (mode: string, flags: string[] = []) => [FAKE_CHAT, `--fake-mode=${mode}`, ...flags].join(" ");
 
-export async function chatWorld(opts: { mode?: string; timeoutMs?: number; keepAliveMs?: number; max?: number; chat?: boolean; extraEnv?: Record<string, string> } = {}) {
+export async function chatWorld(opts: { mode?: string; timeoutMs?: number; keepAliveMs?: number; max?: number; chat?: boolean; flags?: string[] } = {}) {
   const db = await freshDb();
   const { token: mac } = await createToken(db.sql, "test-mac");
   const { token: ui } = await createToken(db.sql, "web-ui");
@@ -20,7 +22,7 @@ export async function chatWorld(opts: { mode?: string; timeoutMs?: number; keepA
   let app!: ReturnType<typeof createApp>;
   const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (r) => app.fetch(r) });
   const mcpUrl = `http://127.0.0.1:${server.port}/mcp/chat`;
-  const env = { ...process.env, SUMMARISER_CMD: FAKE_CHAT, FAKE_CHAT_MODE: opts.mode ?? "ok", ...opts.extraEnv };
+  const env = { ...process.env, SUMMARISER_CMD: fakeChatCmd(opts.mode ?? "ok", opts.flags) };
   app = createApp({
     sql: db.sql, embedder: fakeEmbedder(), metrics, log: () => {},
     ...(opts.chat === false ? {} : { chat: { runs, model: "sonnet", timeoutMs: opts.timeoutMs ?? 20_000, mcpUrl, env, keepAliveMs: opts.keepAliveMs } }),

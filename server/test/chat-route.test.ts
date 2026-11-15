@@ -70,7 +70,7 @@ test("chat validates the conversation: user turns last, bounded", async () => {
 
 test("one run at a time: a second chat is refused while one runs; cancelling frees the slot and kills the CLI", async () => {
   const pidfile = join(process.env.TMPDIR ?? "/tmp", `chat-pid-${crypto.randomUUID()}`);
-  const w = await chatWorld({ mode: "slow", extraEnv: { FAKE_CHAT_PIDFILE: pidfile } });
+  const w = await chatWorld({ mode: "slow", flags: [`--fake-pidfile=${pidfile}`] });
   w.endStandingRun();
   try {
     const first = await ask(w, "slow one");
