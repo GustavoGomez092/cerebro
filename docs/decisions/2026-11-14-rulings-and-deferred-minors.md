@@ -215,3 +215,24 @@ Every decision taken on the owner's behalf during the build (`Ruling:` — what 
 - minor (deferred): a slow request finishing after its Mac was marked down sets it back to up (lane flaps; no bad vector stored).
 - minor (deferred): the Zima lane keeps storing while the Zima's digest mismatches the pin (only mixes if the Zima's model itself changed).
 - minor (deferred): one hung Mac probe (up to 15 s) delays the Zima re-check and other Macs' recovery.
+
+## Web dashboard and chat (2026-11-14, live as cerebro-web:7774999 at http://brain.home.lab)
+
+Rulings:
+- Owner chose TanStack Start + Better Auth (email/password, sign-up off) in its own container instead of a token-in-browser page; the web-ui token stays server-side and may call only /v1/dashboard/*.
+- Chat runs `claude -p` (Sonnet by default, CHAT_MODEL) inside cerebro-server on the Max subscription. It fails closed unless the CLI's init lists only mcp__cerebro__* tools, with an env allowlist, `--setting-sources ""` and `--max-turns 12`. Verified live: a request to run Bash / read secrets was declined with no tool use.
+- cerebro-web connects as role cerebro_web (auth schema only), never the superuser; its password is set by deploy/zima/web-db-role.sh straight into web.env.
+- Published on 127.0.0.1:8792 (8791 belongs to another app); Caddy returns 403 for /mcp/* on cerebro.home.lab.
+- The cerebro-web container is not part of deploy.sh's health gate: a failed web build warns and leaves the server release live; a server rollback stops cerebro-web.
+
+Deferred minors (review of 94718a5..876aa4f):
+- The SSE error handler forwards raw error messages to the browser.
+- Memory headroom in cerebro-server's 1 GB limit with several chat CLIs plus the summariser.
+- The dashboard's active-query list shows search text from every Mac without redaction.
+- The Better Auth session-refresh cookie never reaches the browser, so the owner is signed out every 7 days.
+- The overview poll (every 7 s per tab) re-runs the slow status query and exact count(*)s.
+- /mcp/chat runs JSON-RPC batches in parallel without a cap (needs a live run secret).
+- Cookies are not Secure (plain-http LAN); move to https before exposing beyond the LAN.
+- The summariser's `claude -p` still inherits the server env minus the API-key variables; it could use the chat's allowlist.
+- A dump restores cerebro_web's grants but not its password: re-run web-db-role.sh after a restore.
+- Importer: an open transcript idle for more than 10 minutes is marked done, so sessions without hooks (started before the plugin was installed) are not caught up by later imports. They are caught up once restarted with --resume.
