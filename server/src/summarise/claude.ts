@@ -200,7 +200,12 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
 
     const used = usageTokens(parsed);
     if (parsed.is_error !== false) {
-      const text = typeof parsed.result === "string" ? parsed.result : err || `claude error (exit ${code})`;
+      // No result text (e.g. error_max_structured_output_retries): keep the envelope's own reason, not just the exit code.
+      const reason = [parsed.subtype, ...(Array.isArray(parsed.errors) ? parsed.errors : [])]
+        .filter((x) => typeof x === "string" && x && x !== "error").join("; ");
+      const text = typeof parsed.result === "string"
+        ? parsed.result
+        : [err.trim(), reason].filter(Boolean).join("\n") || `claude error (exit ${code})`;
       const r = classify(text, parsed.api_error_status);
       // An unknown error after an answer envelope (e.g. structured-output retries ran out) may have spent a lot;
       // a login, limit or outage error never reached the model, so only reported usage counts for those.

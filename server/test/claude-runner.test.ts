@@ -160,3 +160,9 @@ test("I2: failures that never reached the model carry no tokens", async () => {
   const missing = await runClaude(input, { ...process.env, SUMMARISER_CMD: "/nonexistent/claude-bin" } as NodeJS.ProcessEnv);
   expect(!missing.ok && missing.tokens).toBeUndefined();
 });
+
+test("an error envelope without result text keeps the CLI's own reason (subtype) in the message", async () => {
+  const r = await runClaude(input, base("schemafail"));
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.message).toContain("error_max_structured_output_retries");
+});
