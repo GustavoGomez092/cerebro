@@ -2,7 +2,7 @@
 // the dashboard sees all clients. Only the web-ui token reaches them (see app.ts).
 import type { SQL } from "bun";
 import type { SearchResponse } from "@cerebro/shared";
-import { search } from "./search";
+import { search, SUMMARY_FROM, summaryScopeClause } from "./search";
 import { embedderFor, type Embedder } from "./embed/embedder";
 import type { EmbedGate } from "./worker";
 import type { Metrics } from "./metrics";
@@ -134,17 +134,26 @@ export async function globalSearch(
 
 const listOf = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
 
-/** A session (client, project, machine, folder, times) and its summaries, oldest range first. Null if unknown. */
+/**
+ * A session (client, project, machine, folder, times) and its summaries, oldest range first. Null if unknown or in a
+ * declined folder. Summaries follow search's visibility rules (summaryScopeClause, open scope) and must be filed
+ * under the session's current binding.
+ */
 export async function sessionSummaries(sql: SQL, sessionId: string) {
   const [s] = await sql`
-    select s.id, s.cwd, s.repo, s.started_at, s.last_event_at, s.ended_at, m.name as machine, cl.name as client_name, p.name as project_name
+    select s.id, s.binding_id, s.cwd, s.repo, s.started_at, s.last_event_at, s.ended_at, m.name as machine,
+           cl.name as client_name, p.name as project_name
     from sessions s join machines m on m.id = s.machine_id join bindings b on b.id = s.binding_id
     left join clients cl on cl.id = b.client_id left join projects p on p.id = b.project_id
-    where s.id = ${sessionId}`;
+    where s.id = ${sessionId} and b.status = 'active'`;
   if (!s) return null;
-  const rows = await sql`
-    select id, first_seq, last_seq, ts_from, ts_to, title, body from summaries
-    where session_id = ${sessionId} and kind = 'session' order by first_seq, id`;
+  const params: unknown[] = [];
+  const visible = summaryScopeClause({ kind: "open" }, {}, params);
+  params.push(sessionId, s.binding_id);
+  const rows = await sql.unsafe(
+    `select sm.id, sm.first_seq, sm.last_seq, sm.ts_from, sm.ts_to, sm.title, sm.body ${SUMMARY_FROM}
+     where ${visible} and sm.kind = 'session' and sm.session_id = $${params.length - 1} and sm.binding_id = $${params.length}
+     order by sm.first_seq, sm.id`, params);
   return {
     session: {
       id: s.id, cwd: s.cwd, repo: s.repo, machine: s.machine, clientName: s.client_name, projectName: s.project_name,

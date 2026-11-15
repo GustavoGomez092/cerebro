@@ -264,3 +264,33 @@ test("a session's summaries, oldest range first; 404 for an unknown session", as
     expect((await ui("GET", "/v1/dashboard/sessions/nope/summaries")).status).toBe(404);
   } finally { await t.drop(); }
 });
+
+test("a declined folder's session and its summaries are hidden, as in search", async () => {
+  const { t, ui } = await setup();
+  try {
+    const { b1 } = await world(t, { embed: false });
+    await t.sql`insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+                select 's1', 'session', ${b1.id}, client_id, project_id, 1, 2, now(), now(), 'Before decline', '{}'::jsonb, 'x', 'm'
+                from bindings where id = ${b1.id}`;
+    expect((await ui("GET", "/v1/dashboard/sessions/s1/summaries")).status).toBe(200);
+    const declined = await t.call("PUT", "/v1/bindings", { repo: "github.com/a/shop", subpath: "", status: "declined", rebind: true });
+    expect(declined.status).toBe(200);
+    expect((await ui("GET", "/v1/dashboard/sessions/s1/summaries")).status).toBe(404);
+  } finally { await t.drop(); }
+});
+
+test("a summary that lags behind its session's binding is not shown", async () => {
+  const { t, ui } = await setup();
+  try {
+    const { b1, b2 } = await world(t, { embed: false });
+    // A summary of s1 still filed under another binding (b2): summaryScopeClause hides it, so must this.
+    await t.sql`insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+                select 's1', 'session', ${b2.id}, client_id, project_id, 1, 2, now(), now(), 'Lagging', '{}'::jsonb, 'x', 'm'
+                from bindings where id = ${b2.id}`;
+    await t.sql`insert into summaries (session_id, kind, binding_id, client_id, project_id, first_seq, last_seq, ts_from, ts_to, title, body, text, model)
+                select 's1', 'session', ${b1.id}, client_id, project_id, 3, 4, now(), now(), 'Current', '{}'::jsonb, 'x', 'm'
+                from bindings where id = ${b1.id}`;
+    const r = await (await ui("GET", "/v1/dashboard/sessions/s1/summaries")).json();
+    expect(r.summaries.map((s: any) => s.title)).toEqual(["Current"]);
+  } finally { await t.drop(); }
+});

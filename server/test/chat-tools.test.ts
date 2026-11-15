@@ -160,6 +160,7 @@ test("a declined folder's sessions are not readable through the tools", async ()
   try {
     await w.t.call("PUT", "/v1/bindings", { repo: "github.com/beta/portal", subpath: "", status: "declined", rebind: true });
     expect((await w.call("get_session_events", { session_id: "s2" })).isError).toBe(true);
+    expect((await w.call("get_session_summary", { session_id: "s2" })).isError).toBe(true);
     const r = await w.json("recent_sessions", {});
     expect(r.sessions.map((s: any) => s.id)).toEqual(["s1"]);
   } finally { await w.t.drop(); }
