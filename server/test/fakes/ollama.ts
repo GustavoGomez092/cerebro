@@ -18,6 +18,9 @@ export function fakeOllama(fill: number, dims = 1024) {
     started: Promise.withResolvers<void>(),
   };
   const server = Bun.serve({
+    // Bind loopback explicitly: a wildcard bind can share a port number with a process bound to 127.0.0.1
+    // (e.g. a local Ollama runner), which then answers this fake's URL instead (seen as a 404 flake).
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const path = new URL(req.url).pathname;
