@@ -1,88 +1,138 @@
-import { Fragment, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { Component, Fragment, memo, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
+import { ArrowUp, Check, Copy, ListChecks, LoaderCircle, Square, SquarePen, TriangleAlert } from "lucide-react";
 import { getSessionSummaries, searchAll } from "../../lib/api";
-import { count, when } from "../../lib/format";
+import { when } from "../../lib/format";
+import { applyEvent, endTurn, historyFor, isRunning, newAssistantTurn, sseFrames, type AssistantTurn, type Step, type Turn } from "../../lib/chat-stream";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { ChatContainerContent, ChatContainerRoot } from "@/components/ui/chat-container";
+import { DotsLoader, TextShimmerLoader } from "@/components/ui/loader";
+import { Message, MessageAction, MessageActions, MessageContent } from "@/components/ui/message";
+import { PromptInput, PromptInputAction, PromptInputActions, PromptInputTextarea } from "@/components/ui/prompt-input";
+import { PromptSuggestion } from "@/components/ui/prompt-suggestion";
+import { ScrollButton } from "@/components/ui/scroll-button";
+import { Steps, StepsContent, StepsItem, StepsTrigger } from "@/components/ui/steps";
 
 export const Route = createFileRoute("/_authed/chat")({ component: ChatPage });
 
-type Step = { label: string };
-type Turn =
-  | { role: "user"; content: string }
-  | { role: "assistant"; content: string; steps: Step[]; status: "streaming" | "done" | "error" | "stopped"; note?: string };
-
-/** Splits an SSE stream into {event, data} records. */
-async function* sse(body: ReadableStream<Uint8Array>) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let i: number;
-    while ((i = buf.indexOf("\n\n")) >= 0) {
-      const block = buf.slice(0, i);
-      buf = buf.slice(i + 2);
-      const event = /^event: ?(.*)$/m.exec(block)?.[1] ?? "message";
-      const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.replace(/^data: ?/, "")).join("\n");
-      try { yield { event, data: JSON.parse(data || "{}") }; } catch { /* skip */ }
-    }
-  }
-}
-
-function errorNote(e: { kind?: string; message?: string; resetAt?: string | null }): string {
-  switch (e.kind) {
-    case "usage_limit": return `The Max plan's usage limit is reached${e.resetAt ? `; it resets ${when(e.resetAt)}` : ""}. Summaries wait too.`;
-    case "auth": return "Claude on the server is not logged in (run claude auth login in cerebro-server).";
-    case "timeout": return "No answer in time; the run was stopped.";
-    case "unavailable": return "Claude is unavailable right now (CLI or network).";
-    default: return e.message || "The chat failed.";
-  }
-}
+const SUGGESTIONS = ["What do you know about JS Lab?", "What did I work on this week?", "Open threads for Elite Dental"];
 
 function ChatPage() {
   const [tab, setTab] = useState<"chat" | "search">("chat");
   return (
-    <main className="page">
-      <div className="page-head">
+    <main className={tab === "chat" ? "chat-page flex min-h-0 flex-1 flex-col" : "page"}>
+      <div className={cn("page-head", tab === "chat" && "mx-auto w-full max-w-3xl px-4 pt-5")}>
         <h1>{tab === "chat" ? "Chat" : "Search"}</h1>
         <div className="tabs" role="tablist">
           <button role="tab" aria-selected={tab === "chat"} className={tab === "chat" ? "on" : ""} onClick={() => setTab("chat")}>Ask Claude</button>
           <button role="tab" aria-selected={tab === "search"} className={tab === "search" ? "on" : ""} onClick={() => setTab("search")}>Plain search</button>
         </div>
       </div>
-      <div hidden={tab !== "chat"}><Chat /></div>
+      {/* Both stay mounted so switching tabs keeps the conversation and the search results. */}
+      <div hidden={tab !== "chat"} className="pk flex min-h-0 flex-1 flex-col"><Chat /></div>
       <div hidden={tab !== "search"}><Search /></div>
     </main>
   );
 }
 
+const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** The agent's tool calls for one answer: open while it works, folded away once the answer is finished. */
+function ToolSteps({ steps, live }: { steps: Step[]; live: boolean }) {
+  const [open, setOpen] = useState(live);
+  useEffect(() => setOpen(live), [live]);
+  const last = steps[steps.length - 1];
+  return (
+    <Steps open={open} onOpenChange={setOpen} className="w-full">
+      <StepsTrigger
+        leftIcon={live ? <LoaderCircle className="size-4 animate-spin" /> : <ListChecks className="size-4" />}
+        swapIconOnHover={!live}
+      >
+        {live && last
+          ? <TextShimmerLoader text={capital(last.label)} size="md" className="font-normal" />
+          : `${steps.length} lookup${steps.length === 1 ? "" : "s"} in Cerebro`}
+      </StepsTrigger>
+      <StepsContent>
+        {steps.map((s, i) => <StepsItem key={i}>{capital(s.label)}</StepsItem>)}
+      </StepsContent>
+    </Steps>
+  );
+}
+
+function CopyAnswer({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <MessageAction tooltip={copied ? "Copied" : "Copy answer"} delayDuration={100}>
+      <Button
+        variant="ghost" size="icon" className="size-8 rounded-full" aria-label="Copy answer"
+        onClick={() => { void navigator.clipboard?.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}
+      >
+        {copied ? <Check /> : <Copy />}
+      </Button>
+    </MessageAction>
+  );
+}
+
+/** If the Markdown renderer ever throws on a half-streamed answer, show it as plain text instead of losing the page. */
+class PlainOnError extends Component<{ text: string; children: ReactNode }, { failedOn: string | null }> {
+  state = { failedOn: null as string | null };
+  static getDerivedStateFromError() { return { failedOn: "" }; }
+  componentDidCatch() { this.setState({ failedOn: this.props.text }); }
+  render() {
+    const { failedOn } = this.state;
+    if (failedOn !== null && (failedOn === "" || failedOn === this.props.text)) return <div className="whitespace-pre-wrap">{this.props.text}</div>;
+    return this.props.children;
+  }
+}
+
+const AssistantMessage = memo(function AssistantMessage({ turn }: { turn: AssistantTurn }) {
+  const live = isRunning(turn);
+  const failed = turn.status === "error";
+  return (
+    <Message className="w-full flex-col items-start gap-3">
+      {turn.steps.length > 0 && <ToolSteps steps={turn.steps} live={live} />}
+      {!turn.content && live && <DotsLoader className="my-2" />}
+      {turn.content && (
+        <PlainOnError text={turn.content}>
+          <MessageContent markdown className="prose prose-pk w-full min-w-0 max-w-none bg-transparent p-0">
+            {turn.content}
+          </MessageContent>
+        </PlainOnError>
+      )}
+      {turn.note && (failed ? (
+        <div role="alert" className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          <span>{turn.note}</span>
+        </div>
+      ) : (
+        <MessageActions className={cn("gap-1 text-xs", turn.status === "done" && turn.content && "-ml-1.5")}>
+          {turn.content && turn.status === "done" && <CopyAnswer text={turn.content} />}
+          <span>{turn.note}</span>
+        </MessageActions>
+      ))}
+    </Message>
+  );
+});
+
 function Chat() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
-  const [running, setRunning] = useState(false);
   const ctrl = useRef<AbortController | null>(null);
-  const bottom = useRef<HTMLDivElement>(null);
+  const running = isRunning(turns[turns.length - 1]);
 
-  const updateLast = (fn: (t: Extract<Turn, { role: "assistant" }>) => Extract<Turn, { role: "assistant" }>) =>
+  const updateLast = (fn: (t: AssistantTurn) => AssistantTurn) =>
     setTurns((ts) => {
       const last = ts[ts.length - 1];
       return last?.role === "assistant" ? [...ts.slice(0, -1), fn(last)] : ts;
     });
 
-  async function send(e?: FormEvent) {
-    e?.preventDefault();
-    const question = input.trim();
+  async function send(text?: string) {
+    const question = (text ?? input).trim();
     if (!question || running) return;
-    // Earlier finished turns as plain text (tool steps aren't sent), then the new question; the server caps them.
-    const history = turns
-      .filter((t) => t.role === "user" || (t.status === "done" && t.content))
-      .map((t) => ({ role: t.role, content: t.content }))
-      .slice(-12);
-    const messages = [...history, { role: "user" as const, content: question }];
-    setTurns((ts) => [...ts, { role: "user", content: question }, { role: "assistant", content: "", steps: [], status: "streaming" }]);
+    const messages = historyFor(turns, question);
+    setTurns((ts) => [...ts, { role: "user", content: question }, newAssistantTurn()]);
     setInput("");
-    setRunning(true);
     const c = new AbortController();
     ctrl.current = c;
     try {
@@ -90,62 +140,97 @@ function Chat() {
       if (res.status === 401) { window.location.assign("/login"); return; }
       if (!res.ok || !res.body) {
         const err = await res.json().catch(() => ({}));
-        updateLast((t) => ({ ...t, status: "error", note: err.error === "chat_busy" ? "Another answer is in progress. Try again when it ends." : err.message ?? `Error ${res.status}` }));
+        const note = err.error === "chat_busy" ? "Another answer is in progress. Try again when it ends." : err.message ?? `Error ${res.status}`;
+        updateLast((t) => ({ ...t, status: "error", note }));
         return;
       }
-      for await (const { event, data } of sse(res.body)) {
-        if (event === "text") updateLast((t) => ({ ...t, content: t.content + data.text }));
-        else if (event === "tool") updateLast((t) => ({ ...t, steps: [...t.steps, { label: data.label }] }));
-        else if (event === "done") updateLast((t) => ({ ...t, status: "done", note: `${count(data.tokens)} tokens · ${data.model ?? "model unknown"} · ${(data.durationMs / 1000).toFixed(1)} s` }));
-        else if (event === "error") updateLast((t) => ({ ...t, status: "error", note: errorNote(data) }));
-        bottom.current?.scrollIntoView({ block: "end" });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let rest = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const parsed = sseFrames(rest + decoder.decode(value, { stream: true }));
+        rest = parsed.rest;
+        if (parsed.frames.length) updateLast((t) => parsed.frames.reduce(applyEvent, t));
       }
-      updateLast((t) => (t.status === "streaming" ? { ...t, status: "error", note: "The answer was cut off." } : t));
+      updateLast((t) => endTurn(t, "ended"));
     } catch {
-      updateLast((t) => ({ ...t, status: c.signal.aborted ? "stopped" : "error", note: c.signal.aborted ? "Stopped." : "The connection dropped." }));
+      updateLast((t) => endTurn(t, c.signal.aborted ? "aborted" : "dropped"));
     } finally {
-      setRunning(false);
-      ctrl.current = null;
+      if (ctrl.current === c) ctrl.current = null;
     }
   }
 
-  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
-  };
+  // Stop aborts the fetch; the proxy passes the abort on and cerebro-server kills the run.
+  const stop = () => ctrl.current?.abort();
+  useEffect(() => () => ctrl.current?.abort(), []);
 
   return (
-    <div className="chat">
-      {turns.length === 0 && (
-        <div className="card muted">
-          <p>Ask about any client or project. Claude answers from Cerebro's recorded sessions, summaries and project states, and cites client, project, session and date.</p>
-          <p className="small">For example: <em>What did we do for Cadco last week?</em> · <em>What's the state of EDA 2.0?</em> · <em>Which clients use WordPress?</em></p>
+    <>
+      <ChatContainerRoot className="relative min-h-0 flex-1 [mask-image:linear-gradient(to_bottom,transparent,black_1.25rem)]">
+        <ChatContainerContent className="mx-auto w-full max-w-3xl gap-8 px-4 pt-6 pb-10">
+          {turns.length === 0 ? (
+            <div className="flex flex-col items-center gap-5 pt-[12vh] text-center">
+              <div className="space-y-2">
+                <h2 className="m-0 text-2xl font-semibold tracking-tight">What do you want to know?</h2>
+                <p className="m-0 max-w-xl text-muted-foreground">
+                  Claude answers from Cerebro's recorded sessions, summaries and project states, and cites client, project, session and date.
+                </p>
+              </div>
+              <div className="flex flex-wrap justify-center gap-2">
+                {SUGGESTIONS.map((s) => (
+                  <PromptSuggestion key={s} size="sm" className="h-9 px-4 font-normal" onClick={() => void send(s)}>{s}</PromptSuggestion>
+                ))}
+              </div>
+            </div>
+          ) : turns.map((t, i) => t.role === "user" ? (
+            <Message key={i} className="justify-end">
+              <MessageContent className="max-w-[85%] rounded-3xl bg-muted px-5 py-2.5 whitespace-pre-wrap text-foreground sm:max-w-[75%]">
+                {t.content}
+              </MessageContent>
+            </Message>
+          ) : <AssistantMessage key={i} turn={t} />)}
+        </ChatContainerContent>
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+          <ScrollButton className="pointer-events-auto bg-card shadow-sm" aria-label="Scroll to the newest message" />
         </div>
-      )}
-      <div className="turns">
-        {turns.map((t, i) => t.role === "user" ? (
-          <div key={i} className="turn user"><div className="bubble">{t.content}</div></div>
-        ) : (
-          <div key={i} className="turn assistant">
-            {t.steps.length > 0 && (
-              <ul className="steps">{t.steps.map((s, j) => (
-                <li key={j}>{s.label}{t.status === "streaming" && j === t.steps.length - 1 && !t.content ? "…" : ""}</li>
-              ))}</ul>
-            )}
-            <div className="bubble answer">{t.content || (t.status === "streaming" ? <span className="muted">Thinking…</span> : null)}</div>
-            {t.note && <div className={`note ${t.status === "error" ? "error" : "muted"}`}>{t.note}</div>}
-          </div>
-        ))}
-        <div ref={bottom} />
+      </ChatContainerRoot>
+      <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-4">
+        <PromptInput
+          value={input} onValueChange={setInput} onSubmit={() => void send()} isLoading={running}
+          className="relative z-10 w-full rounded-3xl border border-input bg-card p-0 pt-1 shadow-xs"
+        >
+          <PromptInputTextarea
+            placeholder="Ask about a client or project…" maxLength={8000} aria-label="Your question"
+            className="min-h-[44px] pt-3 pl-4 text-base leading-[1.3] text-foreground dark:bg-transparent"
+          />
+          <PromptInputActions className="mt-2 flex w-full items-center justify-between gap-2 p-2">
+            <div className="flex items-center gap-1">
+              {turns.length > 0 && !running && (
+                <PromptInputAction tooltip="New chat">
+                  <Button variant="ghost" size="sm" className="rounded-full text-muted-foreground" onClick={() => setTurns([])}>
+                    <SquarePen /> New chat
+                  </Button>
+                </PromptInputAction>
+              )}
+              <span className="hidden pl-2 text-xs text-muted-foreground sm:inline">Enter to send · Shift+Enter for a new line</span>
+            </div>
+            <PromptInputAction tooltip={running ? "Stop" : "Send"}>
+              {running ? (
+                <Button size="icon" variant="secondary" className="size-9 rounded-full" onClick={stop} aria-label="Stop">
+                  <Square className="size-3.5 fill-current" />
+                </Button>
+              ) : (
+                <Button size="icon" className="size-9 rounded-full" disabled={!input.trim()} onClick={() => void send()} aria-label="Send">
+                  <ArrowUp className="size-[18px]" />
+                </Button>
+              )}
+            </PromptInputAction>
+          </PromptInputActions>
+        </PromptInput>
       </div>
-      <form className="composer" onSubmit={send}>
-        <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} rows={2} maxLength={8000}
-          placeholder="Ask about a client or project… (Enter to send, Shift+Enter for a new line)" />
-        {running
-          ? <button type="button" className="secondary" onClick={() => ctrl.current?.abort()}>Stop</button>
-          : <button type="submit" disabled={!input.trim()}>Send</button>}
-        {turns.length > 0 && !running && <button type="button" className="link" onClick={() => setTurns([])}>New chat</button>}
-      </form>
-    </div>
+    </>
   );
 }
 
