@@ -73,7 +73,7 @@ services:
   # The web dashboard (web/: TanStack Start + Better Auth). Behind the `web` profile: deploy.sh must build
   # cerebro-web:<tag> (web/Dockerfile) and run compose with --profile web before it starts. It reads the database
   # (its `auth` schema) and calls cerebro-server with the web-ui token, both from web.env; the browser never sees
-  # the token. Caddy points the dashboard's name (brain.home.lab) at 127.0.0.1:8791.
+  # the token. Caddy points the dashboard's name (brain.home.lab) at 127.0.0.1:8792.
   web:
     container_name: cerebro-web
     image: cerebro-web:${CEREBRO_TAG}
@@ -87,7 +87,7 @@ services:
     environment:
       CEREBRO_URL: http://cerebro-server:8790
     ports:
-      - "127.0.0.1:8791:3000"
+      - "127.0.0.1:8792:3000"
     cpus: 1
     mem_limit: 512m
     memswap_limit: 512m

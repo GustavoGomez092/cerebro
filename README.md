@@ -176,6 +176,7 @@ port: use the `docker exec` forms in [deploy/zima/README.md](deploy/zima/README.
 DATABASE_URL=… bun server/src/cli.ts redact <session-id> [regex]   # scrub a leaked secret from a session, its summaries and project states
 DATABASE_URL=… bun server/src/cli.ts requeue-dead                  # retry dead chunks and dead summary jobs
 DATABASE_URL=… bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only
+DATABASE_URL=… bun server/src/cli.ts web-db-role > file            # new cerebro_web password; prints its DATABASE_URL into a pipe/file only
 ```
 
 Secrets are redacted at ingest (known key formats, bearer tokens, URL passwords, `*_PASSWORD=`-style
@@ -199,19 +200,25 @@ email + password, one owner account, no public sign-up). Pages:
 How it fits together: the browser talks only to `cerebro-web` (a session cookie: `HttpOnly`, `SameSite=Lax`, not
 `Secure` because the LAN is plain http; sign-in limited to 5 tries a minute per address). `cerebro-web` calls
 `cerebro-server`'s `/v1/dashboard/*` server-side with the `web-ui` token from its environment; the token never
-reaches the browser. Better Auth's tables live in the `auth` schema of the same database (migration 008).
+reaches the browser. Better Auth's tables live in the `auth` schema of the same database (migration 008), reached as
+the `cerebro_web` role (migration 009: the `auth` schema only, nothing in `public`), never as the server's superuser.
+`bun server/src/cli.ts web-db-role | …` gives that role LOGIN and a new password and prints web.env's
+`DATABASE_URL` line into a pipe (it refuses a terminal); on the Zima, `deploy/zima/web-db-role.sh` does it all.
 
 **The chat agent** runs in `cerebro-server`, where `claude` is logged in: `claude -p --model $CHAT_MODEL` on the
-owner's Max subscription, exactly like the summariser (API-key variables removed from its environment,
-`CEREBRO_HEADLESS=1`, `--no-session-persistence`, so nothing about the chat is recorded or kept). Its only tools are
-six read-only Cerebro tools served over `/mcp/chat` (`--mcp-config` + `--strict-mcp-config`, `--tools ""`, an
-`--allowedTools` list of those six, every built-in in `--disallowedTools`): `global_search`, `list_clients_projects`,
-`get_session_summary`, `get_project_state`, `recent_sessions` and `get_session_events` (capped: 20 hits, 50 sessions,
-100 events of 2 000 chars, 60 000 chars per answer). They read stored data, which was redacted at ingest. The system
-prompt asks it to cite client / project / session / date and to say when the data doesn't cover something. Earlier
-turns are sent back with each question (the last 12, capped), so a conversation is multi-turn without the CLI
-keeping sessions. One answer at a time (`CHAT_MAX_CONCURRENT`), killed after `CHAT_TIMEOUT_MS` or when the browser
-goes away.
+owner's Max subscription, like the summariser (`CEREBRO_HEADLESS=1`, `--no-session-persistence`, so nothing about
+the chat is recorded or kept). Its environment is an allowlist (PATH, HOME, the Claude config dir, locale, proxies):
+no `DATABASE_URL`, token or API key. Its only tools are six read-only Cerebro tools served over `/mcp/chat`
+(`--mcp-config` + `--strict-mcp-config`, `--tools ""`, an `--allowedTools` list of those six, every built-in in
+`--disallowedTools`, `--setting-sources ""` so no user or project settings or hooks load, `--max-turns 12`):
+`global_search`, `list_clients_projects`, `get_session_summary`, `get_project_state`, `recent_sessions` and
+`get_session_events` (capped: 20 hits, 50 sessions, 100 events of 2 000 chars, 60 000 chars per answer). It fails
+closed: if the CLI's `init` message lists any other tool, or the Cerebro tool server isn't connected, the run is
+killed before anything is shown ("chat tools are not locked down"). They read stored data, which was redacted at
+ingest. The system prompt asks it to cite client / project / session / date and to say when the data doesn't cover
+something. Earlier turns are sent back with each question (the last 12, capped), so a conversation is multi-turn
+without the CLI keeping sessions. One answer at a time (`CHAT_MAX_CONCURRENT`), killed (its whole process group)
+after `CHAT_TIMEOUT_MS` or when the browser goes away.
 
 **Usage.** Chat spends the same Max plan as the summariser, but outside the summariser's `SUMMARY_SHARE`: its tokens
 (input + output + cache creation, from the CLI's result) are counted in memory and shown on the dashboard, never
@@ -219,14 +226,16 @@ written to `usage_ledger`, so chat never delays summaries through the budget. Bo
 the plan hits its limit, the chat says so (with the reset time) and the summariser pauses with `usage_limit` until
 the reset.
 
-Setup on the Zima (token, `web.env`, Caddy, the owner account): [deploy/zima/README.md](deploy/zima/README.md), "Web
-dashboard". Locally:
+Setup on the Zima (token, `web.env`, the database login, Caddy, the owner account):
+[deploy/zima/README.md](deploy/zima/README.md), "Web dashboard". Locally:
 
 ```sh
-DATABASE_URL=postgres://cerebro:cerebro@127.0.0.1:54329/cerebro bun server/src/cli.ts migrate
-DATABASE_URL=… bun server/src/cli.ts token create web-ui
+export SERVER_DB=postgres://cerebro:cerebro@127.0.0.1:54329/cerebro
+DATABASE_URL=$SERVER_DB bun server/src/cli.ts migrate
+DATABASE_URL=$SERVER_DB bun server/src/cli.ts token create web-ui
+DATABASE_URL=$SERVER_DB bun server/src/cli.ts web-db-role > web/.env.local   # DATABASE_URL for cerebro_web
 cd web
-export DATABASE_URL=postgres://cerebro:cerebro@127.0.0.1:54329/cerebro BETTER_AUTH_SECRET=$(openssl rand -base64 32) \
+export $(cat .env.local) BETTER_AUTH_SECRET=$(openssl rand -base64 32) \
   BETTER_AUTH_URL=http://localhost:3000 CEREBRO_URL=http://127.0.0.1:8790 CEREBRO_WEB_TOKEN=<the web-ui token>
 bun scripts/create-owner.ts --email you@example.com   # asks for the password twice (hidden)
 bun run dev                                            # or: bun run build && bun server.ts

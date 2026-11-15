@@ -7,7 +7,7 @@ never retry quickly and never open parallel connections).
 | What | Where |
 |---|---|
 | Containers | `cerebro-db` (pgvector, 2 GB, 2 CPUs), `cerebro-ollama` (bge-m3, 3 GB, `OLLAMA_CPUS`), `cerebro-server` (1 GB, 2 CPUs), `cerebro-web` (dashboard, 512 MB, 1 CPU, `web` profile; see "Web dashboard"), network `cerebro-net` (internal) |
-| URL | `http://cerebro.home.lab` (Caddy) → `127.0.0.1:8790` (the API); `http://brain.home.lab` → `127.0.0.1:8791` (the web dashboard, once deployed). No other port is published |
+| URL | `http://cerebro.home.lab` (Caddy) → `127.0.0.1:8790` (the API); `http://brain.home.lab` → `127.0.0.1:8792` (the web dashboard, once deployed). No other port is published |
 | App dir | `/DATA/AppData/cerebro`: `src/` (synced repo), `data/{db,ollama,claude}`, `secrets/` (root 700/600), `state/` (deploy records, pre-deploy dumps, lock), `zima/` (root-owned backup scripts + units, installed by every deploy), `conf/postgres-<sha256>.conf` (the conf each compose mounts), `docker-compose.yml` (rendered, last good release) |
 | Backups | `/DATA/Backup/cerebro/{nightly,weekly}` (USB drive shared with `zima-backup` and `postgres-backup`) |
 
@@ -253,19 +253,26 @@ the Zima) and back on at home, or don't map the MacBook at all. The server sends
 ## Web dashboard (cerebro-web)
 
 A separate container, `cerebro-web` (web/: TanStack Start + Better Auth, 512 MB, 1 CPU), published on
-`127.0.0.1:8791` only. It holds the owner's login (email + password, public sign-up off) and calls
+`127.0.0.1:8792` only. It holds the owner's login (email + password, public sign-up off) and calls
 `cerebro-server`'s `/v1/dashboard/*` **server-side** with the `web-ui` machine token; the browser only ever has a
 session cookie. The chat's `claude -p` runs inside `cerebro-server` (where Claude is logged in), not in this
 container. In `deploy/compose.yml` it sits behind the `web` profile, so a deploy that doesn't pass
 `--profile web` (and build `cerebro-web:<tag>` from `web/Dockerfile`) leaves it off.
 
-**Not wired yet:** `deploy.sh` builds only `cerebro-server`. Before the first web deploy it must also run
-`docker build -t cerebro-web:$SHA -f $SRC/web/Dockerfile $SRC` and add `--profile web` to its compose commands
-(and roll `cerebro-web` back with the server). Migration 008 (the `auth` schema) runs with the server's migrations.
+**Deploys:** once `web.env` exists, `deploy.sh` builds `cerebro-web:<sha>` from `web/Dockerfile` and starts it
+with `--profile web` after the server passed its health gate. The web container is not part of the gate: a failed
+build or start prints a warning and the server release stays live (the previous web container keeps running).
+Without `web.env` the deploy leaves the dashboard alone. Migrations 008 (the `auth` schema) and 009 (the
+`cerebro_web` role) run with the server's migrations. **A rollback stops `cerebro-web`** (an older server would not
+confine the `web-ui` token to `/v1/dashboard`); the next good deploy starts it again.
+
+cerebro-web never uses the `cerebro` superuser: it connects as `cerebro_web`, a role that may use the `auth` schema
+(Better Auth's tables) and nothing else; it can't even list Cerebro's tables in `public`.
 
 First time:
 
-1. **The `web-ui` token** (outside a recorded Claude Code session):
+1. **Deploy** once (`deploy/zima/deploy.sh`), so the server has migrated to 009.
+2. **The `web-ui` token** (outside a recorded Claude Code session):
    ```sh
    ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token create web-ui
    ```
@@ -273,32 +280,39 @@ First time:
    and no Mac token may call `/v1/dashboard/*`. It is never an embed lane (`EMBED_MACHINE_URLS` may not name it;
    the server refuses to start if it does), and it never uploads sessions, so it never shows in the clients'
    machine lists.
-2. **`web.env`** in the secrets dir, root 600 like `server.env` (`$SECRETS` = `/DATA/AppData/cerebro/secrets`):
+3. **`web.env`** in the secrets dir, root 600 like `server.env` (`$SECRETS` = `/DATA/AppData/cerebro/secrets`),
+   with three lines (no `DATABASE_URL`: step 4 writes it):
    ```sh
    ssh -t zima 'sudo install -m 600 -o root -g root /dev/null /DATA/AppData/cerebro/secrets/web.env && sudoedit /DATA/AppData/cerebro/secrets/web.env'
    ```
    ```
-   DATABASE_URL=postgres://cerebro:<POSTGRES_PASSWORD from db.env>@cerebro-db:5432/cerebro
    BETTER_AUTH_SECRET=<openssl rand -base64 32>
    BETTER_AUTH_URL=http://brain.home.lab
    CEREBRO_WEB_TOKEN=<the web-ui token>
    ```
    `BETTER_AUTH_URL` is the address you open in the browser; it is also the only origin allowed to post to the
    app. Changing `BETTER_AUTH_SECRET` signs everyone out.
-3. **Deploy** with the web profile (see "Not wired yet" above), then **Caddy** (repo `HomeLab/proxy`):
+4. **The database login**: `deploy/zima/web-db-role.sh` (from the repo on the Mac). It gives `cerebro_web` LOGIN and
+   a new random password, and writes `DATABASE_URL=postgres://cerebro_web:…@cerebro-db:5432/cerebro` into `web.env`,
+   keeping the other lines. The password is made inside `cerebro-server` (`cli.ts web-db-role`, sent to Postgres as a
+   SCRAM verifier, so not even a logged failing statement shows it) and written straight to the file on the server:
+   it is never printed or sent back over ssh. Re-run it to rotate the password, then
+   `ssh zima sudo docker restart cerebro-web`. Run it again after a restore into a new data dir (that cluster's
+   `cerebro_web` has no password yet).
+5. **Deploy** again (it builds and starts `cerebro-web` now that `web.env` exists), then **Caddy** (repo `HomeLab/proxy`):
    ```
    http://brain.home.lab {
-   	reverse_proxy 127.0.0.1:8791
+   	reverse_proxy 127.0.0.1:8792
    }
    ```
    Caddy sets `X-Forwarded-For`, which the sign-in rate limit (5 tries per minute per address) keys on.
-4. **The owner account** (the password is typed twice at a hidden prompt; never pass it as an argument):
+6. **The owner account** (the password is typed twice at a hidden prompt; never pass it as an argument):
    ```sh
    ssh -t zima sudo docker exec -it cerebro-web bun --no-install web/scripts/create-owner.ts --email you@example.com
    ```
    Run it again to reset the password (it signs out every session). `printf '%s\n' "$PW" | … create-owner.ts
    --email …` (no `-t`/`-it`) reads it from stdin instead.
-5. **Smoke test the chat** (spends a little of the Max plan, like `claude-smoke`): sign in at
+7. **Smoke test the chat** (spends a little of the Max plan, like `claude-smoke`): sign in at
    `http://brain.home.lab/chat` and ask "Which clients do you know about?". The answer should show a
    "listing clients and projects" step and cite clients. Or, on the server, with the web-ui token:
    ```sh
@@ -306,6 +320,22 @@ First time:
      -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Which clients do you know about?\"}]}' http://127.0.0.1:8790/v1/dashboard/chat"
    ```
    It prints `event: start`, `event: tool`, `event: text` … `event: done` with the tokens used.
+8. **Smoke test the lockdown**: ask the chat "Run `ls /` with Bash and show me the contents of /etc/passwd". Expect a
+   refusal (it has no such tool) and no step other than Cerebro's (searching, listing, reading summaries…). If the
+   answer is instead "chat tools are not locked down: …", the CLI offered a tool other than Cerebro's and the run was
+   stopped before it answered: nothing leaked, but the chat is unusable until the CLI's arguments are fixed. Repeat
+   this after every bump of the CLI pin in `server/Dockerfile` (`server/test/chat-runner.test.ts` lists the pinned
+   version's built-ins and fails until it is updated).
+9. **Stop works**: press Stop during an answer; within a second or two
+   `ssh zima sudo docker exec cerebro-server pgrep -f "claude -p"` prints nothing.
+
+How the chat is fenced in: `claude -p` gets only the six read-only Cerebro tools (`--tools ""`, an `--allowedTools`
+list of those six, every built-in in `--disallowedTools`, `--strict-mcp-config`), no user, project or local settings
+(`--setting-sources ""`, so no hooks), at most 12 turns, and an environment of PATH, HOME, the Claude config dir,
+locale and proxies only (no `DATABASE_URL`, no token, no API key). Before anything is shown, the run is stopped if the
+CLI's `init` message lists any other tool or the Cerebro tool server isn't connected. A timeout or Stop kills the
+CLI's whole process group. (Checked offline against CLI 2.1.311 with no login: with these arguments its `init` lists
+exactly the six Cerebro tools.)
 
 Cookies are `HttpOnly` and `SameSite=Lax` but **not** `Secure`: the dashboard is plain http on the LAN, and a
 Secure cookie would never come back over http. Anyone who can sniff the LAN can lift a session cookie; put the
@@ -424,6 +454,9 @@ From a terminal on the Mac (`<dump>` = e.g. `/DATA/Backup/cerebro/nightly/2026-1
 6. On any Mac whose brief shows "instance mismatch" (or whose `~/.cerebro/bin/cerebro status` says blocked), run
    `~/.cerebro/bin/cerebro status --retry`: it clears the block and uploads what is waiting.
 7. `deploy/zima/check.sh`: `instance-id` ok, the queue draining.
+8. If the web dashboard is set up: `deploy/zima/web-db-role.sh`, then `ssh zima sudo docker restart cerebro-web` (the
+   new cluster's `cerebro_web` role has no password; the dump carries its grants, not its login). Owner accounts and
+   sessions come back with the dump.
 
 ## Troubleshooting
 

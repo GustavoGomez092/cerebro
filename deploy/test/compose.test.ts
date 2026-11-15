@@ -135,7 +135,7 @@ describe("compose config", () => {
     expect(web.container_name).toBe("cerebro-web");
     expect(web.image).toBe("cerebro-web:test");
     expect(web.ports).toHaveLength(1);
-    expect(web.ports[0]).toMatchObject({ host_ip: "127.0.0.1", published: "8791", target: 3000 });
+    expect(web.ports[0]).toMatchObject({ host_ip: "127.0.0.1", published: "8792", target: 3000 });
     // `config` inlines env files: web.env's settings show up in environment.
     expect(web.environment.DATABASE_URL).toBe(`postgres://cerebro:${PW}@cerebro-db:5432/cerebro`);
     expect(web.environment.CEREBRO_URL).toBe("http://cerebro-server:8790");
