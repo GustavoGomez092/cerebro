@@ -95,9 +95,9 @@ describe("compose config", () => {
     expect(c.networks["cerebro-net"].internal).toBe(true);
 
     const casa = c["x-casaos"];
-    expect(casa.hostname).toBe("cerebro.home.lab");
+    expect(casa.hostname).toBe("brain.home.lab"); // the tile opens the dashboard
     expect(casa.port_map).toBe("80");
-    expect(casa.index).toBe("/health");
+    expect(casa.index).toBe("/");
     expect(casa.title.en_us).toBe("Cerebro");
   });
 
