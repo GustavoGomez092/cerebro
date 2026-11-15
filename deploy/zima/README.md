@@ -6,8 +6,8 @@ never retry quickly and never open parallel connections).
 
 | What | Where |
 |---|---|
-| Containers | `cerebro-db` (pgvector, 2 GB, 2 CPUs), `cerebro-ollama` (bge-m3, 3 GB, `OLLAMA_CPUS`), `cerebro-server` (1 GB, 2 CPUs), network `cerebro-net` (internal) |
-| URL | `http://cerebro.home.lab` (Caddy) → `127.0.0.1:8790` (the only published port) |
+| Containers | `cerebro-db` (pgvector, 2 GB, 2 CPUs), `cerebro-ollama` (bge-m3, 3 GB, `OLLAMA_CPUS`), `cerebro-server` (1 GB, 2 CPUs), `cerebro-web` (dashboard, 512 MB, 1 CPU, `web` profile; see "Web dashboard"), network `cerebro-net` (internal) |
+| URL | `http://cerebro.home.lab` (Caddy) → `127.0.0.1:8790` (the API); `http://brain.home.lab` → `127.0.0.1:8791` (the web dashboard, once deployed). No other port is published |
 | App dir | `/DATA/AppData/cerebro`: `src/` (synced repo), `data/{db,ollama,claude}`, `secrets/` (root 700/600), `state/` (deploy records, pre-deploy dumps, lock), `zima/` (root-owned backup scripts + units, installed by every deploy), `conf/postgres-<sha256>.conf` (the conf each compose mounts), `docker-compose.yml` (rendered, last good release) |
 | Backups | `/DATA/Backup/cerebro/{nightly,weekly}` (USB drive shared with `zima-backup` and `postgres-backup`) |
 
@@ -249,6 +249,72 @@ can't help here: it allows or blocks an app's incoming connections on every netw
 blocks the Zima at home too. Turn "Expose Ollama to the network" off before leaving home (its work then embeds on
 the Zima) and back on at home, or don't map the MacBook at all. The server sends the text it embeds
 (conversation chunks, summaries and search queries) to the Macs in plain HTTP over the LAN.
+
+## Web dashboard (cerebro-web)
+
+A separate container, `cerebro-web` (web/: TanStack Start + Better Auth, 512 MB, 1 CPU), published on
+`127.0.0.1:8791` only. It holds the owner's login (email + password, public sign-up off) and calls
+`cerebro-server`'s `/v1/dashboard/*` **server-side** with the `web-ui` machine token; the browser only ever has a
+session cookie. The chat's `claude -p` runs inside `cerebro-server` (where Claude is logged in), not in this
+container. In `deploy/compose.yml` it sits behind the `web` profile, so a deploy that doesn't pass
+`--profile web` (and build `cerebro-web:<tag>` from `web/Dockerfile`) leaves it off.
+
+**Not wired yet:** `deploy.sh` builds only `cerebro-server`. Before the first web deploy it must also run
+`docker build -t cerebro-web:$SHA -f $SRC/web/Dockerfile $SRC` and add `--profile web` to its compose commands
+(and roll `cerebro-web` back with the server). Migration 008 (the `auth` schema) runs with the server's migrations.
+
+First time:
+
+1. **The `web-ui` token** (outside a recorded Claude Code session):
+   ```sh
+   ssh -t zima sudo docker exec -it cerebro-server bun --no-install server/src/cli.ts token create web-ui
+   ```
+   It is the dashboard's only key into the data: the server lets `web-ui` call `/v1/dashboard/*` and nothing else,
+   and no Mac token may call `/v1/dashboard/*`. It is never an embed lane (`EMBED_MACHINE_URLS` may not name it;
+   the server refuses to start if it does), and it never uploads sessions, so it never shows in the clients'
+   machine lists.
+2. **`web.env`** in the secrets dir, root 600 like `server.env` (`$SECRETS` = `/DATA/AppData/cerebro/secrets`):
+   ```sh
+   ssh -t zima 'sudo install -m 600 -o root -g root /dev/null /DATA/AppData/cerebro/secrets/web.env && sudoedit /DATA/AppData/cerebro/secrets/web.env'
+   ```
+   ```
+   DATABASE_URL=postgres://cerebro:<POSTGRES_PASSWORD from db.env>@cerebro-db:5432/cerebro
+   BETTER_AUTH_SECRET=<openssl rand -base64 32>
+   BETTER_AUTH_URL=http://brain.home.lab
+   CEREBRO_WEB_TOKEN=<the web-ui token>
+   ```
+   `BETTER_AUTH_URL` is the address you open in the browser; it is also the only origin allowed to post to the
+   app. Changing `BETTER_AUTH_SECRET` signs everyone out.
+3. **Deploy** with the web profile (see "Not wired yet" above), then **Caddy** (repo `HomeLab/proxy`):
+   ```
+   http://brain.home.lab {
+   	reverse_proxy 127.0.0.1:8791
+   }
+   ```
+   Caddy sets `X-Forwarded-For`, which the sign-in rate limit (5 tries per minute per address) keys on.
+4. **The owner account** (the password is typed twice at a hidden prompt; never pass it as an argument):
+   ```sh
+   ssh -t zima sudo docker exec -it cerebro-web bun --no-install web/scripts/create-owner.ts --email you@example.com
+   ```
+   Run it again to reset the password (it signs out every session). `printf '%s\n' "$PW" | … create-owner.ts
+   --email …` (no `-t`/`-it`) reads it from stdin instead.
+5. **Smoke test the chat** (spends a little of the Max plan, like `claude-smoke`): sign in at
+   `http://brain.home.lab/chat` and ask "Which clients do you know about?". The answer should show a
+   "listing clients and projects" step and cite clients. Or, on the server, with the web-ui token:
+   ```sh
+   ssh zima "curl -sN -H 'Authorization: Bearer <web-ui token>' -H 'Content-Type: application/json' \
+     -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Which clients do you know about?\"}]}' http://127.0.0.1:8790/v1/dashboard/chat"
+   ```
+   It prints `event: start`, `event: tool`, `event: text` … `event: done` with the tokens used.
+
+Cookies are `HttpOnly` and `SameSite=Lax` but **not** `Secure`: the dashboard is plain http on the LAN, and a
+Secure cookie would never come back over http. Anyone who can sniff the LAN can lift a session cookie; put the
+dashboard behind https (Caddy with an internal CA) if that matters, then set `BETTER_AUTH_URL` to the https address
+and flip `useSecureCookies` in `web/src/server/auth.server.ts`.
+
+`cerebro.home.lab` keeps proxying every path to `cerebro-server`, including `/mcp/chat` (the chat run's tool
+endpoint): it answers only a run in progress's one-time secret, and refuses any request carrying
+`X-Forwarded-For`, so nothing through Caddy gets in.
 
 ## Upgrades and rollback
 

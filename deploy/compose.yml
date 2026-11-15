@@ -70,6 +70,31 @@ services:
     restart: unless-stopped
     networks: [cerebro-net, default] # default only publishes the port
 
+  # The web dashboard (web/: TanStack Start + Better Auth). Behind the `web` profile: deploy.sh must build
+  # cerebro-web:<tag> (web/Dockerfile) and run compose with --profile web before it starts. It reads the database
+  # (its `auth` schema) and calls cerebro-server with the web-ui token, both from web.env; the browser never sees
+  # the token. Caddy points the dashboard's name (brain.home.lab) at 127.0.0.1:8791.
+  web:
+    container_name: cerebro-web
+    image: cerebro-web:${CEREBRO_TAG}
+    profiles: [web]
+    depends_on:
+      db:
+        condition: service_healthy
+      server:
+        condition: service_started
+    env_file: ${CEREBRO_SECRETS}/web.env # DATABASE_URL, BETTER_AUTH_SECRET, BETTER_AUTH_URL, CEREBRO_WEB_TOKEN
+    environment:
+      CEREBRO_URL: http://cerebro-server:8790
+    ports:
+      - "127.0.0.1:8791:3000"
+    cpus: 1
+    mem_limit: 512m
+    memswap_limit: 512m
+    oom_score_adj: 500
+    restart: unless-stopped
+    networks: [cerebro-net, default] # default only publishes the port
+
 networks:
   cerebro-net:
     driver: bridge

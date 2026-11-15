@@ -40,6 +40,7 @@ beforeAll(() => {
   mkdirSync(secrets, { recursive: true });
   writeFileSync(join(secrets, "server.env"), `DATABASE_URL=postgres://cerebro:${PW}@cerebro-db:5432/cerebro\n`);
   writeFileSync(join(secrets, "db.env"), `POSTGRES_PASSWORD=${PW}\n`);
+  writeFileSync(join(secrets, "web.env"), `DATABASE_URL=postgres://cerebro:${PW}@cerebro-db:5432/cerebro\n`);
 });
 
 afterAll(() => {
@@ -122,6 +123,29 @@ describe("compose config", () => {
       "wal_compression = lz4", "checkpoint_timeout = 15min", "listen_addresses = '*'",
     ];
     for (const line of want) expect(conf).toContain(line);
+  });
+
+  test("the web dashboard is its own container behind the `web` profile, published on 127.0.0.1 only", () => {
+    const plain = JSON.parse(run(["docker", "compose", "-f", COMPOSE, "--env-file", ENV_EXAMPLE, "config", "--format", "json"], env).out);
+    expect(plain.services.web).toBeUndefined(); // off until deploy.sh builds cerebro-web and passes --profile web
+    const r = run(["docker", "compose", "-f", COMPOSE, "--env-file", ENV_EXAMPLE, "--profile", "web", "config", "--format", "json"], env);
+    expect(r.err).toBe("");
+    expect(r.code).toBe(0);
+    const { web } = JSON.parse(r.out).services;
+    expect(web.container_name).toBe("cerebro-web");
+    expect(web.image).toBe("cerebro-web:test");
+    expect(web.ports).toHaveLength(1);
+    expect(web.ports[0]).toMatchObject({ host_ip: "127.0.0.1", published: "8791", target: 3000 });
+    // `config` inlines env files: web.env's settings show up in environment.
+    expect(web.environment.DATABASE_URL).toBe(`postgres://cerebro:${PW}@cerebro-db:5432/cerebro`);
+    expect(web.environment.CEREBRO_URL).toBe("http://cerebro-server:8790");
+    expect(web.depends_on.db.condition).toBe("service_healthy");
+    expect(web.depends_on.server.condition).toBe("service_started");
+    expect(Object.keys(web.networks).sort()).toEqual(["cerebro-net", "default"]);
+    expect(web.restart).toBe("unless-stopped");
+    expect(web.memswap_limit).toBe(web.mem_limit);
+    expect(Number(web.mem_limit)).toBe(512 * 1024 ** 2);
+    expect(web.oom_score_adj).toBe(500);
   });
 });
 

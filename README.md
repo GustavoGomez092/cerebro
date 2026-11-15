@@ -33,6 +33,9 @@ Tests create and drop their own throwaway databases on the dev Postgres
 | `SUMMARISER_CMD` | `claude` | The Claude Code CLI to run (`claude -p`, the owner's subscription login; API-key variables are removed from its environment) |
 | `SUMMARY_SHARE` | `0.2` | Share of the 5-hour window the summariser may spend |
 | `SUBSCRIPTION_TOKENS_PER_5H` | `2000000` | Tokens the subscription allows per rolling 5-hour window; the summariser's budget is `SUMMARY_SHARE ×` this |
+| `CHAT_MODEL` | `sonnet` | Model for the dashboard's chat agent (`claude -p --model`; an alias or id, one word) |
+| `CHAT_TIMEOUT_MS` | `300000` | A chat answer is killed after this long |
+| `CHAT_MAX_CONCURRENT` | `1` | Chat answers at once (1 or 2); one more gets `429 chat_busy` |
 
 #### Summariser cost (measured 2026-11-14, `claude-haiku-5-5`)
 
@@ -115,7 +118,11 @@ Each machine gets its own token; only its SHA-256 hash is stored.
 DATABASE_URL=… bun server/src/cli.ts token create my-macbook   # prints the token once
 DATABASE_URL=… bun server/src/cli.ts token list
 DATABASE_URL=… bun server/src/cli.ts token revoke my-macbook
+DATABASE_URL=… bun server/src/cli.ts token create web-ui       # the web dashboard's token (see "Web dashboard")
 ```
+
+The name `web-ui` is special: that token may call `/v1/dashboard/*` and nothing else, and no other token may call
+`/v1/dashboard/*`. `EMBED_MACHINE_URLS` may not name it.
 
 ### API overview
 
@@ -145,6 +152,21 @@ project; anything else may search all clients. Repo spellings are normalised ser
 | `GET /v1/sessions` | Sessions in scope, newest first (`from`, `to`, `limit`, cursor `before`) |
 | `GET /v1/sessions/:id/events` | Raw events in scope (`afterSeq`, `limit` ≤ 1000, `nextSeq`; `full=1` for untruncated tool output, capped at 2 MB per page) |
 
+**Dashboard API** (`web-ui` token only; every other token gets `403 forbidden`). Unscoped by design: it reads every
+client. Counters are in-process and reset when the server restarts.
+
+| Method & path | Purpose |
+|---|---|
+| `GET /v1/dashboard/overview` | `health` (`db`, `apiVersion`, `instanceId`, `startedAt`, `uptimeSeconds`), `status` (exactly what `/v1/status` reports, without `machine`), `queries` (`perMinute` `{m1, m5, m15}` search requests, `active` in-flight searches with the query cut to 120 chars, start and elapsed ms, `database`: this database's non-idle `pg_stat_activity` rows, SQL cut to 200 chars), `throughput` (`eventsPerMinute`, `chunksEmbeddedPerMinute`, `summariesLastHour`, `queues.embed {pending, dead}`, `queues.summary {live, imported, dead}`), `chat` (tokens and answers in the last 5 h and since start, the last answer, the last usage limit) |
+| `GET /v1/dashboard/db` | `{bytes, counts}`: `pg_database_size` and exact row counts of sessions, events, chunks, summaries, clients, projects |
+| `GET /v1/dashboard/clients` | Every client → its projects (plus `(no project)` for client-only folders) → sessions per machine and last activity (newest event, else start); active bindings, as search sees them |
+| `POST /v1/dashboard/search` | `{query, limit?, include?, from?, to?}` (nothing else: no repo, scope, client or project) → the hybrid search over **all** clients, each hit with `machine`, `cwd` and `repo` added. Counts as a search. The client `/v1/search` rules are unchanged |
+| `GET /v1/dashboard/sessions/:id/summaries` | The session (client, project, machine, cwd, dates) and its summaries, oldest range first |
+| `POST /v1/dashboard/chat` | `{messages: [{role: "user"\|"assistant", content}…]}` (≤ 40, the owner's question last) → a server-sent event stream: `start`, `tool` (`{name, label}`, e.g. `searching "cadco checkout"`), `text` (`{text}` pieces), `ping` (every 8 s), then `done` (`{tokens, model, durationMs}`) or `error` (`{kind, message, resetAt}`; `kind` is `usage_limit`, `auth`, `timeout`, `cancelled`, `unavailable` or `failed`). `429 chat_busy` past `CHAT_MAX_CONCURRENT`, `503 chat_unavailable` if not configured |
+
+`POST /mcp/chat` is the chat run's own tool endpoint (MCP over HTTP, JSON replies): it answers only the one-time
+secret of a run in progress and refuses any request with `X-Forwarded-For` (anything through Caddy).
+
 ### Maintenance
 
 Local forms (they need `DATABASE_URL` to reach the database). On the Zima server the database has no published
@@ -159,6 +181,59 @@ DATABASE_URL=… bun server/src/cli.ts requeue-dead-summaries        # retry dea
 Secrets are redacted at ingest (known key formats, bearer tokens, URL passwords, `*_PASSWORD=`-style
 lines). Events are chunked at ingest, so full-text search works immediately; a background worker
 embeds chunks (live sessions before imported history) and the vector half of search fills in.
+
+## Web dashboard
+
+`web/` is a TanStack Start (React, SSR) app with its own container, `cerebro-web`, behind a login (Better Auth,
+email + password, one owner account, no public sign-up). Pages:
+
+- **Dashboard**: server health (database, embedder lanes, summariser), uptime and instance, database size and row
+  counts, searches per minute (1/5/15 min), the searches and SQL running right now, events/chunks per minute,
+  summaries per hour, queue depths and chat usage. It refreshes every 7 s (the database counts every 60 s) while
+  the tab is visible.
+- **Clients**: every client → projects → sessions per machine and last activity.
+- **Chat**: ask about any client or project ("what did we do for Cadco last week?", "which clients use
+  WordPress?"). A plain result-list search over everything sits in a second tab; clicking a hit opens its session
+  summary.
+
+How it fits together: the browser talks only to `cerebro-web` (a session cookie: `HttpOnly`, `SameSite=Lax`, not
+`Secure` because the LAN is plain http; sign-in limited to 5 tries a minute per address). `cerebro-web` calls
+`cerebro-server`'s `/v1/dashboard/*` server-side with the `web-ui` token from its environment; the token never
+reaches the browser. Better Auth's tables live in the `auth` schema of the same database (migration 008).
+
+**The chat agent** runs in `cerebro-server`, where `claude` is logged in: `claude -p --model $CHAT_MODEL` on the
+owner's Max subscription, exactly like the summariser (API-key variables removed from its environment,
+`CEREBRO_HEADLESS=1`, `--no-session-persistence`, so nothing about the chat is recorded or kept). Its only tools are
+six read-only Cerebro tools served over `/mcp/chat` (`--mcp-config` + `--strict-mcp-config`, `--tools ""`, an
+`--allowedTools` list of those six, every built-in in `--disallowedTools`): `global_search`, `list_clients_projects`,
+`get_session_summary`, `get_project_state`, `recent_sessions` and `get_session_events` (capped: 20 hits, 50 sessions,
+100 events of 2 000 chars, 60 000 chars per answer). They read stored data, which was redacted at ingest. The system
+prompt asks it to cite client / project / session / date and to say when the data doesn't cover something. Earlier
+turns are sent back with each question (the last 12, capped), so a conversation is multi-turn without the CLI
+keeping sessions. One answer at a time (`CHAT_MAX_CONCURRENT`), killed after `CHAT_TIMEOUT_MS` or when the browser
+goes away.
+
+**Usage.** Chat spends the same Max plan as the summariser, but outside the summariser's `SUMMARY_SHARE`: its tokens
+(input + output + cache creation, from the CLI's result) are counted in memory and shown on the dashboard, never
+written to `usage_ledger`, so chat never delays summaries through the budget. Both still draw on the plan itself: if
+the plan hits its limit, the chat says so (with the reset time) and the summariser pauses with `usage_limit` until
+the reset.
+
+Setup on the Zima (token, `web.env`, Caddy, the owner account): [deploy/zima/README.md](deploy/zima/README.md), "Web
+dashboard". Locally:
+
+```sh
+DATABASE_URL=postgres://cerebro:cerebro@127.0.0.1:54329/cerebro bun server/src/cli.ts migrate
+DATABASE_URL=… bun server/src/cli.ts token create web-ui
+cd web
+export DATABASE_URL=postgres://cerebro:cerebro@127.0.0.1:54329/cerebro BETTER_AUTH_SECRET=$(openssl rand -base64 32) \
+  BETTER_AUTH_URL=http://localhost:3000 CEREBRO_URL=http://127.0.0.1:8790 CEREBRO_WEB_TOKEN=<the web-ui token>
+bun scripts/create-owner.ts --email you@example.com   # asks for the password twice (hidden)
+bun run dev                                            # or: bun run build && bun server.ts
+```
+
+`bun test` at the root runs `web/test` too (it builds the app with Vite once, a few seconds); `bun run typecheck`
+checks the server and `web/`.
 
 ## Install on a Mac
 
