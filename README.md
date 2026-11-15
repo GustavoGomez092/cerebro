@@ -33,6 +33,7 @@ Tests create and drop their own throwaway databases on the dev Postgres
 | `SUMMARISER_CMD` | `claude` | The Claude Code CLI to run (`claude -p`, the owner's subscription login; API-key variables are removed from its environment) |
 | `SUMMARY_SHARE` | `0.2` | Share of the 5-hour window the summariser may spend |
 | `SUBSCRIPTION_TOKENS_PER_5H` | `2000000` | Tokens the subscription allows per rolling 5-hour window; the summariser's budget is `SUMMARY_SHARE ×` this |
+| `SUMMARISER_WORKERS` | `1` | Summariser loops running at once (1–8): one primary, the rest only summarise sessions (leased claims, never the same one twice); each runs its own `claude` CLI (~250 MB) |
 | `CHAT_MODEL` | `sonnet` | Model for the dashboard's chat agent (`claude -p --model`; an alias or id, one word) |
 | `CHAT_TIMEOUT_MS` | `300000` | A chat answer is killed after this long |
 | `CHAT_MAX_CONCURRENT` | `1` | Chat answers at once (1 or 2); one more gets `429 chat_busy` |

@@ -112,7 +112,7 @@ describe("deploy.sh", () => {
       Object.fromEntries(lines.filter((l) => l && !l.startsWith("#")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
     const written = env(readFileSync(join(s.app("secrets"), "server.env"), "utf8").split("\n"));
     // Every value deploy.sh writes must be one loadConfig accepts (SUMMARISER_ENABLED rejects unknown words).
-    expect(loadConfig(written).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
+    expect(loadConfig(written).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude", workers: 1 });
     // The Mac mini failover is off until the owner fills in the two commented lines (deploy/zima/README.md).
     const raw = readFileSync(join(s.app("secrets"), "server.env"), "utf8").split("\n");
     expect(raw.some((l) => /^# EMBED_MACHINE_URLS=/.test(l))).toBe(true);
@@ -126,7 +126,7 @@ describe("deploy.sh", () => {
       embedModelDigest: MANIFEST_DIGEST.slice(0, 12),
     });
     // server.env is written only on the first deploy: one from before plan 3 has DATABASE_URL alone.
-    expect(loadConfig({ DATABASE_URL: written.DATABASE_URL }).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
+    expect(loadConfig({ DATABASE_URL: written.DATABASE_URL }).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude", workers: 1 });
   });
 
   test("a later run without secrets on the server asks for --first-run", () => {

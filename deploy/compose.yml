@@ -62,8 +62,8 @@ services:
     ports:
       - "127.0.0.1:8790:8790"
     cpus: 2
-    mem_limit: 1g
-    memswap_limit: 1g
+    mem_limit: 3g
+    memswap_limit: 3g
     oom_score_adj: 500
     volumes:
       - ${CEREBRO_DATA}/claude:/data/claude

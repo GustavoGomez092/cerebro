@@ -57,7 +57,7 @@ test("budgetState deletes ledger rows older than 7 days", async () => {
 
 test("config validates share in (0, 1]", () => {
   const base = { DATABASE_URL: "x" };
-  expect(loadConfig(base).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
+  expect(loadConfig(base).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude", workers: 1 });
   expect(loadConfig({ ...base, SUMMARY_SHARE: "1" }).summariser.share).toBe(1);
   expect(loadConfig({ ...base, SUMMARISER_ENABLED: "false" }).summariser.enabled).toBe(false);
   for (const bad of ["0", "-0.1", "1.5", "abc"]) {

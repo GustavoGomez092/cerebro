@@ -77,7 +77,7 @@ describe("compose config", () => {
     expect(Number(ollama.cpus)).toBe(4);
     expect(ollama.environment).toMatchObject({ OLLAMA_NUM_PARALLEL: "1", OLLAMA_MAX_LOADED_MODELS: "1", OLLAMA_KEEP_ALIVE: "-1" });
     expect(Number(server.cpus)).toBe(2);
-    expect(Number(server.mem_limit)).toBe(1024 ** 3);
+    expect(Number(server.mem_limit)).toBe(3 * 1024 ** 3); // room for SUMMARISER_WORKERS claude CLIs (~250 MB each) + chat
     expect(server.environment.EMBED_URL).toBe("http://cerebro-ollama:11434");
     expect(server.depends_on.db.condition).toBe("service_healthy");
     expect(server.depends_on.ollama.condition).toBe("service_started");

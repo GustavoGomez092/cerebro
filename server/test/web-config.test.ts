@@ -36,3 +36,11 @@ test("buildServer wires one Metrics and the chat agent: its model, cap and this 
     } finally { built.embedder.stop(); await built.sql.close(); }
   } finally { await db.drop(); }
 });
+
+test("SUMMARISER_WORKERS: 1 by default, at most 8", () => {
+  const base = { DATABASE_URL: "postgres://x@y/z" };
+  expect(loadConfig(base).summariser.workers).toBe(1);
+  expect(loadConfig({ ...base, SUMMARISER_WORKERS: "4" }).summariser.workers).toBe(4);
+  expect(() => loadConfig({ ...base, SUMMARISER_WORKERS: "9" })).toThrow(/SUMMARISER_WORKERS/);
+  expect(() => loadConfig({ ...base, SUMMARISER_WORKERS: "0" })).toThrow(/SUMMARISER_WORKERS/);
+});

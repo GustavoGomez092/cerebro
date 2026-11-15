@@ -11,7 +11,7 @@ import { markScopesDirty, scopeKey } from "../src/summarise/state";
 import { newSummariserState, startSummariser, type SummariserConfig, type SummariserDeps } from "../src/summarise/loop";
 
 const FAKE = "bun server/test/fakes/fake-claude.ts";
-const CFG: SummariserConfig = { enabled: true, share: 0.2, windowTokens: 2_000_000, cmd: FAKE };
+const CFG: SummariserConfig = { enabled: true, share: 0.2, windowTokens: 2_000_000, cmd: FAKE, workers: 1 };
 const BUDGET = { share: CFG.share, windowTokens: CFG.windowTokens };
 
 /** A fake CLI whose mode can change mid-test; records every call's prompt. */
@@ -724,5 +724,34 @@ test("the server reports its summariser settings in status", async () => {
     console.log = log;
     await built.sql.close();
     await db.drop();
+  }
+});
+
+test("helper workers summarise jobs in parallel with the primary: each session once, no state calls from helpers", async () => {
+  const { t, state } = await setup();
+  const main = fakeCli();
+  const helperCli = fakeCli();
+  const primary = await startVerified(t, main, { state, manual: true, log: quiet });
+  const helper = startSummariser(t.sql, t.embedder, CFG, { run: helperCli.run, state, manual: true, log: quiet, helper: true });
+  try {
+    const { binding } = await boundFolder(t, { client: "Parallel", project: "Many", repo: "github.com/acme/many" });
+    const N = 8;
+    for (let i = 1; i <= N; i++) await endedSession(t, binding.id, `par${i}`, `parallel${i}`, { imported: true });
+    for (let i = 0; i < 6; i++) await Promise.all([primary.tick(), helper.tick()]);
+    expect(await t.sql`select 1 from summary_jobs`).toHaveLength(0);
+    const summarised = await t.sql`select session_id, count(*)::int as n from summaries group by 1`;
+    expect(summarised).toHaveLength(N);
+    expect(summarised.every((r: any) => r.n === 1)).toBe(true);
+    // Both did real work, and only the primary folded the state.
+    expect(summaryCalls(helperCli.calls.filter((c) => !isProbe(c))).length).toBeGreaterThan(0);
+    expect(summaryCalls(main.calls).length).toBeGreaterThan(0);
+    expect(summaryCalls(main.calls).length + summaryCalls(helperCli.calls).length).toBe(N);
+    expect(helperCli.calls.some((c) => "current_status" in ((c.schema as any).properties ?? {}))).toBe(false);
+    const [st] = await t.sql`select dirty from project_states where scope = ${scopeKey(binding.clientId, binding.projectId)}`;
+    expect(st.dirty).toBe(false);
+  } finally {
+    await helper.stop();
+    await primary.stop();
+    await t.drop();
   }
 });

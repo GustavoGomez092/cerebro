@@ -74,16 +74,18 @@ if (import.meta.main) {
     const { config, sql, embedder, gate, workerState, summariserState, metrics, app } = await buildServer(process.env);
     const server = Bun.serve({ port: config.port, fetch: app.fetch, maxRequestBodySize: 11 * 1024 * 1024, idleTimeout: 30 });
     const worker = startEmbedWorker(sql, embedder, { state: workerState, gate, onEmbedded: (n) => metrics.chunks.add(n) });
-    const summariser = config.summariser.enabled
-      ? startSummariser(sql, embedder, config.summariser, { state: summariserState })
-      : null;
+    // One primary loop, plus job-only helpers when SUMMARISER_WORKERS > 1 (claims are leased: no session twice).
+    const summarisers = config.summariser.enabled
+      ? Array.from({ length: config.summariser.workers }, (_, i) =>
+          startSummariser(sql, embedder, config.summariser, { state: summariserState, helper: i > 0 }))
+      : [];
     console.log(JSON.stringify({ level: "info", msg: "cerebro listening", port: server.port }));
     let stopping = false;
     const shutdown = async () => {
       if (stopping) return;
       stopping = true;
       server.stop();
-      await summariser?.stop(); // waits for the job in progress
+      await Promise.all(summarisers.map((s) => s.stop())); // each waits for its job in progress
       await worker.stop();
       embedder.stop();
       await sql.close();

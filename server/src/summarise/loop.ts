@@ -44,6 +44,12 @@ export interface SummariserDeps {
   /** How long stop() lets a Claude call in flight finish before killing it (default 20 s). */
   stopDeadlineMs?: number;
   log?: (line: string) => void;
+  /**
+   * An extra worker beside the primary (SUMMARISER_WORKERS > 1): it only claims and summarises jobs, in parallel
+   * with the others (claims are leased, so no two take the same session). Folding states, dirty scopes and the
+   * embedding sweep stay with the primary; a helper's summaries mark their scopes dirty for it.
+   */
+  helper?: boolean;
 }
 
 export interface Summariser {
@@ -334,14 +340,15 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       state.paused = { reason: "disabled", until: null };
       return false;
     }
-    await sweepEmbeddings();
+    const helper = !!deps.helper;
+    if (!helper) await sweepEmbeddings();
     if (!(await mayRun())) return false;
     if (!verified && !(await verify())) return false;
-    await scheduleGrowingSessions(sql);
-    let dirtyDone = false;
+    if (!helper) await scheduleGrowingSessions(sql);
+    let dirtyDone = helper;
     for (let n = 0; !stopped; n++) {
       if (n >= JOBS_PER_TICK) {
-        await updateDirtyScopes();
+        if (!helper) await updateDirtyScopes();
         return true;
       }
       const b = await budgetState(sql, budget);
@@ -371,14 +378,14 @@ export function startSummariser(sql: SQL, embedder: Embedder, cfg: SummariserCon
       if (handle("summary", res)) return false;
       // Imported history waits for the dirty-scope pass, which folds up to 10 summaries per call:
       // one state call per imported summary would spend a whole window on a single opt-in.
-      if (imported) continue;
+      if (imported || helper) continue;
       for (const scope of res.scopes) {
         const r = await updateState(sql, scope, [], { run, budget, signal });
         noteRun(r);
         if (handle("state", r)) return false;
       }
     }
-    if (!stopped) await updateDirtyScopes();
+    if (!stopped && !helper) await updateDirtyScopes();
     return false;
   };
 

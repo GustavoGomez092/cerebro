@@ -11,7 +11,8 @@ export interface Config {
   embedModelDigest: string | null;
   embedModel: string;
   embedDims: number;
-  summariser: { enabled: boolean; share: number; windowTokens: number; cmd: string };
+  /** `workers`: summariser loops running at once (one primary, the rest job-only helpers; SUMMARISER_WORKERS). */
+  summariser: { enabled: boolean; share: number; windowTokens: number; cmd: string; workers: number };
   /** The dashboard's chat agent: `claude -p` on the same subscription login as the summariser (SUMMARISER_CMD). */
   chat: { model: string; timeoutMs: number; maxConcurrent: number };
 }
@@ -131,6 +132,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       share: shareEnv(env, "SUMMARY_SHARE", 0.2),
       windowTokens: intEnv(env, "SUBSCRIPTION_TOKENS_PER_5H", 2000000),
       cmd: env.SUMMARISER_CMD || "claude",
+      workers: rangeEnv(env, "SUMMARISER_WORKERS", 1, 1, 8),
     },
     chat: {
       model: modelEnv(env, "CHAT_MODEL", "sonnet"),
