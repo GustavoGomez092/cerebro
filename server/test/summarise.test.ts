@@ -508,3 +508,21 @@ test("a job loads at most a bounded amount of text; the rest is due at once", as
     expect(j).toEqual({ covered_seq: 4, due: true });
   } finally { await t.drop(); }
 });
+
+test("a stored piece is progress: it resets the job's attempts, so a long session's sporadic failures never dead-letter it", async () => {
+  const t = await authedApp();
+  try {
+    const { job } = await endedSession(t, 12);
+    // Four earlier leases each failed once (after storing pieces in between).
+    await t.sql`update summary_jobs set attempts = 4 where session_id = 's1'`;
+    // First piece answers; the second fails on the schema while the CLI itself works (the probe answers).
+    let calls = 0;
+    const flaky = (input: ClaudeInput) =>
+      isProbe(input) ? fakeRun("ok")(input) : fakeRun(++calls === 1 ? "ok" : "schemafail")(input);
+    expect(await summariseJob(t.sql, t.embedder, job, { run: flaky, budget: BUDGET, maxChars: 120 }))
+      .toMatchObject({ status: "failed", reason: "failed" });
+    expect(await t.sql`select 1 from summaries`).toHaveLength(1);
+    const [j] = await t.sql`select attempts, dead from summary_jobs where session_id = 's1'`;
+    expect(j).toEqual({ attempts: 1, dead: false });
+  } finally { await t.drop(); }
+});

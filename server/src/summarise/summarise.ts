@@ -330,6 +330,10 @@ export async function summariseJob(
           on conflict (session_id, first_seq, last_seq) do nothing
           returning id`;
         if (!row) return null;
+        // A stored piece is progress: earlier failures no longer count towards dead-lettering. Otherwise a long
+        // session (many pieces per load, attempts reset only when the whole load completes) dies of sporadic
+        // failures spread over leases that each moved it forward.
+        await tx`update summary_jobs set attempts = 0 where session_id = ${sessionId}`;
         const scope = scopeKey(b.client_id, b.project_id);
         await markScopesDirty(tx, [scope]);
         return { id: row.id, scope };
