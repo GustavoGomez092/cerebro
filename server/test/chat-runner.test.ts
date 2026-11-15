@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildChatPrompt, CHAT_ALLOWED_TOOLS, CHAT_DENIED_TOOLS, CHAT_ENV_ALLOWLIST, CHAT_MAX_TURNS, runChat, type ChatEvent } from "../src/chat/runner";
+import { buildChatPrompt, chatSystemPrompt, CHAT_ALLOWED_TOOLS, CHAT_DENIED_TOOLS, CHAT_ENV_ALLOWLIST, CHAT_MAX_TURNS, runChat, type ChatEvent } from "../src/chat/runner";
 import { CHAT_TOOLS } from "../src/chat/tools";
 import { chatWorld, fakeChatCmd } from "./chat-world";
 
@@ -202,4 +202,11 @@ test("the prompt carries earlier turns, oldest first, capped in count and length
   expect(capped).not.toContain("turn-0 ");
   expect(capped).toContain("turn-39");
   expect(capped.length).toBeLessThan(60_000);
+});
+
+test("the system prompt says missing states and summaries mean 'not summarised yet', to be read from the sessions", () => {
+  const p = chatSystemPrompt(new Date("2026-11-14T12:00:00Z"));
+  expect(p).toContain("not summarised yet");
+  expect(p).toContain("get_session_events");
+  expect(p).toContain("Today is 2026-11-14");
 });

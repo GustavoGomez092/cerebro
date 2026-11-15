@@ -126,6 +126,10 @@ test("get_project_state reads the project's (or client's) running state", async 
     expect(r).toMatchObject({ client: "Cadco", project: "EDA 2.0", text: "EDA 2.0 is in QA", version: 3 });
     const none = await w.json("get_project_state", { client: "Beta" });
     expect(none.state).toBeNull();
+    // An empty state is "not built yet" (the summariser works through imported history over days), not "no project".
+    expect(none).toMatchObject({ sessions: 1, summarisedSessions: 0 });
+    expect(none.note).toContain("not built yet");
+    expect(none.note).toContain("get_session_events");
   } finally { await w.t.drop(); }
 });
 

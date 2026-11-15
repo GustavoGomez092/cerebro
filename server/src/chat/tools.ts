@@ -117,7 +117,21 @@ const DEFS = [
       const [row] = await ctx.sql`
         select text, version, updated_at from project_states where scope = ${scopeKey(client.id, project?.id ?? null)} and text <> ''`;
       const base = { client: client.name, project: project?.name ?? null };
-      return row ? { ...base, text: row.text, version: row.version, updatedAt: row.updated_at.toISOString() } : { ...base, state: null };
+      if (row) return { ...base, text: row.text, version: row.version, updatedAt: row.updated_at.toISOString() };
+      // No state yet: say how far the summariser is for this scope, so the model reads sessions instead of
+      // concluding the project has no history.
+      const [n] = await ctx.sql`
+        select count(*)::int as sessions,
+               count(*) filter (where exists (select 1 from summaries sm where sm.session_id = s.id))::int as summarised
+        from sessions s join bindings b on b.id = s.binding_id
+        where b.status = 'active' and b.client_id = ${client.id}
+          and (${project?.id ?? null}::uuid is null or b.project_id = ${project?.id ?? null}::uuid)`;
+      return {
+        ...base, state: null, sessions: n.sessions, summarisedSessions: n.summarised,
+        note: `The state document is not built yet (${n.summarised} of ${n.sessions} sessions summarised so far; the ` +
+          "summariser works through imported history gradually). The history exists: use recent_sessions, " +
+          "get_session_summary and get_session_events to answer from the sessions themselves.",
+      };
     },
   }),
   tool({
