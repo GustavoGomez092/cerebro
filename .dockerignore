@@ -21,3 +21,4 @@ secrets
 *.key
 **/*.pem
 **/*.key
+web/dist

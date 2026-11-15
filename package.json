@@ -4,12 +4,13 @@
   "workspaces": [
     "shared",
     "server",
-    "client"
+    "client",
+    "web"
   ],
   "scripts": {
     "test": "bun test",
     "dev": "bun server/src/main.ts",
-    "typecheck": "bunx tsc --noEmit -p ."
+    "typecheck": "bunx tsc --noEmit -p . && bunx tsc --noEmit -p web"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",
