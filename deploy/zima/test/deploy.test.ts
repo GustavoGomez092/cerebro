@@ -533,6 +533,26 @@ describe("deploy.sh", () => {
     expect(s.calls()).not.toContain("--profile web");
   });
 
+  test("a rollback stops cerebro-web: an older server would not keep the web-ui token to /v1/dashboard", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    writeFileSync(s.app("secrets/web.env"), "BETTER_AUTH_SECRET=x\n");
+    s.commit("README.md", "web\n");
+    expect(s.run("deploy.sh").code).toBe(0);
+    s.commit("README.md", "broken\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh", [], { FAKE_HEALTHY_TAGS: "prev" });
+    expect(r.code, show(r)).toBe(1);
+    expect(r.err).toContain("rolled back to cerebro-server:prev");
+    expect(r.err).toContain("cerebro-web stopped");
+    const calls = s.calls().split("\n");
+    const stop = calls.findIndex((l) => l.startsWith("docker compose") && /--profile web stop web$/.test(l));
+    const prev = calls.findIndex((l) => l === "compose-up-server cerebro-server:prev");
+    expect(stop, s.calls()).toBeGreaterThan(-1);
+    expect(stop).toBeLessThan(prev); // before the old server is up
+    expect(s.calls()).not.toMatch(/--profile web up/);
+  });
+
   test("later runs refresh the stored ZimaOS compose and restart app management only when metadata changed", () => {
     const s = sandbox();
     expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
@@ -1028,5 +1048,43 @@ describe("check.sh", () => {
     const s = checkSandbox();
     const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ lastSuccessMinutes: null, pending: 0 }) });
     expect(r.code, show(r)).toBe(0);
+  });
+});
+
+describe("web-db-role.sh", () => {
+  const PW = "FakeWebDbPassw0rd1234567890abcdefghijkl";
+
+  test("puts cerebro_web's DATABASE_URL into web.env (root 600), keeps the other lines and never prints the password", () => {
+    const s = sandbox();
+    mkdirSync(s.app("secrets"), { recursive: true });
+    writeFileSync(s.app("secrets/web.env"), "DATABASE_URL=postgres://cerebro:superuserpw@cerebro-db:5432/cerebro\nBETTER_AUTH_SECRET=keep-me\nCEREBRO_WEB_TOKEN=cbr_keep\n");
+    const r = s.run("web-db-role.sh", [], { FAKE_WEB_DB_PW: PW });
+    expect(r.code, show(r)).toBe(0);
+    const env = readFileSync(s.app("secrets/web.env"), "utf8").split("\n").filter(Boolean);
+    expect(env.sort()).toEqual([
+      "BETTER_AUTH_SECRET=keep-me", "CEREBRO_WEB_TOKEN=cbr_keep", `DATABASE_URL=postgres://cerebro_web:${PW}@cerebro-db:5432/cerebro`,
+    ]);
+    expect(mode(s.app("secrets/web.env"))).toBe(0o600);
+    expect(r.out + r.err).not.toContain(PW);
+    // The password is made by cerebro-server and stays on the server: the command is run there, through one ssh call.
+    expect(s.calls()).toContain("docker exec -i cerebro-server bun --no-install server/src/cli.ts web-db-role");
+    expect(s.calls()).not.toContain(PW);
+  });
+
+  test("creates web.env when it doesn't exist yet", () => {
+    const s = sandbox();
+    mkdirSync(s.app("secrets"), { recursive: true });
+    const r = s.run("web-db-role.sh", [], { FAKE_WEB_DB_PW: PW });
+    expect(r.code, show(r)).toBe(0);
+    expect(readFileSync(s.app("secrets/web.env"), "utf8")).toBe(`DATABASE_URL=postgres://cerebro_web:${PW}@cerebro-db:5432/cerebro\n`);
+  });
+
+  test("a failure in cerebro-server leaves web.env as it was", () => {
+    const s = sandbox();
+    mkdirSync(s.app("secrets"), { recursive: true });
+    writeFileSync(s.app("secrets/web.env"), "DATABASE_URL=old\n");
+    const r = s.run("web-db-role.sh", [], { FAKE_WEB_DB_RC: "1" });
+    expect(r.code).toBe(1);
+    expect(readFileSync(s.app("secrets/web.env"), "utf8")).toBe("DATABASE_URL=old\n");
   });
 });

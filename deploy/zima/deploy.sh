@@ -106,6 +106,12 @@ rollback() {
   zssh "sudo docker image inspect cerebro-server:prev >/dev/null 2>&1" ||
     die "$msg; there is no cerebro-server:prev to roll back to; see: $logs"
   render_compose prev | zssh "sudo tee $COMPOSE >/dev/null" || die "$msg; could not write the rollback compose"
+  # An older server may not confine the web-ui token to /v1/dashboard: the dashboard stays off until a redeploy.
+  if zssh "sudo docker compose -f $COMPOSE --profile web stop web"; then
+    msg="$msg; cerebro-web stopped until the next good deploy"
+  else
+    msg="$msg; WARNING: could not stop cerebro-web (ssh zima sudo docker stop cerebro-web)"
+  fi
   zssh "sudo docker compose -f $COMPOSE up -d --no-deps server" ||
     die "$msg; starting cerebro-server:prev failed too; see: $logs"
   if health_gate >/dev/null; then die "$msg; rolled back to cerebro-server:prev (healthy)"; fi
