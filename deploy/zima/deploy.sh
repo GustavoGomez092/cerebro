@@ -124,7 +124,7 @@ release_lock() {
 
 # Creates the secrets once (kept on later runs) and the data dirs.
 first_run_setup() {
-  local secrets=$1 data=$2 pw
+  local secrets=$1 data=$2 digest=$3 pw
   # Data dirs first, with the default umask, so the app dir stays traversable (src/ is synced as the ssh user).
   umask 022
   mkdir -p "$data/db" "$data/ollama" "$data/claude"
@@ -152,7 +152,7 @@ first_run_setup() {
       "# Each Mac embeds its own work on its own Ollama (machine-token name=URL), cerebro-ollama (EMBED_URL) the" \
       "# fallback: uncomment both, redeploy. A Mac whose bge-m3 digest differs is skipped. See deploy/zima/README.md." \
       "# EMBED_MACHINE_URLS=mac-mini=http://192.168.4.42:11434,macbook-pro=http://192.168.4.45:11434" \
-      "# EMBED_MODEL_DIGEST=790764642607" |
+      "# EMBED_MODEL_DIGEST=$digest" |
       secret_write "$secrets/server.env"
     echo "secrets: wrote server.env"
   fi
@@ -260,7 +260,7 @@ trap release_lock EXIT
 trap 'die "interrupted; the running server is unchanged"' INT TERM
 
 if ((FIRST_RUN)); then
-  zfn first_run_setup "$SECRETS" "$DATA"
+  zfn first_run_setup "$SECRETS" "$DATA" "${BGE_M3_DIGEST:0:12}"
 else
   zssh "sudo test -s $SECRETS/db.env && sudo test -s $SECRETS/server.env" ||
     die "no secrets on the server; run deploy/zima/deploy.sh --first-run"

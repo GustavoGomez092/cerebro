@@ -100,8 +100,13 @@ else
   # its own Ollama. While one is down or mismatched, its chunks wait or embed on the Zima CPU (~70x slower) and
   # its searches use the Zima: warn per machine, never fail.
   route_ok=""
-  while IFS=$'\t' read -r e_machine e_state e_url e_error; do
+  while IFS=$'\t' read -r e_machine e_known e_state e_url e_error; do
     [[ -n $e_machine ]] || continue
+    if [[ $e_known == false ]]; then
+      # No live token by this name: a typo, or a revoked Mac. The real Mac's work counts as unmapped.
+      warn embed-route "$e_machine: no machine token by this name (a typo in EMBED_MACHINE_URLS? see token list); that Mac's work embeds on the Zima CPU"
+      continue
+    fi
     case $e_state in
       down) warn embed-route "$e_machine: embedding on the Zima CPU (slow): its Ollama is unreachable at $e_url${e_error:+ ($e_error)}" ;;
       digest_mismatch) warn embed-route "$e_machine: embedding on the Zima CPU (slow): its Ollama has a different bge-m3 (mismatch) at $e_url${e_error:+ ($e_error)}" ;;
@@ -109,11 +114,37 @@ else
       unknown) route_ok="$route_ok, $e_machine not tried yet" ;;
       *) warn embed-route "$e_machine: unknown endpoint state $e_state" ;;
     esac
-  done < <(jq -r '.embedder.endpoints[]? | [.machine, .state, .url, (.lastError // "")] | @tsv' <<<"$status")
+  done < <(jq -r '.embedder.endpoints[]? | [.machine, (.known | tostring), .state, .url, (.lastError // "")] | @tsv' <<<"$status")
+  fb_state=$(jq -r '.embedder.fallback.state // "ok"' <<<"$status")
+  fb_error=$(jq -r '.embedder.fallback.lastError // empty' <<<"$status")
   if ! jq -e '(.embedder.endpoints // []) | length > 0' >/dev/null <<<"$status"; then
     ok embed-route "Zima Ollama only (EMBED_MACHINE_URLS unset)"
+  elif [[ $fb_state != ok ]]; then
+    # Until the Zima's own model matches EMBED_MODEL_DIGEST, every Mac sits idle (their vectors would not match).
+    warn embed-route "no Mac is used: the Zima's bge-m3 is not confirmed against EMBED_MODEL_DIGEST ($fb_state${fb_error:+: $fb_error})"
   elif [[ -n $route_ok ]]; then
     ok embed-route "${route_ok#, } (each Mac embeds its own work)"
+  fi
+
+  # The Zima embedder (the only one without EMBED_MACHINE_URLS) backs off while its Ollama fails.
+  paused=$(jq -r '.embedder.pausedUntil // empty' <<<"$status")
+  embed_error=$(jq -r '.embedder.lastError // empty' <<<"$status")
+  if [[ -n $paused ]]; then
+    warn embed-paused "the Zima embedder is paused until $paused${embed_error:+ (last error: $embed_error)}"
+  fi
+
+  # How long the oldest chunk of each kind has waited (queue.oldestWaitSeconds; absent on older servers). Live work
+  # should embed within minutes; imported history may take a day or two on the Zima CPU alone.
+  if jq -e '.queue.oldestWaitSeconds' >/dev/null 2>&1 <<<"$status"; then
+    wait_live=$(jq -r '.queue.oldestWaitSeconds.live / 3600 | floor' <<<"$status")
+    wait_imported=$(jq -r '.queue.oldestWaitSeconds.imported / 3600 | floor' <<<"$status")
+    if ((wait_live >= 6)); then
+      warn queue-wait "a live chunk has waited $wait_live h to be embedded (over 6 h; see embed-route and embedder)"
+    elif ((wait_imported >= 48)); then
+      warn queue-wait "an imported chunk has waited $wait_imported h to be embedded (over 48 h; see embed-route and embedder)"
+    else
+      ok queue-wait "oldest live $wait_live h, imported $wait_imported h"
+    fi
   fi
 
   # summariser.paused.reason (server/src/summarise/loop.ts PauseReason): login and unavailable need the owner;

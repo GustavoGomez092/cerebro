@@ -8,7 +8,8 @@ import { join, relative } from "node:path";
 import { loadConfig } from "../../../server/src/config";
 import { newSummariserState } from "../../../server/src/summarise/loop";
 import { authedApp } from "../../../server/test/helpers";
-import { createEmbedRouter } from "../../../server/src/embed/failover";
+import { createEmbedRouter, PRIMARY_DOWN_MS } from "../../../server/src/embed/failover";
+import { fakeOllama } from "../../../server/test/fakes/ollama";
 import { boundFolder, ingest, sess } from "../../../server/test/fixtures";
 
 const DEPLOY = join(import.meta.dir, "..", "..");
@@ -120,7 +121,9 @@ describe("deploy.sh", () => {
     // Uncommented as the README says (drop the "# "), they load as they are.
     const enabled = env(raw.map((l) => l.replace(/^# (EMBED_MACHINE_URLS|EMBED_MODEL_DIGEST)=/, "$1=")));
     expect(loadConfig(enabled)).toMatchObject({
-      embedMachineUrls: { "mac-mini": "http://192.168.4.42:11434", "macbook-pro": "http://192.168.4.45:11434" }, embedModelDigest: "790764642607",
+      embedMachineUrls: { "mac-mini": "http://192.168.4.42:11434", "macbook-pro": "http://192.168.4.45:11434" },
+      // The digest line is filled in from deploy/.env's BGE_M3_DIGEST: the one deploy.sh gates the Zima on.
+      embedModelDigest: MANIFEST_DIGEST.slice(0, 12),
     });
     // server.env is written only on the first deploy: one from before plan 3 has DATABASE_URL alone.
     expect(loadConfig({ DATABASE_URL: written.DATABASE_URL }).summariser).toEqual({ enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" });
@@ -658,19 +661,25 @@ describe("check.sh", () => {
   const status = (o: {
     pending?: number; dead?: number; lastSuccessMinutes?: number | null; paused?: string | null; dbBytes?: number; summariser?: boolean;
     summaryDead?: number; lastError?: string | null; lastRunAt?: string | null;
-    endpoints?: { machine: string; state: string; url?: string; lastError?: string | null }[];
+    endpoints?: { machine: string; state: string; url?: string; lastError?: string | null; known?: boolean }[];
+    fallbackState?: string; waitLiveHours?: number; waitImportedHours?: number; pausedMinutes?: number; embedderError?: string;
   } = {}) =>
     JSON.stringify({
       machine: "check",
-      queue: { pending: o.pending ?? 0, dead: o.dead ?? 0, oldestPendingSeconds: 0 },
+      queue: {
+        pending: o.pending ?? 0, dead: o.dead ?? 0, oldestPendingSeconds: 0,
+        oldestWaitSeconds: { live: (o.waitLiveHours ?? 0) * 3600, imported: (o.waitImportedHours ?? 0) * 3600 },
+      },
       embedder: {
         lastSuccessAt: o.lastSuccessMinutes === null ? null : new Date(Date.now() - (o.lastSuccessMinutes ?? 10) * 60_000).toISOString(),
-        lastError: null, pausedUntil: null,
+        lastError: o.embedderError ?? null,
+        pausedUntil: o.pausedMinutes ? new Date(Date.now() + o.pausedMinutes * 60_000).toISOString() : null,
         ...(o.endpoints ? {
           endpoints: o.endpoints.map((e) => ({
-            machine: e.machine, url: e.url ?? "http://192.168.4.42:11434", state: e.state, lastError: e.lastError ?? null, downUntil: null, lastUsedAt: null,
+            machine: e.machine, known: e.known ?? true, url: e.url ?? "http://192.168.4.42:11434", state: e.state,
+            lastError: e.lastError ?? null, downUntil: null, lastUsedAt: null,
           })),
-          fallback: { url: "http://cerebro-ollama:11434", lastUsedAt: null },
+          fallback: { url: "http://cerebro-ollama:11434", lastUsedAt: null, state: o.fallbackState ?? "ok", lastError: null },
         } : {}),
       },
       ...(o.summariser === false ? {} : {
@@ -908,27 +917,69 @@ describe("check.sh", () => {
     expect(older.out).toMatch(/^ALL OK$/m);
   });
 
-  test("embed-route: check.sh reads the server's real /v1/status with an unreachable Mac", async () => {
-    const zima = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const { input } = (await req.json()) as { input: string[] };
-        return Response.json({ embeddings: input.map(() => new Array(1024).fill(0.1)) });
-      },
-    });
+  test("embed-route: a mapped name with no live machine token warns (a typo leaves that Mac on the Zima)", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ endpoints: [{ machine: "macmini", state: "unknown", known: false }] }) });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +embed-route +macmini: no machine token by this name \(a typo in EMBED_MACHINE_URLS\? see token list\); that Mac's work embeds on the Zima CPU$/m);
+    expect(r.out).toContain("ALL OK (1 warning(s))");
+  });
+
+  test("embed-route: the Zima's own digest not confirmed warns that no Mac is used", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ endpoints: [{ machine: "mac-mini", state: "up" }], fallbackState: "digest_mismatch" }) });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +embed-route +no Mac is used: the Zima's bge-m3 is not confirmed against EMBED_MODEL_DIGEST \(digest_mismatch\)/m);
+  });
+
+  test("queue-wait: warns when the oldest live chunk waited over 6 h or the oldest imported one over 48 h", () => {
+    const s = checkSandbox();
+    const ok = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ pending: 3, waitLiveHours: 5, waitImportedHours: 47 }) });
+    expect(ok.out).toMatch(/^ok +queue-wait +oldest live 5 h, imported 47 h$/m);
+    const live = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ pending: 3, waitLiveHours: 7 }) });
+    expect(live.code, show(live)).toBe(0);
+    expect(live.out).toMatch(/^warn +queue-wait +a live chunk has waited 7 h to be embedded/m);
+    const imported = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ pending: 3, waitImportedHours: 50 }) });
+    expect(imported.out).toMatch(/^warn +queue-wait +an imported chunk has waited 50 h to be embedded/m);
+    const legacy = JSON.parse(status());
+    delete legacy.queue.oldestWaitSeconds; // a server from before migration 007
+    const older = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: JSON.stringify(legacy) });
+    expect(older.out).not.toMatch(/queue-wait/);
+  });
+
+  test("embedder: a paused Zima embedder warns with its last error", () => {
+    const s = checkSandbox();
+    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: status({ pausedMinutes: 3, embedderError: "embedder unavailable: Unable to connect" }) });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out).toMatch(/^warn +embed-paused +the Zima embedder is paused until \S+ \(last error: embedder unavailable: Unable to connect\)$/m);
+  });
+
+  test("embed-route: check.sh reads the server's real /v1/status: down warns, and a recovered Mac stops warning (M2)", async () => {
+    const mac = fakeOllama(1), zima = fakeOllama(2);
+    let clock = 1_000_000;
     const embedder = createEmbedRouter({
-      machineUrls: { "mac-mini": "http://127.0.0.1:1" }, fallbackUrl: `http://127.0.0.1:${zima.port}`, model: "bge-m3", dims: 1024, log: () => {},
+      machineUrls: { "test-mac": mac.url, "macmini": "http://127.0.0.1:1" }, fallbackUrl: zima.url, model: "bge-m3", dims: 1024,
+      digest: "790764642607", log: () => {}, now: () => clock,
     });
     const t = await authedApp({ embedder });
-    let real: string;
+    const real: string[] = [];
     try {
-      await embedder.forMachine("mac-mini").embed(["a"]);
-      real = await (await t.call("GET", "/v1/status")).text();
-    } finally { await t.drop(); zima.stop(true); }
+      mac.mode = "503";
+      await embedder.probeNow();
+      real.push(await (await t.call("GET", "/v1/status")).text());
+      mac.mode = "ok";
+      clock += PRIMARY_DOWN_MS;
+      await embedder.probeNow();
+      real.push(await (await t.call("GET", "/v1/status")).text());
+    } finally { await t.drop(); mac.stop(); zima.stop(); embedder.stop(); }
     const s = checkSandbox();
-    const r = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: real });
-    expect(r.code, show(r)).toBe(0);
-    expect(r.out).toMatch(/^warn +embed-route +mac-mini: embedding on the Zima CPU \(slow\): its Ollama is unreachable at http:\/\/127\.0\.0\.1:1 /m);
+    const down = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: real[0] });
+    expect(down.code, show(down)).toBe(0);
+    expect(down.out).toMatch(/^warn +embed-route +test-mac: embedding on the Zima CPU \(slow\): its Ollama is unreachable at http:\/\/127\.0\.0\.1:\d+ \(embedder returned 503\)$/m);
+    expect(down.out).toMatch(/^warn +embed-route +macmini: no machine token by this name/m);
+    const up = s.run("check.sh", [], { ...GOOD, FAKE_STATUS: real[1] });
+    expect(up.out).not.toMatch(/^warn +embed-route +test-mac/m);
+    expect(up.out).toMatch(/^ok +embed-route +test-mac up/m);
   });
 
   test("an idle embedder with an empty queue is fine", () => {
