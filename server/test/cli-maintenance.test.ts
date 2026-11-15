@@ -3,7 +3,7 @@ import { authedApp, freshDb } from "./helpers";
 import { boundFolder, sess, ingest } from "./fixtures";
 import { claudeSmoke, requeueMissingEmbeddings } from "../src/cli";
 import { runClaude, type ClaudeInput } from "../src/summarise/claude";
-import { SUMMARY_SCHEMA } from "../src/summarise/prompts";
+import { SUMMARY_CALL_SCHEMA } from "../src/summarise/prompts";
 import { fakeEmbedder } from "../src/embed/fake";
 import { toVector } from "../src/embed/embedder";
 import { summaryEmbedText } from "../src/summarise/summarise";
@@ -125,7 +125,7 @@ test("M3: claude-smoke runs one summary call with the server's prompt and schema
     const calls: ClaudeInput[] = [];
     const r = await claudeSmoke((input) => { calls.push(input); return fakeRun("ok")(input); }, db.sql);
     expect(calls).toHaveLength(1);
-    expect(calls[0].schema).toBe(SUMMARY_SCHEMA);
+    expect(calls[0].schema).toBe(SUMMARY_CALL_SCHEMA);
     expect(r.ok).toBe(true);
     expect(r.line).toMatch(/^ok: a summary call answered .*model claude-haiku-fake, 22 tokens/);
     expect(await db.sql`select tokens, kind from usage_ledger`).toEqual([{ tokens: 22, kind: "summary" }]);

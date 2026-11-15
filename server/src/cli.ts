@@ -6,7 +6,7 @@ import { requeueDead } from "./worker";
 import { requeueDeadSummaries } from "./summarise/jobs";
 import { parseSummary, summaryEmbedText } from "./summarise/summarise";
 import { runClaude, type ClaudeInput, type ClaudeRun } from "./summarise/claude";
-import { SUMMARY_SCHEMA, summaryRequest } from "./summarise/prompts";
+import { SUMMARY_CALL_SCHEMA, summaryRequest } from "./summarise/prompts";
 import { renderRange } from "./summarise/render";
 import { record } from "./summarise/budget";
 import { ollamaEmbedder } from "./embed/ollama";
@@ -49,7 +49,7 @@ export async function claudeSmoke(run: (input: ClaudeInput) => Promise<ClaudeRun
     { seq: 2, ts: at(1), kind: "assistant", text: "Renamed FOO to BAR in settings.ts and its two call sites; the tests pass.", tool_name: null, tool_input: null },
   ]);
   const started = Date.now();
-  const res = await run({ ...summaryRequest(piece), schema: SUMMARY_SCHEMA });
+  const res = await run({ ...summaryRequest(piece), schema: SUMMARY_CALL_SCHEMA });
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   const spent = res.ok ? res.tokens : res.tokens ?? 0;
   if (sql && spent > 0) await record(sql, spent, "summary");

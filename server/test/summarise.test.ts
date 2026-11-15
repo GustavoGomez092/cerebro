@@ -526,3 +526,26 @@ test("a stored piece is progress: it resets the job's attempts, so a long sessio
     expect(j).toEqual({ attempts: 1, dead: false });
   } finally { await t.drop(); }
 });
+
+test("the schema sent to the CLI states the caps as guidance, not hard limits, and over-long answers are trimmed on store", async () => {
+  const t = await authedApp();
+  try {
+    const { job } = await endedSession(t);
+    let sent: any;
+    const long = async (input: ClaudeInput) => {
+      sent = input.schema;
+      const r = await fakeRun("ok")(input);
+      return r.ok ? { ...r, output: { ...(r.output as object), overview: "o".repeat(2090), facts: Array(40).fill("f".repeat(400)) } } : r;
+    };
+    expect(await summariseJob(t.sql, t.embedder, job, { run: long, budget: BUDGET })).toMatchObject({ status: "done" });
+    // A hard maxLength/maxItems makes the CLI retry and give up (error_max_structured_output_retries) when Haiku overshoots.
+    expect(JSON.stringify(sent)).not.toMatch(/maxLength|maxItems/);
+    expect(sent.required).toEqual((SUMMARY_SCHEMA as any).required);
+    expect(sent.properties.overview.description).toContain("at most 1200 characters");
+    expect(sent.properties.facts.description).toContain("at most 30 items of at most 300 characters each");
+    const [s] = await t.sql`select body from summaries`;
+    expect(s.body.overview).toHaveLength(1200);
+    expect(s.body.facts).toHaveLength(30);
+    expect(s.body.facts[0]).toHaveLength(300);
+  } finally { await t.drop(); }
+});

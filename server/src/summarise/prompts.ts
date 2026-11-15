@@ -25,6 +25,29 @@ export const SUMMARY_SCHEMA = {
 } as const;
 
 /**
+ * SUMMARY_SCHEMA as sent to the CLI: the caps move into the descriptions. The CLI enforces maxLength/maxItems
+ * by asking again and gives up after five tries (error_max_structured_output_retries), which on dense stretches
+ * cost whole calls over an overview a few characters long; parseSummary re-applies the caps on store anyway.
+ */
+export const SUMMARY_CALL_SCHEMA = {
+  ...SUMMARY_SCHEMA,
+  properties: Object.fromEntries(
+    Object.entries(SUMMARY_SCHEMA.properties).map(([k, v]) => {
+      if ("maxLength" in v) {
+        const { maxLength, ...rest } = v;
+        return [k, { ...rest, description: `${v.description} Keep it at most ${maxLength} characters.` }];
+      }
+      const { maxItems, items, ...rest } = v;
+      return [k, {
+        ...rest,
+        items: { type: items.type },
+        description: `${v.description} Keep it to at most ${maxItems} items of at most ${items.maxLength} characters each.`,
+      }];
+    }),
+  ),
+};
+
+/**
  * The system prompt for one call. `tag` is the per-call delimiter fencing the transcript, so text inside
  * the transcript cannot close the data block.
  */

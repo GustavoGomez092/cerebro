@@ -4,7 +4,7 @@ import { embedderFor, toVector, type Embedder } from "../embed/embedder";
 import { budgetState, canSpend, estimateTokens, record } from "./budget";
 import { HEALTH_PROBE, type runClaude } from "./claude";
 import { completeSummaryJob, failSummaryJob, releaseSummaryJob } from "./jobs";
-import { SUMMARY_SCHEMA, summaryRequest } from "./prompts";
+import { SUMMARY_CALL_SCHEMA, SUMMARY_SCHEMA, summaryRequest } from "./prompts";
 import { renderRange, type EventRow } from "./render";
 import { markScopesDirty, scopeKey } from "./state";
 
@@ -266,7 +266,7 @@ export async function summariseJob(
     }
 
     const req = summaryRequest(piece);
-    const run = await deps.run({ ...req, schema: SUMMARY_SCHEMA });
+    const run = await deps.run({ ...req, schema: SUMMARY_CALL_SCHEMA });
     if (!run.ok) {
       // A call killed at our timeout (or by a stop) reports no usage, but its input was very likely processed
       // and billed: charge its estimate so the budget sees it, whatever the probe below says. The probe decides
