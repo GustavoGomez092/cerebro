@@ -52,7 +52,7 @@ run("image runs as uid 10010 with the documented environment", () => {
 run("migrate command and the healthcheck pass against a database", async () => {
   expect(sh("docker", "network", "create", NET).code).toBe(0);
   expect(sh("docker", "run", "-d", "--name", DB, "--network", NET, "-e", "POSTGRES_USER=cerebro", "-e", "POSTGRES_PASSWORD=cerebro",
-    "-e", "POSTGRES_DB=cerebro", "pgvector/pgvector:0.8.1-pg17").code).toBe(0);
+    "-e", "POSTGRES_DB=cerebro", "pgvector/pgvector:0.8.6-pg17").code).toBe(0);
   for (let i = 0; i < 60 && sh("docker", "exec", DB, "pg_isready", "-U", "cerebro").code !== 0; i++) await Bun.sleep(1000);
   const env = ["-e", `DATABASE_URL=postgres://cerebro:cerebro@${DB}:5432/cerebro`, "-e", "EMBED_URL=http://127.0.0.1:1"];
 

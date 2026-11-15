@@ -7,7 +7,7 @@ const ZIMA = join(import.meta.dir, "..");
 const DEPLOY = join(ZIMA, "..");
 const REPO = join(DEPLOY, "..");
 const COMPOSE_SRC = await Bun.file(join(DEPLOY, "compose.yml")).text();
-const IMAGE = /image: (pgvector\/pgvector\S+)/.exec(COMPOSE_SRC)?.[1] ?? "pgvector/pgvector:0.8.1-pg17";
+const IMAGE = /image: (pgvector\/pgvector\S+)/.exec(COMPOSE_SRC)?.[1] ?? "pgvector/pgvector:0.8.6-pg17";
 
 function run(cmd: string[], env: Record<string, string> = {}, input?: Uint8Array) {
   const p = Bun.spawnSync(cmd, { cwd: REPO, env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe", stdin: input });

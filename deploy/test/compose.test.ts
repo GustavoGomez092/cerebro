@@ -13,7 +13,7 @@ function run(cmd: string[], env: Record<string, string> = {}) {
   return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
 }
 
-const PGVECTOR_IMAGE = /image: (pgvector\/pgvector\S+)/.exec(await Bun.file(COMPOSE).text().catch(() => ""))?.[1] ?? "pgvector/pgvector:0.8.1-pg17";
+const PGVECTOR_IMAGE = /image: (pgvector\/pgvector\S+)/.exec(await Bun.file(COMPOSE).text().catch(() => ""))?.[1] ?? "pgvector/pgvector:0.8.6-pg17";
 
 // The Docker tests need a daemon and a free host port 8790.
 const dockerUp = run(["docker", "info"]).code === 0;
@@ -64,7 +64,8 @@ describe("compose config", () => {
     expect(server.ports).toHaveLength(1);
     expect(server.ports[0]).toMatchObject({ host_ip: "127.0.0.1", published: "8790", target: 8790 });
 
-    expect(db.image).toMatch(/^pgvector\/pgvector:0\.8\.1-pg17@sha256:[0-9a-f]{64}$/);
+    // 0.8.1-pg17 shipped Postgres 17.8, whose left()/substring() refuse some stored UTF-8 text (BUG #19406).
+    expect(db.image).toMatch(/^pgvector\/pgvector:0\.8\.6-pg17@sha256:[0-9a-f]{64}$/);
     expect(ollama.image).toMatch(/^ollama\/ollama:[\w.-]+@sha256:[0-9a-f]{64}$/);
     expect(server.image).toBe("cerebro-server:test");
 
