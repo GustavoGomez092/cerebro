@@ -19,8 +19,11 @@ never retry quickly and never open parallel connections).
 2. **Deploy**: `deploy/zima/deploy.sh --first-run`. It generates the secrets on the server (never printed),
    creates the data dirs, builds the image, pulls bge-m3, migrates, gates on `/health`, creates the `check`
    machine token, registers the ZimaOS app, and installs the backup scripts and units into
-   `/DATA/AppData/cerebro/zima/`. If the ZimaOS registration fails (a warning; the server is live), register it
-   with `ssh zima sudo casaos-cli app-management install -f /DATA/AppData/cerebro/docker-compose.yml`.
+   `/DATA/AppData/cerebro/zima/`. The ZimaOS registration warns "ports in use" on a first run (the stack is
+   already up) and the app is still listed as `cerebro` (running). **Never** run `casaos-cli app-management install`
+   for it by hand after stopping the stack: ZimaOS tries to pull the local-only `cerebro-server` image from public
+   mirrors, fails ("repository does not exist") and leaves Cerebro down. If that happened, bring it back with
+   `ssh zima 'cd /DATA/AppData/cerebro && sudo docker compose -p cerebro -f docker-compose.yml up -d --pull never --wait'`.
 3. **Caddy route** (repo `HomeLab/proxy`, see its README "Add a service"): add
    ```
    http://cerebro.home.lab {
