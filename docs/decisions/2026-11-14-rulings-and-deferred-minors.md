@@ -196,3 +196,22 @@ Every decision taken on the owner's behalf during the build (`Ruling:` — what 
 - Final: minor (deferred): New-2 after a restore, migrate's pooled connection lacks the timeouts until restart.
 - Final: minor (deferred): New-3 running the server locally makes one real Claude call per start (set SUMMARISER_ENABLED=false for dev).
 - Final: minor (deferred): New-4 restore step 4 can write an empty/null instance id if the server isn't listening yet.
+
+## embed-tuning (go-live, 2026-11-14)
+
+### Rulings
+
+- Ruling: keep bge-m3 (owner's choice after the Zima benchmark: 0.22 chunks/s, 0.45 s idle query; granite-embedding:278m 0.67–0.76 chunks/s; paraphrase-multilingual:278m rejected — it ignores everything past ~128 tokens) — best multilingual quality, no schema change — cost if wrong: re-embed with another model later.
+- Ruling: one chunk per worker call and a 6 s query-embed budget — a query waits behind at most one in-flight chunk — cost if wrong: slightly lower bulk throughput on the Zima fallback.
+- Ruling: per-machine embedding (owner's request): each Mac embeds its own sessions and its own searches on its own Ollama (`EMBED_MACHINE_URLS`, mac-mini=192.168.4.42, macbook-pro=192.168.4.45, eero DHCP reservations in place); never cross-Mac; the Zima's Ollama is the universal fallback — Macs are ~75× faster (15.8–17.3 chunks/s) — cost if wrong: a sleeping Mac's work waits or crawls on the Zima.
+- Ruling: OLLAMA_CPUS=2 on the Zima (fallback only) — protects Jellyfin and the other apps — cost if wrong: fallback queries ~1 s instead of 0.45 s.
+- Ruling: a Zima digest mismatch keeps the server up with Macs disabled rather than failing startup — a rollback can't fix server.env, so a fatal error would leave the server down — cost if wrong: degraded embedding until fixed (check.sh warns).
+
+### Deferred minors
+
+- minor (deferred): all lanes share one worker state, so the Zima lane's back-off never grows while a Mac works (M1).
+- minor (deferred): a down Mac's chunks get only ~30 s of Zima time per 62–77 s (M3).
+- minor (deferred): searches pause the Mac lanes when only the Zima lane needs pausing; a bad chunk is embedded twice before the health check (M5).
+- minor (deferred): a slow request finishing after its Mac was marked down sets it back to up (lane flaps; no bad vector stored).
+- minor (deferred): the Zima lane keeps storing while the Zima's digest mismatches the pin (only mixes if the Zima's model itself changed).
+- minor (deferred): one hung Mac probe (up to 15 s) delays the Zima re-check and other Macs' recovery.
