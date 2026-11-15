@@ -152,8 +152,14 @@ else and is the fallback, so nothing stops when a Mac is asleep, restarting or a
 
 Both serve bge-m3 `7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`, the same as `cerebro-ollama`.
 
+**Before you enable it**: give each Mac a fixed address with an **eero DHCP reservation** (eero app, Settings,
+Network settings, Reservations & port forwarding, the Mac, Reserve IP address): 192.168.4.42 for the Mac mini,
+192.168.4.45 for the MacBook Pro. Do this first: the map routes by IP, and both Macs serve the same model, so if
+their leases ever swapped, each Mac's work would silently go to the other one (the digest check can't tell them
+apart). Then set up each Mac (below).
+
 **Enable it**: on the server, edit `/DATA/AppData/cerebro/secrets/server.env` (root 600; `deploy.sh --first-run`
-writes the two lines commented out) so that it has:
+writes the two lines commented out, the digest already filled in from `BGE_M3_DIGEST`) so that it has:
 
 ```sh
 EMBED_MACHINE_URLS=mac-mini=http://192.168.4.42:11434,macbook-pro=http://192.168.4.45:11434
@@ -165,38 +171,57 @@ ssh -t zima sudo nano /DATA/AppData/cerebro/secrets/server.env
 ```
 
 then redeploy (`deploy/zima/deploy.sh`) so the server restarts with them. The names are the machine-token names
-(`token list`, see Maintenance); a machine not in the list (e.g. `check`) embeds on the Zima. `EMBED_MODEL_DIGEST`
-is the `ollama list` ID of bge-m3 (12 hex) or its full sha256 from `/api/tags`, the same value as `BGE_M3_DIGEST` in
-`deploy/.env`, and applies to every Mac. Leave both unset (or commented) to embed on the Zima alone, exactly as
-before. A malformed list or digest stops the server at startup, and the deploy's health gate rolls back.
+(`token list`, see Maintenance); a machine not in the list (e.g. `check`) embeds on the Zima, and a name with no
+live token (a typo) logs a warning at startup and makes `check.sh` warn. `EMBED_MODEL_DIGEST` is required with the
+map: the `ollama list` ID of bge-m3 (12 hex) or its full sha256 from `/api/tags`, the same value as `BGE_M3_DIGEST`
+in `deploy/.env`. Leave both unset (or commented) to embed on the Zima alone, exactly as before.
+
+A malformed `EMBED_MACHINE_URLS`, or the map without `EMBED_MODEL_DIGEST`, stops the server at startup. The deploy's
+gate then rolls back to the previous image, but **a rollback does not undo server.env**: the previous release reads
+the same file and fails the same way, so the server stays down until you fix server.env and redeploy. Check the
+two lines twice before redeploying.
 
 How the server routes (`server/src/embed/failover.ts`, `server/src/worker.ts`):
 
+- **One model, always**: at startup, and every 5 minutes after, the server reads the Zima's own bge-m3 digest
+  (`cerebro-ollama`'s `/api/tags`) and compares it with `EMBED_MODEL_DIGEST`. Until they match, no Mac is used at
+  all and everything embeds on the Zima, whose model made the vectors already stored (`check.sh` warns "no Mac is
+  used"). Each Mac's digest is read before it is first used, every 5 minutes while it is up, and again right after
+  every embed whose vectors are stored (chunks, summaries): a Mac whose bge-m3 changed (say, an `ollama pull` that
+  fetched a newer manifest) is marked `digest_mismatch`, and the vectors it just made are dropped, not stored. The
+  one gap is a search query, which is never stored: a query embedded in the seconds between a model swap and the
+  next check ranks against the stored vectors with a slightly different model, for that one search.
 - **Chunks**: the embed worker runs one lane per Mac, plus a Zima lane, each on its own: a slow or stuck lane
   never holds another up. A Mac's lane embeds only the chunks of sessions that Mac uploaded (the session's
-  `machine_id`, recorded at ingest and never changed), live sessions before imported history, on that Mac only.
-  While the Mac is down or mismatched, its chunks wait: they are released without charging an attempt and retried
-  after 30 s, and its lane sits out a 60 s window before trying the Mac again. The Zima lane embeds unmapped
-  machines' chunks and, after those, the waiting chunks of a Mac that is down, one chunk per call, so nothing is
-  stranded while a Mac is away; it never takes a chunk of a Mac that is up.
-- **Search queries** embed on the asking machine's Mac. If it is down, mismatched, or hasn't answered within 2 s,
-  that query embeds on the Zima instead (~0.45 s idle), inside the search's 6 s budget.
+  `machine_id`, recorded at ingest and never changed, copied onto each queue row), live sessions before imported
+  history, on that Mac only. While the Mac is down or mismatched, its chunks wait: they are released without
+  charging an attempt and retried after 30 s. The Zima lane embeds unmapped machines' chunks and, after those, the
+  waiting chunks of a Mac that is down or mismatched, one chunk per call, so nothing is stranded while a Mac is
+  away; it never takes a chunk of a Mac that is up.
+- **Probes**: a background prober checks each Mac (its digest, then one known text) when the server starts and
+  60 s after it went down, and brings it back to `up` by itself; `/v1/status` and `check.sh` follow within seconds
+  of a Mac coming back, with no traffic needed.
+- **Search queries** embed on the asking machine's Mac only while it is up; a search never waits on a probe. If
+  the Mac hasn't answered within 2 s, that query embeds on the Zima instead (~0.45 s idle). If the Zima is busy
+  with a chunk (~4.5 s) at that moment, the search can run out of its 6 s budget and return full-text results
+  only (`degradedReasons: embedder`); the Mac is then marked down, so the following searches go straight to the
+  Zima.
 - **Summaries** embed on the Mac that uploaded the session (a history: the Mac that posted it), with the Zima as
   fallback.
-- **Down** means unreachable, refused, 404/5xx, a malformed answer (e.g. wrong dims), or no answer within 15 s:
-  the Mac is then skipped for 60 s, and the next call after that tries it again. A Mac that is just reloading
-  bge-m3 (it unloads after idle minutes; a cold call took 1.6 s against 0.17 s warm) is not down: a query that
-  can't wait falls back once while the load finishes, and the Mac is used again from the next call. The server
-  asks each Mac to keep the model loaded 30 minutes (`keep_alive: "30m"`); the Zima keeps it loaded forever. A
-  400 (bad input) is not retried on the Zima: it would refuse it too.
-- **Digest**: with `EMBED_MODEL_DIGEST` set, the server reads each Mac's `/api/tags` before its first use and again
-  each time it comes back after being down. A different digest, or no bge-m3, keeps that Mac out (a warning is
-  logged; its queries use the Zima, its chunks wait); it is checked again 60 s later, so a fixed Mac is picked up
-  by itself. Vectors from two different models never mix.
-- `/v1/status` shows `embedder.endpoints` (per Mac: `machine`, `url`, `state`: `up`, `down`, `digest_mismatch` or
-  `unknown` before its first call; `lastError`, `downUntil`, `lastUsedAt`) and `embedder.fallback` (`url`,
-  `lastUsedAt`). `check.sh` warns (`embed-route`, never a failure) for each Mac that is down or mismatched, naming
-  it: "macbook-pro: embedding on the Zima CPU (slow): …".
+- **Down** means unreachable, refused, 404/5xx, a malformed answer (e.g. wrong dims), or no answer within 15 s
+  (or before a search gave up on it): the Mac is then skipped for 60 s, until the next probe. A Mac that is just
+  reloading bge-m3 (it unloads after idle minutes; a cold call took 1.6 s against 0.17 s warm) is not down: a query
+  that can't wait falls back once while the load finishes, and the Mac is used again from the next call. The
+  server asks each Mac to keep the model loaded 30 minutes (`keep_alive: "30m"`); the Zima keeps it loaded
+  forever. A 400 (bad input) is not retried on the Zima: it would refuse it too.
+- `/v1/status` shows `embedder.endpoints` (per Mac: `machine`, `known` (a live token by that name), `url`,
+  `state`: `up`, `down`, `digest_mismatch` or `unknown` before its first probe; `lastError`, `downUntil`,
+  `lastUsedAt`), `embedder.fallback` (`url`, `lastUsedAt`, `state` of the Zima's digest: `ok`, `digest_mismatch`,
+  `unreachable`, `unchecked`), `embedder.lanes` (each lane's `lastSuccessAt`, `lastError`) and
+  `queue.oldestWaitSeconds` (`live`, `imported`). `check.sh` warns (never fails) for each Mac that is down or
+  mismatched ("macbook-pro: embedding on the Zima CPU (slow): …"), for a mapped name with no token, while the
+  Zima's digest is unconfirmed, while the Zima embedder is paused, and when the oldest live chunk has waited
+  over 6 h or the oldest imported one over 48 h.
 
 **Each Mac** (the Mac mini and the MacBook Pro, once each):
 
@@ -205,21 +230,22 @@ How the server routes (`server/src/embed/failover.ts`, `server/src/worker.ts`):
    `launchctl` setting is lost at reboot; the app setting is not). Check from the Zima:
    `ssh zima curl -s -m 5 http://192.168.4.42:11434/api/tags` (`.45` for the MacBook Pro).
 2. `ollama pull bge-m3` and check that `ollama list` shows the same ID as `cerebro-ollama`
-   (`ssh zima sudo docker exec cerebro-ollama ollama list`), i.e. `EMBED_MODEL_DIGEST`.
+   (`ssh zima sudo docker exec cerebro-ollama ollama list`), i.e. `EMBED_MODEL_DIGEST`. Pulling again later may
+   fetch a newer manifest: the server then stops using that Mac (`check.sh` warns "mismatch") until the digests
+   agree again.
 3. Either never sleep (System Settings, Energy: "Prevent automatic sleeping when the display is off", "Wake for
    network access"), or accept the Zima fallback while it sleeps: nothing is lost, its chunks wait or embed slowly
-   on the Zima, and a search from it waits up to 2 s about once a minute (each time the server tries it again). A MacBook that leaves home is
-   simply down until it is back on the LAN.
-4. Give each Mac a fixed address: an **eero DHCP reservation** per Mac (eero app, Settings, Network settings,
-   Reservations & port forwarding, the Mac, Reserve IP address): 192.168.4.42 for the Mac mini, 192.168.4.45 for
-   the MacBook Pro, so `EMBED_MACHINE_URLS` keeps pointing at them.
+   on the Zima, and a search from it can wait up to 2 s (or fall back to full text) about once a minute, when the
+   server finds it down again. A MacBook that leaves home is simply down until it is back on the LAN.
+4. The DHCP reservation above.
 
 **Security**: Ollama has no authentication. Exposed on the LAN, anyone on the home network can use a Mac's models
 (run them, pull or delete models). Keep it to the home LAN (no port forward on the eero). The MacBook Pro joins
-other networks: there, "Expose Ollama to the network" exposes it to that network too, so turn the setting off
-when away (its work then embeds on the Zima), or rely on the macOS firewall to block incoming connections to
-Ollama off the home network. The server sends the text it embeds (conversation chunks, summaries and search
-queries) to the Mac in plain HTTP over the LAN.
+other networks, and "Expose Ollama to the network" exposes it on whichever network it is on. The macOS firewall
+can't help here: it allows or blocks an app's incoming connections on every network alike, so blocking Ollama
+blocks the Zima at home too. Turn "Expose Ollama to the network" off before leaving home (its work then embeds on
+the Zima) and back on at home, or don't map the MacBook at all. The server sends the text it embeds
+(conversation chunks, summaries and search queries) to the Macs in plain HTTP over the LAN.
 
 ## Upgrades and rollback
 

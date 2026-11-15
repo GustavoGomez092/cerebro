@@ -26,7 +26,7 @@ Tests create and drop their own throwaway databases on the dev Postgres
 | `PORT`         | `8790`   | HTTP port                                       |
 | `EMBED_URL`    | required to run | Ollama base URL for embeddings; with `EMBED_MACHINE_URLS`, the fallback and the Ollama for unmapped machines |
 | `EMBED_MACHINE_URLS` | unset | `name=url,name=url`: machine-token name → that machine's own Ollama (e.g. `mac-mini=http://192.168.4.42:11434,macbook-pro=http://192.168.4.45:11434`). Each machine's chunks, summaries and searches embed there; one Mac's work never goes to another. Unset: `EMBED_URL` for everything. See deploy/zima/README.md |
-| `EMBED_MODEL_DIGEST` | unset | Expected model digest on every machine endpoint (12-hex `ollama list` ID or the full sha256); an endpoint is not used while it differs |
+| `EMBED_MODEL_DIGEST` | unset; required with `EMBED_MACHINE_URLS` | bge-m3's digest (12-hex `ollama list` ID or the full sha256). The `EMBED_URL` Ollama must serve it, or no machine endpoint is used; a machine endpoint is not used while its digest differs |
 | `EMBED_MODEL`  | `bge-m3` | Ollama embedding model                          |
 | `EMBED_DIMS`   | `1024`   | Embedding size; must match the schema's vector size |
 | `SUMMARISER_ENABLED` | `true` | `false`, `0`, `no` or `off` (any case) turns the summary loop off; `true`, `1`, `yes`, `on` keep it on; any other value stops the server at startup |
