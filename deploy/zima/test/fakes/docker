@@ -62,6 +62,11 @@ case $1 in
         read -r _ anon shmem file limit oom <<<"$line"
         printf 'limit %s\nanon %s\nfile %s\nkernel 1000\nshmem %s\nlow 0\nhigh 0\nmax 0\noom 0\noom_kill %s\n' "$limit" "$anon" "$file" "$shmem" "$oom"
         exit 0 ;;
+      *"cli.ts web-db-role"*)
+        # FAKE_WEB_DB_RC: cerebro-server can't set the role; FAKE_WEB_DB_PW: the password it makes.
+        [[ -z ${FAKE_WEB_DB_RC-} ]] || { echo "role cerebro_web does not exist" >&2; exit "$FAKE_WEB_DB_RC"; }
+        printf 'DATABASE_URL=postgres://cerebro_web:%s@cerebro-db:5432/cerebro\n' "${FAKE_WEB_DB_PW:-pw}"
+        exit 0 ;;
       *"token create check"*)
         printf 'Token for check (shown once, store it on that machine):\n%s\nDo not create tokens inside a recorded Claude Code session.\n' "$FAKE_CHECK_TOKEN"
         exit 0 ;;

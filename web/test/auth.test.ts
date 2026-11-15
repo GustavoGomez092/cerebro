@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { getMigrations } from "better-auth/db/migration";
 import { freshDb } from "../../server/test/helpers";
+import { webDbUrl } from "./web-db";
 import { authOptions, authPool, createAuth } from "../src/server/auth.server";
 import { createOrResetOwner } from "../src/server/owner.server";
 
@@ -8,8 +9,9 @@ const BASE = "http://brain.home.lab";
 const SECRET = "test-secret-".padEnd(48, "x");
 
 async function setup() {
-  const db = await freshDb(); // server migrations, 008 included
-  const pool = authPool(db.url);
+  const db = await freshDb(); // server migrations, 008 and 009 included
+  // Better Auth runs as cerebro_web (migration 009), as on the Zima: never the superuser.
+  const pool = authPool(await webDbUrl(db));
   const auth = createAuth({ pool, secret: SECRET, baseURL: BASE });
   const post = (path: string, body: unknown, ip = "192.168.4.10") =>
     auth.handler(new Request(`${BASE}/api/auth${path}`, {

@@ -12,6 +12,7 @@ import { record } from "./summarise/budget";
 import { ollamaEmbedder } from "./embed/ollama";
 import { toVector, type Embedder } from "./embed/embedder";
 import type { SQL } from "bun";
+import { runWebDbRole } from "./web-db-role";
 
 const usage = [
   "usage: bun server/src/cli.ts token create|revoke <machine>",
@@ -22,6 +23,7 @@ const usage = [
   "       bun server/src/cli.ts requeue-dead                  # retry chunks and summary jobs that were given up on",
   "       bun server/src/cli.ts requeue-dead-summaries        # retry dead summary jobs only",
   "       bun server/src/cli.ts claude-smoke                  # one tiny real summary call through the server's runClaude (after claude auth login)",
+  "       bun server/src/cli.ts web-db-role | …               # new password for cerebro_web; prints web.env's DATABASE_URL line into a pipe only",
 ].join("\n");
 
 /** What to do about each failure class, for the owner at the terminal. */
@@ -127,6 +129,15 @@ async function main(argv: string[]) {
     try {
       if (area === "requeue-dead") console.log(`requeued ${await requeueDead(sql)} chunk(s)`);
       console.log(`requeued ${await requeueDeadSummaries(sql)} summary job(s)`);
+    } finally { await sql.close(); }
+    return;
+  }
+  if (area === "web-db-role") {
+    const { databaseUrl } = loadConfig(process.env);
+    const sql = connect(databaseUrl);
+    try {
+      await migrate(sql);
+      await runWebDbRole(sql, databaseUrl, { isTTY: !!process.stdout.isTTY, write: (s) => process.stdout.write(s) });
     } finally { await sql.close(); }
     return;
   }

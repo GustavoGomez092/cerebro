@@ -4,6 +4,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { freshDb } from "../../server/test/helpers";
+import { webDbUrl } from "./web-db";
 import { createApp } from "../../server/src/http/app";
 import { createToken } from "../../server/src/auth";
 import { fakeEmbedder } from "../../server/src/embed/fake";
@@ -24,7 +25,7 @@ beforeAll(async () => {
   const api = createApp({ sql: db.sql, embedder: fakeEmbedder(), log: () => {} });
   cerebro = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: api.fetch });
   Object.assign(process.env, {
-    DATABASE_URL: db.url, BETTER_AUTH_SECRET: "app-test-secret-".padEnd(48, "z"), BETTER_AUTH_URL: BASE,
+    DATABASE_URL: await webDbUrl(db), BETTER_AUTH_SECRET: "app-test-secret-".padEnd(48, "z"), BETTER_AUTH_URL: BASE,
     CEREBRO_URL: `http://127.0.0.1:${cerebro.port}`, CEREBRO_WEB_TOKEN: token,
   });
   const handler = (await import(join(WEB, "dist", "server", "server.js"))).default;

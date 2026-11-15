@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { join } from "node:path";
 import { freshDb } from "../../server/test/helpers";
+import { webDbUrl } from "./web-db";
 import { parseOwnerArgs, passwordFromPipe } from "../scripts/create-owner";
 import { authPool, createAuth } from "../src/server/auth.server";
 
@@ -23,12 +24,13 @@ test("a piped password is the first line, without its line ending", () => {
 
 test("the script creates the owner from a piped password and never prints it", async () => {
   const db = await freshDb();
-  const pool = authPool(db.url);
+  const webUrl = await webDbUrl(db);
+  const pool = authPool(webUrl);
   try {
     const password = "piped-password-0123456789";
     const proc = Bun.spawn(["bun", SCRIPT, "--email", "owner@home.lab"], {
       stdin: new Blob([`${password}\n`]), stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, DATABASE_URL: db.url, BETTER_AUTH_SECRET: "s".repeat(40), BETTER_AUTH_URL: "http://brain.home.lab", CEREBRO_WEB_TOKEN: "unused" },
+      env: { ...process.env, DATABASE_URL: webUrl, BETTER_AUTH_SECRET: "s".repeat(40), BETTER_AUTH_URL: "http://brain.home.lab", CEREBRO_WEB_TOKEN: "unused" },
     });
     const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     expect(code).toBe(0);
