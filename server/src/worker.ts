@@ -26,8 +26,10 @@ export interface WorkerState {
   pauseMs: number;
   lastSuccessAt: string | null;
   lastError: string | null;
+  /** Per lane (a machine's name, "zima"), with EMBED_MACHINE_URLS: the shared fields above mix every lane. */
+  lanes?: Record<string, { lastSuccessAt: string | null; lastError: string | null }>;
 }
-export const newWorkerState = (): WorkerState => ({ pausedUntil: 0, pauseMs: 0, lastSuccessAt: null, lastError: null });
+export const newWorkerState = (): WorkerState => ({ pausedUntil: 0, pauseMs: 0, lastSuccessAt: null, lastError: null, lanes: {} });
 
 const PAUSE_MIN_MS = 5_000, PAUSE_MAX_MS = 5 * 60_000;
 /** Known-good text: if it fails too, the embedder is broken and no chunk is to blame. */
@@ -77,6 +79,12 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
   const leaseSeconds = opts.leaseSeconds ?? 600, maxAttempts = opts.maxAttempts ?? 5;
   const result = { claimed: 0, embedded: 0, failed: 0, dead: 0, paused: false };
   const lane = opts.route?.machine ?? null;
+  const laneName = opts.route ? lane ?? "zima" : null;
+  const laneState = laneName === null ? null : ((state.lanes ??= {})[laneName] ??= { lastSuccessAt: null, lastError: null });
+  const noteError = (message: string) => {
+    state.lastError = message;
+    if (laneState) laneState.lastError = message;
+  };
   if (lane === null && state.pausedUntil > Date.now()) return { ...result, paused: true };
 
   let claimed: Claimed[];
@@ -120,6 +128,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
     });
     result.embedded += items.length;
     state.lastSuccessAt = new Date().toISOString();
+    if (laneState) { laneState.lastSuccessAt = state.lastSuccessAt; laneState.lastError = null; }
     state.pauseMs = 0;
   };
   const charge = async (item: Claimed, err: Error) => {
@@ -137,7 +146,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
   const pause = async (pending: Claimed[], err: Error) => {
     if (lane !== null) {
       // This machine's endpoint is down: its chunks wait (no attempt charged); the worker itself doesn't pause.
-      state.lastError = err.message;
+      noteError(err.message);
       result.paused = true;
       if (pending.length) {
         await sql`update embed_queue set locked_until = null, next_attempt_at = now() + make_interval(secs => ${DEFER_S})
@@ -147,7 +156,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
     }
     state.pauseMs = Math.min(PAUSE_MAX_MS, Math.max(PAUSE_MIN_MS, state.pauseMs * 2));
     state.pausedUntil = Date.now() + state.pauseMs;
-    state.lastError = err.message;
+    noteError(err.message);
     result.paused = true;
     if (pending.length) await sql`update embed_queue set locked_until = null where chunk_id = any(${sql.array(pending.map((x) => x.chunk_id), "int8")})`;
   };
@@ -165,7 +174,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
       continue;
     } catch (e) {
       if (isTransient(e)) { await pause(batches.slice(bi).flat(), e as Error); return result; }
-      state.lastError = (e as Error).message;
+      noteError((e as Error).message);
     }
     // Isolate the bad item(s): retry one at a time.
     for (const [ii, item] of batch.entries()) {
@@ -176,7 +185,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
           await pause([...batch.slice(ii), ...batches.slice(bi + 1).flat()], e as Error);
           return result;
         }
-        state.lastError = (e as Error).message;
+        noteError((e as Error).message);
         await charge(item, e as Error);
       }
     }
@@ -242,7 +251,7 @@ export function embedLanes(sql: SQL, embedder: Embedder, opts: EmbedOptions): { 
       name: "zima",
       run: () => embedPending(sql, embedder, {
         ...opts,
-        route: { zima: { mapped: lanes.map((l) => l.machine), waiting: lanes.filter((l) => l.blocked()).map((l) => l.machine) } },
+        route: { zima: { mapped: lanes.map((l) => l.machine), waiting: lanes.filter((l) => l.waiting()).map((l) => l.machine) } },
       }),
     },
   ];

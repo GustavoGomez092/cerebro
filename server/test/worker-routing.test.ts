@@ -21,8 +21,9 @@ async function world(opts: { map?: boolean } = {}) {
   let clock = 1_000_000;
   const router = createEmbedRouter({
     machineUrls: opts.map === false ? {} : { "test-mac": mini.url, "macbook-pro": mbp.url },
-    fallbackUrl: zima.url, model: "bge-m3", dims: 1024, now: () => clock, log: () => {},
+    fallbackUrl: zima.url, model: "bge-m3", dims: 1024, digest: "790764642607", now: () => clock, log: () => {},
   });
+  await router.probeNow(); // both Macs up
   const tokens: Record<string, string> = { "test-mac": t.token };
   for (const m of ["macbook-pro", "check"]) tokens[m] = (await createToken(t.sql, m)).token;
   const { binding } = await boundFolder(t);
@@ -101,6 +102,7 @@ test("the Zima lane picks up a down machine's waiting chunks, one per call, but 
     // Once A's window is over, A's lane probes again and its new work goes back to A.
     w.mini.mode = "ok";
     w.advance(PRIMARY_DOWN_MS);
+    await w.router.probeNow();
     await w.upload("test-mac", "a2", ["avocado"]);
     expect(await lanes.zima.run()).toMatchObject({ claimed: 0 });
     expect(await lanes["test-mac"].run()).toMatchObject({ embedded: 1 });

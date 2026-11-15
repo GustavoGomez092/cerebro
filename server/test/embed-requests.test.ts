@@ -4,18 +4,21 @@ import { boundFolder, ev, sess } from "./fixtures";
 import { createToken } from "../src/auth";
 import { createEmbedRouter } from "../src/embed/failover";
 import { embedSummary } from "../src/summarise/summarise";
+import { search } from "../src/search";
 import { fakeOllama } from "./fakes/ollama";
 
 // "test-mac" (authedApp's token) → Mac mini (fill 1), "macbook-pro" → MacBook (fill 3), "check" unmapped; Zima fill 2.
 const live: { stop(): void }[] = [];
 afterEach(() => { for (const s of live.splice(0)) s.stop(); });
 
-async function world() {
+async function world(opts: { budgetMs?: number } = {}) {
   const mini = fakeOllama(1), mbp = fakeOllama(3), zima = fakeOllama(2);
   live.push(mini, mbp, zima);
   const embedder = createEmbedRouter({
-    machineUrls: { "test-mac": mini.url, "macbook-pro": mbp.url }, fallbackUrl: zima.url, model: "bge-m3", dims: 1024, log: () => {},
+    machineUrls: { "test-mac": mini.url, "macbook-pro": mbp.url }, fallbackUrl: zima.url, model: "bge-m3", dims: 1024,
+    digest: "790764642607", log: () => {}, ...(opts.budgetMs ? { primaryBudgetMs: () => opts.budgetMs! } : {}),
   });
+  await embedder.probeNow();
   const t = await authedApp({ embedder });
   const tokens: Record<string, string> = { "test-mac": t.token };
   for (const m of ["macbook-pro", "check"]) tokens[m] = (await createToken(t.sql, m)).token;
@@ -78,5 +81,29 @@ test("a history posted by a machine embeds on that machine's endpoint", async ()
     for (let i = 0; i < 100 && w.mbp.embedCalls === 0; i++) await Bun.sleep(10); // embedded in the background
     expect(w.mbp.embedCalls).toBe(1);
     expect(w.mini.embedCalls + w.zima.embedCalls).toBe(0);
+  } finally { await w.t.drop(); }
+});
+
+test("I3: a hung Mac plus a busy Zima degrades to full text by the search budget, and the next search skips the Mac", async () => {
+  // Scaled down: Mac budget 200 ms (2 s live), search budget 600 ms (6 s live), the Zima busy for 500 ms (an
+  // in-flight chunk). 200 + 500 > 600: the first search must give up its vector legs on time, not run over.
+  const w = await world({ budgetMs: 200 });
+  try {
+    w.mini.mode = "hang";
+    w.zima.mode = "slow";
+    w.zima.delayMs = 500;
+    const started = performance.now();
+    const first = await search(w.t.sql, w.t.embedder.forMachine!("test-mac"), { query: "kingfisher", scope: "open" }, { embedTimeoutMs: 600 });
+    const took = performance.now() - started;
+    expect(first.degradedReasons).toEqual(["embedder"]);
+    expect(took).toBeLessThan(600 + 250);
+    await Bun.sleep(20);
+    expect(w.t.embedder.status!().endpoints[0]).toMatchObject({ machine: "test-mac", state: "down" });
+
+    w.zima.delayMs = 100; // idle again
+    const calls = w.mini.embedCalls;
+    const second = await search(w.t.sql, w.t.embedder.forMachine!("test-mac"), { query: "heron", scope: "open" }, { embedTimeoutMs: 600 });
+    expect(second.degradedReasons).toEqual([]);
+    expect(w.mini.embedCalls).toBe(calls); // straight to the Zima
   } finally { await w.t.drop(); }
 });

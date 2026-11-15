@@ -1,13 +1,16 @@
 /** A stand-in Ollama on a random port (Bun.serve, port 0): /api/tags and /api/embed. Never the real one. */
 export type OllamaMode = "ok" | "503" | "400" | "hang" | "dims768" | "slow";
 export const DIGEST = "790764642607" + "b".repeat(52);
+/** The text the router's prober embeds to check an endpoint. */
+const CANARY = "cerebro embedder health check";
 
 /** Vectors are 1024 dims filled with `fill`, so a test can tell which Ollama answered. */
 export function fakeOllama(fill: number, dims = 1024) {
   const s = {
     mode: "ok" as OllamaMode,
     models: [{ name: "bge-m3:latest", digest: DIGEST }] as { name: string; digest: string }[],
-    embedCalls: 0, tagCalls: 0, aborted: 0,
+    /** Embed calls and their inputs, not counting the prober's canary (counted in canaryCalls). */
+    embedCalls: 0, canaryCalls: 0, tagCalls: 0, aborted: 0,
     /** "slow": answers after this long (a cold model load), unless the request is aborted first. */
     delayMs: 300,
     inputs: [] as string[][],
@@ -20,9 +23,9 @@ export function fakeOllama(fill: number, dims = 1024) {
       const path = new URL(req.url).pathname;
       if (path === "/api/tags") { s.tagCalls++; return Response.json({ models: s.models }); }
       if (path !== "/api/embed") return new Response("no", { status: 404 });
-      s.embedCalls++;
       const body = (await req.json()) as { input: string[]; keep_alive?: unknown };
-      s.inputs.push(body.input);
+      if (body.input.length === 1 && body.input[0] === CANARY) s.canaryCalls++;
+      else { s.embedCalls++; s.inputs.push(body.input); }
       s.keepAlive.push(body.keep_alive);
       s.started.resolve();
       if (s.mode === "hang") {

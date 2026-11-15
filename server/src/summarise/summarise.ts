@@ -133,7 +133,7 @@ export async function embedSummary(sql: SQL, embedder: Embedder, id: unknown, te
         where sm.id = ${id}`.catch(() => []);
       machine = row?.name ?? null;
     }
-    embedder = embedderFor(embedder, machine ?? null);
+    embedder = embedderFor(embedder, machine ?? null, { storing: true });
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

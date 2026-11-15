@@ -2,8 +2,11 @@ export interface Embedder {
   dims: number;
   /** Embeds texts in order. `signal` lets a caller (e.g. a search timeout) cancel the request. */
   embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
-  /** EMBED_MACHINE_URLS routing: the embedder for work that belongs to `machine` (absent: this one serves all). */
-  forMachine?(machine: string | null): Embedder;
+  /**
+   * EMBED_MACHINE_URLS routing: the embedder for work that belongs to `machine` (absent: this one serves all).
+   * `storing`: the vectors will be stored, so a Mac's digest is re-confirmed after it made them.
+   */
+  forMachine?(machine: string | null, opts?: { storing?: boolean }): Embedder;
   /** The mapped machines' own endpoints, one worker lane each (absent or empty: one lane, this embedder). */
   lanes?(): EmbedLane[];
   /** Per-endpoint state for /v1/status. */
@@ -11,10 +14,11 @@ export interface Embedder {
 }
 
 /** The embedder for `machine`'s work: its own endpoint when routed, else `e` itself. */
-export const embedderFor = (e: Embedder, machine: string | null): Embedder => e.forMachine?.(machine) ?? e;
+export const embedderFor = (e: Embedder, machine: string | null, opts?: { storing?: boolean }): Embedder =>
+  e.forMachine?.(machine, opts) ?? e;
 
-/** unset: no endpoint configured; unknown: not tried since the server started. */
-export type EndpointState = "unset" | "unknown" | "up" | "down" | "digest_mismatch";
+/** unknown: not probed yet since the server started. */
+export type EndpointState = "unknown" | "up" | "down" | "digest_mismatch";
 
 export interface EndpointStatus {
   machine: string | null;
@@ -25,9 +29,12 @@ export interface EndpointStatus {
   lastUsedAt: string | null;
 }
 
+/** The Zima's own bge-m3 against EMBED_MODEL_DIGEST: no Mac is used unless it is `ok`. */
+export type FallbackState = "unchecked" | "ok" | "digest_mismatch" | "unreachable";
+
 export interface EmbedStatus {
   endpoints: EndpointStatus[];
-  fallback: { url: string; lastUsedAt: string | null };
+  fallback: { url: string; lastUsedAt: string | null; state: FallbackState; lastError: string | null };
 }
 
 /**
@@ -37,7 +44,10 @@ export interface EmbedStatus {
 export interface EmbedLane {
   machine: string;
   embedder: Embedder;
+  /** Not usable now (not up, or the Zima's digest unconfirmed): the lane doesn't claim. */
   blocked(): boolean;
+  /** Down or mismatched: the Zima lane may take this machine's waiting chunks. */
+  waiting(): boolean;
 }
 
 /**

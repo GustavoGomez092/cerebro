@@ -41,6 +41,16 @@ export async function buildServer(env: Record<string, string | undefined>, opts:
   );
   if (applied.length) console.log(JSON.stringify({ level: "info", msg: "migrations applied", applied }));
   await checkEmbedSettings(sql, config.embedModel, config.embedDims);
+  // A mapped name with no live machine token (a typo, a revoked Mac) leaves that Mac's work on the Zima CPU.
+  const mapped = Object.keys(config.embedMachineUrls);
+  if (mapped.length) {
+    const live = new Set((await sql`select name from machines where revoked_at is null`).map((r: any) => r.name));
+    for (const name of mapped.filter((m) => !live.has(m))) {
+      console.log(JSON.stringify({ level: "warn", msg: "EMBED_MACHINE_URLS names no machine with a live token; check the name", machine: name }));
+    }
+  }
+  // Confirms the Zima's bge-m3 against EMBED_MODEL_DIGEST before any Mac is used, then probes the Macs in the background.
+  await embedder.start();
   const gate = new EmbedGate();
   const workerState = newWorkerState();
   const { enabled, share, windowTokens } = config.summariser;
@@ -67,6 +77,7 @@ if (import.meta.main) {
       server.stop();
       await summariser?.stop(); // waits for the job in progress
       await worker.stop();
+      embedder.stop();
       await sql.close();
       process.exit(0);
     };

@@ -13,14 +13,19 @@ export function ollamaEmbedder(
   return {
     dims,
     async embed(texts, signal) {
-      const signals = [AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])];
+      // One controller and a timer cleared on every path (no AbortSignal.timeout/any left behind per call).
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(new DOMException("embedder timeout", "TimeoutError")), timeoutMs);
+      const follow = () => ctrl.abort(signal!.reason);
+      if (signal?.aborted) follow();
+      else signal?.addEventListener("abort", follow, { once: true });
       let embeddings: unknown;
       try {
         const res = await fetchFn(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model, input: texts, keep_alive: keepAlive }),
-          signal: AbortSignal.any(signals),
+          signal: ctrl.signal,
         });
         if (!res.ok) {
           // 404 (model missing), 500 (out of memory, crashed runner), 502–504 (overloaded/restarting):
@@ -38,6 +43,9 @@ export function ollamaEmbedder(
         throw new EmbedderError(`embedder ${aborted ? "timed out or was cancelled" : "unavailable"}: ${err?.message ?? e}`, {
           transient: !aborted && err instanceof TypeError,
         });
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", follow);
       }
       if (!Array.isArray(embeddings) || embeddings.length !== texts.length) throw new EmbedderError("embedder returned the wrong number of vectors");
       for (const v of embeddings) {

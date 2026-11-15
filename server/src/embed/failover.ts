@@ -1,17 +1,27 @@
 import {
-  EmbedderError, type Embedder, type EmbedLane, type EmbedStatus, type EndpointState, type EndpointStatus,
+  EmbedderError, type Embedder, type EmbedLane, type EmbedStatus, type EndpointState, type EndpointStatus, type FallbackState,
 } from "./embedder";
 import { ollamaEmbedder } from "./ollama";
 
-/** How long a failed or mismatched endpoint is skipped before the next call probes it again. */
+/** How long a failed or mismatched endpoint is skipped before a background probe tries it again. */
 export const PRIMARY_DOWN_MS = 60_000;
+/** While an endpoint is up, its model digest is re-read this often (a cheap GET /api/tags), as is the Zima's. */
+export const DIGEST_RECHECK_MS = 5 * 60_000;
+/** While the Zima's digest is unconfirmed (unreachable, mismatched), it is re-read this often. */
+const FALLBACK_RETRY_MS = 30_000;
+/** How often the background prober looks for due probes. */
+const PROBE_TICK_MS = 5_000;
+/** GET /api/tags budget. */
+const TAGS_TIMEOUT_MS = 2_000;
+/** A probe's embed: known text, so a failure is the endpoint's and not a chunk's. */
+const CANARY = "cerebro embedder health check";
 
 /**
- * A machine endpoint's budget (connect + response) for one call. A Mac mini (M4 Pro, Metal) answers a query in
- * ~0.02 s and embeds ~16 chunks/s (~25,000 chars/s); 2 s covers LAN jitter and a busy GPU but keeps a sleeping
- * Mac (no ARP reply, so the connect hangs instead of being refused) from stalling a search for long: the
- * query-embed budget is QUERY_EMBED_TIMEOUT_MS (6 s), which leaves the fallback ~4 s. Bulk calls add 0.4 ms
- * per char (2,500 chars/s, a tenth of the measured rate), so a 1,600-char chunk gets ~2.6 s; capped at 60 s.
+ * How long a caller that can fall back (a search query, a summary) waits for a Mac before it uses the Zima. A Mac
+ * mini (M4 Pro, Metal) answers a query in ~0.02 s warm and ~1.6 s cold (model reload); 2 s covers both and LAN
+ * jitter while leaving ~4 s of the search's 6 s QUERY_EMBED_TIMEOUT_MS for the Zima (~0.45 s idle). Queries never
+ * wait on a probe: probes run in the background. Longer texts add 0.4 ms per char (2,500 chars/s, a tenth of the
+ * Mac's measured ~25,000); capped at 60 s.
  */
 export const PRIMARY_BASE_MS = 2000;
 const PRIMARY_MS_PER_CHAR = 0.4;
@@ -22,10 +32,10 @@ export function primaryBudgetMs(texts: string[]): number {
 }
 
 /**
- * How long an endpoint may take before it counts as down. A Mac's Ollama that unloaded bge-m3 reloads it on the
- * next call (1.6 s measured, ~2 s budgeted); a query that can't wait falls back after primaryBudgetMs while the
- * request carries on, so the load completes and the endpoint stays up. 15 s (plus the per-char allowance) covers
- * a cold load on a busy Mac; a sleeping Mac (the connect hangs) is marked down when it runs out.
+ * How long an endpoint may take before it counts as down. A query that can't wait falls back after
+ * primaryBudgetMs while the request carries on, so a cold load completes and the endpoint stays up. 15 s (plus the
+ * per-char allowance) covers a cold load on a busy Mac; a sleeping Mac (the connect hangs) is marked down when it
+ * runs out. Worker lanes and probes, which never fall back, wait this long.
  */
 export const PRIMARY_GRACE_MS = 15_000;
 export function primaryGraceMs(texts: string[]): number {
@@ -52,27 +62,57 @@ function displayUrl(url: string): string {
   }
 }
 
-const cancelled = () => new EmbedderError("embedder timed out or was cancelled: aborted");
+/**
+ * A deadline as an AbortSignal that also follows `parent`, with a timer this code owns and clears (no
+ * AbortSignal.timeout / AbortSignal.any per call: thousands of those would linger during a backlog).
+ */
+function deadline(ms: number, parent?: AbortSignal) {
+  const ctrl = new AbortController();
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; ctrl.abort(new DOMException("deadline", "TimeoutError")); }, ms);
+  const follow = () => ctrl.abort(parent!.reason);
+  if (parent?.aborted) follow();
+  else parent?.addEventListener("abort", follow, { once: true });
+  return {
+    signal: ctrl.signal,
+    get expired() { return expired; },
+    done() { clearTimeout(timer); parent?.removeEventListener("abort", follow); },
+  };
+}
 
-/** Rejects as soon as `signal` aborts (the shared work keeps going for the other callers). */
-function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return p;
-  if (signal.aborted) return Promise.reject(cancelled());
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(cancelled());
-    signal.addEventListener("abort", onAbort, { once: true });
-    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
-  });
+type DigestCheck = { ok: true } | { ok: false; mismatch: boolean; error: string };
+
+/** GET /api/tags and compare `model` (or `model:latest`)'s digest with the expected prefix. */
+async function checkTags(url: string, model: string, want: string, fetchFn: typeof fetch): Promise<DigestCheck> {
+  const d = deadline(TAGS_TIMEOUT_MS);
+  let models: { name?: unknown; digest?: unknown }[];
+  try {
+    const res = await fetchFn(`${url.replace(/\/+$/, "")}/api/tags`, { signal: d.signal });
+    if (!res.ok) throw new Error(`tags returned ${res.status}`);
+    const body = (await res.json()) as { models?: unknown };
+    if (!Array.isArray(body.models)) throw new Error("tags returned no model list");
+    models = body.models;
+  } catch (e) {
+    return { ok: false, mismatch: false, error: `digest check failed: ${(e as Error)?.message ?? e}` };
+  } finally {
+    d.done();
+  }
+  const m = models.find((x) => x?.name === model || x?.name === `${model}:latest`);
+  const got = typeof m?.digest === "string" ? m.digest.toLowerCase().replace(/^sha256:/, "") : null;
+  if (!got) return { ok: false, mismatch: true, error: `model ${model} not found` };
+  if (!got.startsWith(want)) {
+    return { ok: false, mismatch: true, error: `model ${model} digest ${got.slice(0, 12)} does not match EMBED_MODEL_DIGEST ${want.slice(0, 12)}` };
+  }
+  return { ok: true };
 }
 
 export interface EndpointOptions {
   url: string;
-  /** The machine-token name this endpoint belongs to (null: a single primary). */
-  machine?: string | null;
+  machine: string;
   model: string;
   dims: number;
-  /** EMBED_MODEL_DIGEST (12-hex prefix or full sha256): checked before use. */
-  digest?: string | null;
+  /** EMBED_MODEL_DIGEST (12-hex prefix or full sha256, lower case). */
+  digest: string;
   now?: () => number;
   log?: (line: string) => void;
   /** How long a caller that can fall back waits before it does (tests shorten it). */
@@ -83,13 +123,14 @@ export interface EndpointOptions {
 }
 
 /**
- * One Ollama that is tried before the fallback, with its own state: a call that fails for a reason of the
- * endpoint's own (unreachable, 5xx/404, over its budget, a malformed answer such as the wrong dims) marks it down
- * for PRIMARY_DOWN_MS; the next call after that probes it again. With a digest, the model is checked (GET
- * /api/tags) before first use and on every probe after it was down: a mismatch or a missing model keeps it out.
+ * One machine's Ollama, tried before the Zima for that machine's work. It is used only while `up`; it becomes up
+ * through a background probe (its digest, then a canary embed), never from a caller's request. A request that
+ * fails for a reason of the endpoint's own (unreachable, 5xx/404, no answer within its grace, a malformed answer
+ * such as the wrong dims) marks it down for PRIMARY_DOWN_MS; the prober tries it again after that. While up, its
+ * digest is re-read every DIGEST_RECHECK_MS, and after every embed whose vectors will be stored.
  */
 export class Endpoint {
-  readonly machine: string | null;
+  readonly machine: string;
   readonly url: string;
   private readonly o: EndpointOptions;
   private readonly ollama: Embedder;
@@ -97,37 +138,30 @@ export class Endpoint {
   private readonly log: (line: string) => void;
   private readonly budget: (texts: string[]) => number;
   private readonly grace: (texts: string[]) => number;
-  /** A call that outran its budget is still out (maybe loading the model): fallback-capable callers skip ahead. */
-  private slowPending = 0;
-  private readonly digest: string | null;
   private state: EndpointState = "unknown";
   private lastError: string | null = null;
   private downUntil = 0;
+  private verifiedAt = 0;
   private lastUsedAt: string | null = null;
-  private verified: boolean;
-  private checking: Promise<boolean> | null = null;
+  private probing: Promise<void> | null = null;
+  /** A call that outran its budget is still out (maybe loading the model): fallback-capable callers skip ahead. */
+  private slowPending = 0;
 
   constructor(o: EndpointOptions) {
     this.o = o;
-    this.machine = o.machine ?? null;
+    this.machine = o.machine;
     this.url = displayUrl(o.url);
     this.now = o.now ?? Date.now;
     this.log = o.log ?? ((l: string) => console.log(l));
     this.budget = o.primaryBudgetMs ?? primaryBudgetMs;
     this.grace = o.primaryGraceMs ?? primaryGraceMs;
-    this.digest = o.digest ?? null;
-    this.verified = !this.digest;
     this.ollama = ollamaEmbedder(o.url, o.model, o.dims, o.fetchFn ?? fetch, PRIMARY_MAX_MS, MACHINE_KEEP_ALIVE);
   }
 
-  /** Sitting out a down or mismatch window: not to be tried yet. */
-  blocked(): boolean {
-    return (this.state === "down" || this.state === "digest_mismatch") && this.now() < this.downUntil;
-  }
-
+  get isUp(): boolean { return this.state === "up"; }
+  /** Down or mismatched: its work waits (chunks) or uses the Zima (queries, summaries). */
+  get isOut(): boolean { return this.state === "down" || this.state === "digest_mismatch"; }
   get lastFailure(): string | null { return this.lastError; }
-
-  /** How long a caller that can fall back waits for this endpoint. */
   budgetFor(texts: string[]): number { return this.budget(texts); }
 
   private setDown(next: "down" | "digest_mismatch", error: string) {
@@ -135,88 +169,93 @@ export class Endpoint {
       this.log(JSON.stringify({
         level: "warn",
         msg: next === "down"
-          ? "machine embedder unavailable; its work waits or uses the fallback"
-          : "machine embedder model digest mismatch; its work waits or uses the fallback",
+          ? "machine embedder unavailable; its work waits or uses the Zima"
+          : "machine embedder model digest mismatch; its work waits or uses the Zima",
         machine: this.machine, url: this.url, error,
       }));
     }
     this.state = next;
     this.lastError = error;
     this.downUntil = this.now() + PRIMARY_DOWN_MS;
-    this.verified = !this.digest;
   }
 
   private setUp() {
-    if (this.state === "down" || this.state === "digest_mismatch") {
-      this.log(JSON.stringify({ level: "info", msg: "machine embedder back", machine: this.machine, url: this.url }));
-    }
+    if (this.state !== "up") this.log(JSON.stringify({ level: "info", msg: "machine embedder up", machine: this.machine, url: this.url }));
     this.state = "up";
     this.lastError = null;
   }
 
-  /** GET /api/tags: true when the model is there with the expected digest. */
-  private async checkDigest(): Promise<boolean> {
-    const { model } = this.o;
-    let models: { name?: unknown; digest?: unknown }[];
-    try {
-      const res = await (this.o.fetchFn ?? fetch)(`${this.o.url.replace(/\/+$/, "")}/api/tags`, { signal: AbortSignal.timeout(PRIMARY_BASE_MS) });
-      if (!res.ok) throw new Error(`tags returned ${res.status}`);
-      const body = (await res.json()) as { models?: unknown };
-      if (!Array.isArray(body.models)) throw new Error("tags returned no model list");
-      models = body.models;
-    } catch (e) {
-      this.setDown("down", `digest check failed: ${(e as Error)?.message ?? e}`);
+  /** Reads the digest now. False (and out) on a mismatch, a missing model or an unreachable /api/tags. */
+  private async verifyDigest(): Promise<boolean> {
+    const r = await checkTags(this.o.url, this.o.model, this.o.digest, this.o.fetchFn ?? fetch);
+    if (!r.ok) {
+      this.setDown(r.mismatch ? "digest_mismatch" : "down", r.error);
       return false;
     }
-    const m = models.find((x) => x?.name === model || x?.name === `${model}:latest`);
-    const got = typeof m?.digest === "string" ? m.digest.toLowerCase().replace(/^sha256:/, "") : null;
-    if (!got) {
-      this.setDown("digest_mismatch", `model ${model} not found`);
-      return false;
-    }
-    if (!got.startsWith(this.digest!)) {
-      this.setDown("digest_mismatch", `model ${model} digest ${got.slice(0, 12)} does not match EMBED_MODEL_DIGEST ${this.digest!.slice(0, 12)}`);
-      return false;
-    }
-    this.verified = true;
+    this.verifiedAt = this.now();
     return true;
   }
 
-  /** Whether a call may try this endpoint now: not inside a down window, and its digest verified. */
-  private async usable(signal?: AbortSignal): Promise<boolean> {
-    if (this.blocked()) return false;
-    if (this.verified) return true;
-    this.checking ??= this.checkDigest().finally(() => { this.checking = null; });
-    return abortable(this.checking, signal);
+  /** Whether the prober should look at this endpoint now. */
+  probeDue(): boolean {
+    if (this.state === "unknown") return true;
+    if (this.isOut) return this.now() >= this.downUntil;
+    return this.now() - this.verifiedAt >= DIGEST_RECHECK_MS;
+  }
+
+  /** Digest, then (unless already up) a canary embed: brings the endpoint up, or keeps it out. Concurrent calls share one. */
+  probe(): Promise<void> {
+    this.probing ??= (async () => {
+      if (!(await this.verifyDigest())) return;
+      if (this.state === "up") return; // a periodic re-check
+      const d = deadline(this.grace([CANARY]));
+      try {
+        await this.ollama.embed([CANARY], d.signal);
+        this.setUp();
+      } catch (e) {
+        this.setDown("down", d.expired ? `no answer within ${this.grace([CANARY])} ms` : (e as Error).message);
+      } finally {
+        d.done();
+      }
+    })().finally(() => { this.probing = null; });
+    return this.probing;
   }
 
   /**
-   * Embeds here. Null when the endpoint is not usable or failed (it is then down for PRIMARY_DOWN_MS), or, with
-   * `fallbackAfterMs`, when it hasn't answered by then: the request carries on (a cold model load finishes and
-   * the endpoint stays up) and only marks the endpoint down if it fails or outlasts its grace. The caller's abort
-   * and a bad-input answer (an error status other than 404/5xx) are thrown: neither says the endpoint is broken,
-   * and the fallback would refuse bad input too.
+   * Embeds here if the endpoint is up. Null when it isn't, when it failed (it is then down), or, with
+   * `fallbackAfterMs`, when it hasn't answered by then: the request carries on (a cold load finishes and the
+   * endpoint stays up) and marks it down only if it fails, outlasts its grace, or its caller gives up first. With
+   * `confirmDigest`, the digest is re-read after the embed and the vectors are dropped if it changed. The caller's
+   * abort and a bad-input answer (an error status other than 404/5xx) are thrown: neither says the endpoint is
+   * broken, and the Zima would refuse bad input too.
    */
-  async tryEmbed(texts: string[], signal?: AbortSignal, opts: { fallbackAfterMs?: number } = {}): Promise<number[][] | null> {
+  async tryEmbed(texts: string[], signal?: AbortSignal, opts: { fallbackAfterMs?: number; confirmDigest?: boolean } = {}): Promise<number[][] | null> {
     const canFallBack = opts.fallbackAfterMs !== undefined;
-    if (canFallBack && this.slowPending > 0) return null;
-    if (!(await this.usable(signal))) return null;
+    if (!this.isUp || (canFallBack && this.slowPending > 0)) return null;
     const graceMs = this.grace(texts);
-    const deadline = AbortSignal.timeout(graceMs);
-    const settled = this.ollama.embed(texts, signal ? AbortSignal.any([signal, deadline]) : deadline).then(
-      (v) => {
+    const d = deadline(graceMs, signal);
+    let wentSlow = false;
+    const settled = this.ollama.embed(texts, d.signal).then(
+      async (v) => {
+        d.done();
         this.setUp();
+        if (opts.confirmDigest && !(await this.verifyDigest())) return null;
         this.lastUsedAt = new Date(this.now()).toISOString();
         return v;
       },
       (e) => {
-        if (signal?.aborted) throw e;
+        d.done();
+        if (signal?.aborted) {
+          // A search that gave up after falling back from this Mac: treat the Mac as down so the next one doesn't wait.
+          if (wentSlow) this.setDown("down", `no answer within ${opts.fallbackAfterMs} ms before the caller gave up`);
+          throw e;
+        }
         const err = e as EmbedderError;
-        if (!deadline.aborted && !err.transient && err.status !== undefined) {
+        if (!d.expired && !err.transient && err.status !== undefined) {
           this.setUp(); // it answered
           throw e;
         }
-        this.setDown("down", deadline.aborted ? `no answer within ${graceMs} ms` : err.message);
+        this.setDown("down", d.expired ? `no answer within ${graceMs} ms` : err.message);
         return null;
       },
     );
@@ -226,132 +265,153 @@ export class Endpoint {
     const first = await Promise.race([settled, new Promise<typeof slow>((r) => { timer = setTimeout(() => r(slow), opts.fallbackAfterMs); })])
       .finally(() => clearTimeout(timer));
     if (first !== slow) return first;
+    wentSlow = true;
     this.slowPending++;
     settled.catch(() => {}).finally(() => { this.slowPending--; });
     return null;
   }
 
   status(): EndpointStatus {
-    const out = this.blocked() || this.state === "down" || this.state === "digest_mismatch";
     return {
       machine: this.machine, url: this.url, state: this.state, lastError: this.lastError,
-      downUntil: out ? new Date(this.downUntil).toISOString() : null, lastUsedAt: this.lastUsedAt,
+      downUntil: this.isOut ? new Date(this.downUntil).toISOString() : null, lastUsedAt: this.lastUsedAt,
     };
   }
 }
 
-/** The fallback (EMBED_URL, the Zima's own Ollama), remembering when it last embedded. */
-function trackedFallback(url: string, model: string, dims: number, now: () => number, fetchFn: typeof fetch) {
-  const inner = ollamaEmbedder(url, model, dims, fetchFn);
-  const t = {
-    url: displayUrl(url),
-    lastUsedAt: null as string | null,
-    embedder: {
-      dims,
-      async embed(texts: string[], signal?: AbortSignal) {
-        const v = await inner.embed(texts, signal);
-        t.lastUsedAt = new Date(now()).toISOString();
-        return v;
-      },
-    } as Embedder,
-  };
-  return t;
-}
-
-/** The endpoint first, then the fallback in the same call when the endpoint is not usable or fails. */
-function withFallback(endpoint: Endpoint, fallback: Embedder, used: (which: "primary" | "fallback") => void): Embedder {
-  return {
-    dims: fallback.dims,
-    async embed(texts, signal) {
-      const v = await endpoint.tryEmbed(texts, signal, { fallbackAfterMs: endpoint.budgetFor(texts) });
-      if (v) { used("primary"); return v; }
-      const fb = await fallback.embed(texts, signal);
-      used("fallback");
-      return fb;
-    },
-  };
-}
-
-/** A single primary in front of a fallback, as used per machine by the router (and testable on its own). */
-export interface EmbedRouting {
-  primary: { url: string | null; state: EndpointState; lastError: string | null; downUntil: string | null };
-  fallback: { url: string };
-  lastUsed: "primary" | "fallback" | null;
-}
-
-export interface FailoverOptions extends Omit<EndpointOptions, "url" | "machine"> {
-  /** Tried first; null means the fallback alone. */
-  primaryUrl: string | null;
-  fallbackUrl: string;
-}
-
-/**
- * Embeds on the primary Ollama when it is reachable (and serves the expected model), else on the fallback.
- * A primary failure of its own is retried on the fallback in the same call; a bad-input answer (4xx) is
- * surfaced, not retried. The caller's signal cancels whichever request is in flight.
- */
-export function failoverEmbedder(o: FailoverOptions): Embedder & { routing(): EmbedRouting } {
-  const now = o.now ?? Date.now;
-  const fb = trackedFallback(o.fallbackUrl, o.model, o.dims, now, o.fetchFn ?? fetch);
-  const endpoint = o.primaryUrl ? new Endpoint({ ...o, url: o.primaryUrl, now }) : null;
-  let lastUsed: EmbedRouting["lastUsed"] = null;
-  const inner = endpoint ? withFallback(endpoint, fb.embedder, (w) => { lastUsed = w; }) : fb.embedder;
-  return {
-    dims: o.dims,
-    async embed(texts, signal) {
-      const v = await inner.embed(texts, signal);
-      if (!endpoint) lastUsed = "fallback";
-      return v;
-    },
-    routing() {
-      const s = endpoint?.status();
-      return {
-        primary: s ? { url: s.url, state: s.state, lastError: s.lastError, downUntil: s.downUntil }
-          : { url: null, state: "unset", lastError: null, downUntil: null },
-        fallback: { url: fb.url },
-        lastUsed,
-      };
-    },
-  };
-}
-
-export interface RouterOptions extends Omit<EndpointOptions, "url" | "machine"> {
+export interface RouterOptions {
   /** EMBED_MACHINE_URLS: machine-token name → that machine's Ollama. */
   machineUrls: Record<string, string>;
   /** EMBED_URL: the Zima's own Ollama, for unmapped machines and whenever a machine's endpoint can't serve. */
   fallbackUrl: string;
+  model: string;
+  dims: number;
+  /** EMBED_MODEL_DIGEST; required with any machine endpoint. */
+  digest?: string | null;
+  now?: () => number;
+  log?: (line: string) => void;
+  primaryBudgetMs?: (texts: string[]) => number;
+  primaryGraceMs?: (texts: string[]) => number;
+  fetchFn?: typeof fetch;
 }
+
+export type EmbedRouter = Embedder & Required<Pick<Embedder, "forMachine" | "lanes" | "status">> & {
+  /** Checks the Zima's digest, probes every endpoint now, and keeps probing in the background. */
+  start(): Promise<void>;
+  /** One prober pass: whatever is due (tests drive the clock and call this). */
+  probeNow(): Promise<void>;
+  stop(): void;
+};
 
 /**
  * Each machine embeds its own work: `forMachine(name)` is that machine's endpoint with the Zima as fallback
  * (queries and summaries), `lanes()` its endpoint alone (the worker, which leaves a down machine's chunks to wait).
- * Unmapped machines, and `embed` itself, use the Zima. An empty map behaves exactly like the Zima's Ollama alone.
+ * Unmapped machines, and `embed` itself, use the Zima. A Mac is used only while it is up and the Zima's own bge-m3
+ * matches EMBED_MODEL_DIGEST, so vectors from two models never meet in one index. An empty map behaves exactly
+ * like the Zima's Ollama alone.
  */
-export function createEmbedRouter(o: RouterOptions): Embedder & Required<Pick<Embedder, "forMachine" | "lanes" | "status">> {
+export function createEmbedRouter(o: RouterOptions): EmbedRouter {
   const now = o.now ?? Date.now;
-  const fb = trackedFallback(o.fallbackUrl, o.model, o.dims, now, o.fetchFn ?? fetch);
-  const endpoints = new Map(Object.entries(o.machineUrls).map(([machine, url]) => [machine, new Endpoint({ ...o, url, machine, now })]));
-  const routed = new Map([...endpoints].map(([m, ep]) => [m, withFallback(ep, fb.embedder, () => {})]));
+  const log = o.log ?? ((l: string) => console.log(l));
+  const fetchFn = o.fetchFn ?? fetch;
+  const names = Object.keys(o.machineUrls);
+  if (names.length && !o.digest) throw new Error("a digest (EMBED_MODEL_DIGEST) is required with machine endpoints");
+  const digest = o.digest ?? "";
+
+  const zima = ollamaEmbedder(o.fallbackUrl, o.model, o.dims, fetchFn);
+  const fb = {
+    url: displayUrl(o.fallbackUrl),
+    lastUsedAt: null as string | null,
+    state: (names.length ? "unchecked" : "ok") as FallbackState,
+    lastError: null as string | null,
+    checkedAt: -Infinity,
+  };
+  const fallback: Embedder = {
+    dims: o.dims,
+    async embed(texts, signal) {
+      const v = await zima.embed(texts, signal);
+      fb.lastUsedAt = new Date(now()).toISOString();
+      return v;
+    },
+  };
+  const checkFallback = async () => {
+    const r = await checkTags(o.fallbackUrl, o.model, digest, fetchFn);
+    const next: FallbackState = r.ok ? "ok" : r.mismatch ? "digest_mismatch" : "unreachable";
+    if (next !== fb.state && next !== "ok") {
+      log(JSON.stringify({
+        level: "warn", msg: "the Zima's bge-m3 can't be confirmed against EMBED_MODEL_DIGEST; no Mac is used until it is",
+        fallback: fb.url, error: r.ok ? null : r.error,
+      }));
+    }
+    fb.state = next;
+    fb.lastError = r.ok ? null : r.error;
+    fb.checkedAt = now();
+  };
+  const fallbackOk = () => fb.state === "ok";
+
+  const endpoints = new Map(names.map((machine) => [machine, new Endpoint({
+    url: o.machineUrls[machine], machine, model: o.model, dims: o.dims, digest, now, log,
+    primaryBudgetMs: o.primaryBudgetMs, primaryGraceMs: o.primaryGraceMs, fetchFn,
+  })]));
+  const usable = (ep: Endpoint) => ep.isUp && fallbackOk();
+
+  /** The endpoint first, then the Zima in the same call when the endpoint is not usable or fails. */
+  const routed = (ep: Endpoint, storing: boolean): Embedder => ({
+    dims: o.dims,
+    async embed(texts, signal) {
+      if (usable(ep)) {
+        const v = await ep.tryEmbed(texts, signal, { fallbackAfterMs: ep.budgetFor(texts), confirmDigest: storing });
+        if (v) return v;
+      }
+      return fallback.embed(texts, signal);
+    },
+  });
+  const query = new Map([...endpoints].map(([m, ep]) => [m, routed(ep, false)]));
+  const store = new Map([...endpoints].map(([m, ep]) => [m, routed(ep, true)]));
+
   const lanes: EmbedLane[] = [...endpoints].map(([machine, ep]) => ({
     machine,
-    blocked: () => ep.blocked(),
+    blocked: () => !usable(ep),
+    waiting: () => ep.isOut || fb.state === "digest_mismatch",
     embedder: {
       dims: o.dims,
       async embed(texts, signal) {
-        const v = await ep.tryEmbed(texts, signal);
-        if (!v) throw new EmbedderError(`${machine}'s embedder unavailable: ${ep.lastFailure ?? "down"}`, { transient: true });
+        const v = usable(ep) ? await ep.tryEmbed(texts, signal, { confirmDigest: true }) : null;
+        if (!v) throw new EmbedderError(`${machine}'s embedder unavailable: ${ep.lastFailure ?? "not up"}`, { transient: true });
         return v;
       },
     },
   }));
+
+  let ticking: Promise<void> | null = null;
+  const probeNow = () => {
+    ticking ??= (async () => {
+      if (!names.length) return;
+      const due = now() - fb.checkedAt >= (fallbackOk() ? DIGEST_RECHECK_MS : FALLBACK_RETRY_MS);
+      if (due) await checkFallback();
+      await Promise.all([...endpoints.values()].filter((ep) => ep.probeDue()).map((ep) => ep.probe()));
+    })().finally(() => { ticking = null; });
+    return ticking;
+  };
+  let interval: ReturnType<typeof setInterval> | undefined;
+
   return {
     dims: o.dims,
-    embed: (texts, signal) => fb.embedder.embed(texts, signal),
-    forMachine: (machine) => (machine !== null && routed.get(machine)) || fb.embedder,
+    embed: (texts, signal) => fallback.embed(texts, signal),
+    forMachine: (machine, opts) => (machine !== null && (opts?.storing ? store : query).get(machine)) || fallback,
     lanes: () => lanes,
     status: (): EmbedStatus => ({
       endpoints: [...endpoints.values()].map((ep) => ep.status()),
-      fallback: { url: fb.url, lastUsedAt: fb.lastUsedAt },
+      fallback: { url: fb.url, lastUsedAt: fb.lastUsedAt, state: fb.state, lastError: fb.lastError },
     }),
+    probeNow,
+    async start() {
+      if (!names.length) return;
+      await checkFallback(); // at startup, before any Mac is used
+      void probeNow().catch(() => {});
+      interval ??= setInterval(() => { void probeNow().catch(() => {}); }, PROBE_TICK_MS);
+      (interval as any).unref?.();
+    },
+    stop() { clearInterval(interval); interval = undefined; },
   };
 }
