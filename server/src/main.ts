@@ -1,7 +1,9 @@
 import { loadConfig } from "./config";
 import { checkEmbedSettings, connect, migrate } from "./db";
 import { createEmbedRouter } from "./embed/failover";
-import { createApp } from "./http/app";
+import { createApp, type ChatDeps } from "./http/app";
+import { Metrics } from "./metrics";
+import { ChatRuns } from "./chat/runs";
 import { EmbedGate, newWorkerState, startEmbedWorker } from "./worker";
 import { newSummariserState, startSummariser } from "./summarise/loop";
 
@@ -55,17 +57,23 @@ export async function buildServer(env: Record<string, string | undefined>, opts:
   const workerState = newWorkerState();
   const { enabled, share, windowTokens } = config.summariser;
   const summariser = { state: newSummariserState(enabled), budget: { share, windowTokens } };
+  const metrics = new Metrics();
+  // The chat's CLI runs in this container and reaches this server's /mcp/chat on loopback.
+  const chat: ChatDeps = {
+    runs: new ChatRuns(config.chat.maxConcurrent), model: config.chat.model, timeoutMs: config.chat.timeoutMs,
+    mcpUrl: `http://127.0.0.1:${config.port}/mcp/chat`, env: { ...env, SUMMARISER_CMD: config.summariser.cmd },
+  };
   return {
-    config, sql, embedder, gate, workerState, summariserState: summariser.state,
-    app: createApp({ sql, embedder, gate, workerState, summariser }),
+    config, sql, embedder, gate, workerState, summariserState: summariser.state, metrics, chat,
+    app: createApp({ sql, embedder, gate, workerState, summariser, metrics, chat }),
   };
 }
 
 if (import.meta.main) {
   try {
-    const { config, sql, embedder, gate, workerState, summariserState, app } = await buildServer(process.env);
+    const { config, sql, embedder, gate, workerState, summariserState, metrics, app } = await buildServer(process.env);
     const server = Bun.serve({ port: config.port, fetch: app.fetch, maxRequestBodySize: 11 * 1024 * 1024, idleTimeout: 30 });
-    const worker = startEmbedWorker(sql, embedder, { state: workerState, gate });
+    const worker = startEmbedWorker(sql, embedder, { state: workerState, gate, onEmbedded: (n) => metrics.chunks.add(n) });
     const summariser = config.summariser.enabled
       ? startSummariser(sql, embedder, config.summariser, { state: summariserState })
       : null;

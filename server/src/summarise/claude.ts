@@ -109,8 +109,27 @@ function parseStructured(env: Record<string, unknown>): { value: unknown } | nul
   }
 }
 
+/** The CLI to run (SUMMARISER_CMD, default `claude`), split into words. The chat agent uses the same one. */
+export const claudeCommand = (env: Record<string, string | undefined>): string[] =>
+  (env.SUMMARISER_CMD ?? "claude").trim().split(/\s+/).filter(Boolean);
+
+/** Variables that would make the CLI bill an API account instead of the owner's subscription login. */
+export const API_KEY_VARS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"] as const;
+
+/**
+ * The environment for a `claude -p` child: subscription login only (API-key variables removed) and
+ * CEREBRO_HEADLESS=1, so a Cerebro client installed alongside never records the call.
+ */
+export function subscriptionEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const childEnv: Record<string, string | undefined> = { ...env, CEREBRO_HEADLESS: "1" };
+  for (const k of API_KEY_VARS) delete childEnv[k];
+  return childEnv;
+}
+
+export { classify as classifyClaudeError };
+
 export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = process.env): Promise<ClaudeRun> {
-  const cmd = (env.SUMMARISER_CMD ?? "claude").trim().split(/\s+/).filter(Boolean);
+  const cmd = claudeCommand(env);
   const args = [
     ...cmd,
     "-p",
@@ -123,8 +142,7 @@ export async function runClaude(input: ClaudeInput, env: NodeJS.ProcessEnv = pro
     "--no-session-persistence",
   ];
   // Subscription login only: an API key in the env would make the CLI bill the API instead.
-  const childEnv: Record<string, string | undefined> = { ...env, CEREBRO_HEADLESS: "1" };
-  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]) delete childEnv[k];
+  const childEnv = subscriptionEnv(env);
 
   if (input.signal?.aborted) return fail("timeout", "claude call aborted");
   let proc: ReturnType<typeof Bun.spawn>;

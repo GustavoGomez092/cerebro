@@ -10,7 +10,7 @@ import { Semaphore } from "../../semaphore";
 const envelope = z.object({ sessions: z.array(z.unknown()), events: z.array(z.unknown()) });
 const iso = z.string().datetime({ offset: true });
 
-export function ingestRoutes({ sql }: AppDeps) {
+export function ingestRoutes({ sql, metrics }: AppDeps) {
   const r = new Hono<Env>();
   // Keep big flushes from taking every pooled connection (search, auth and /health need some).
   const gate = new Semaphore(4);
@@ -19,7 +19,9 @@ export function ingestRoutes({ sql }: AppDeps) {
     if (b instanceof Response) return b;
     if (b.events.length > INGEST_LIMITS.maxEvents || b.sessions.length > INGEST_LIMITS.maxSessions)
       return c.json({ error: "batch_too_large", message: `at most ${INGEST_LIMITS.maxEvents} events and ${INGEST_LIMITS.maxSessions} sessions per batch` }, 413);
-    return c.json(await gate.run(() => ingestBatch(sql, c.get("machine"), b)));
+    const result = await gate.run(() => ingestBatch(sql, c.get("machine"), b));
+    metrics?.events.add(result.inserted);
+    return c.json(result);
   });
   r.post("/sessions/:id/end", async (c) => {
     const b = await parseBody(c, z.object({ endedAt: iso }));

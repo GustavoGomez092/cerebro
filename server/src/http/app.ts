@@ -13,8 +13,27 @@ import { ingestRoutes } from "./routes/ingest";
 import { searchRoutes } from "./routes/search";
 import { readRoutes } from "./routes/read";
 import { summaryRoutes } from "./routes/summaries";
+import { dashboardRoutes } from "./routes/dashboard";
+import { Metrics } from "../metrics";
+import { WEB_UI_MACHINE } from "../config";
+import { ChatRuns } from "../chat/runs";
+import { mcpRoutes } from "../chat/mcp";
+
+export interface ChatDeps {
+  runs: ChatRuns;
+  /** CHAT_MODEL. */
+  model: string;
+  timeoutMs: number;
+  /** This server's own /mcp/chat, as the CLI in the same container reaches it. */
+  mcpUrl: string;
+  /** A `ping` event this often while a run is quiet, so idle timeouts (Bun's 30 s here, the web app's) keep the stream. */
+  keepAliveMs?: number;
+  /** Environment for the CLI (SUMMARISER_CMD picks the binary); defaults to process.env. */
+  env?: Record<string, string | undefined>;
+}
 
 export const API_VERSION = 1;
+export { WEB_UI_MACHINE };
 const SMALL_BODY = 64 * 1024;
 
 export interface AppDeps {
@@ -24,12 +43,17 @@ export interface AppDeps {
   workerState?: WorkerState;
   /** The summariser's live state and budget, for /v1/status. */
   summariser?: { state: SummariserState; budget: { share: number; windowTokens: number } };
+  /** In-process counters for the dashboard, one per server (a fresh one when absent). */
+  metrics?: Metrics;
+  /** The dashboard's chat agent (absent: POST /v1/dashboard/chat answers 503). */
+  chat?: ChatDeps;
   /** Structured log sink (one JSON line per request); defaults to stdout. */
   log?: (line: string) => void;
 }
 export type Env = { Variables: { machine: Machine } };
 
-export function createApp(deps: AppDeps): Hono<Env> {
+export function createApp(input: AppDeps): Hono<Env> {
+  const deps = { ...input, metrics: input.metrics ?? new Metrics() };
   const log = deps.log ?? ((l: string) => console.log(l));
   const app = new Hono<Env>();
 
@@ -55,7 +79,16 @@ export function createApp(deps: AppDeps): Hono<Env> {
     }
   });
   app.use("/v1/*", bearerAuth(deps.sql));
+  // The dashboard reads every client: only the web-ui token may, and that token may do nothing else.
+  app.use("/v1/*", async (c, next) => {
+    const ui = c.get("machine").name === WEB_UI_MACHINE;
+    if (ui !== c.req.path.startsWith("/v1/dashboard/"))
+      return c.json({ error: "forbidden", message: ui ? "the web-ui token may only call /v1/dashboard" : "only the web-ui token may call /v1/dashboard" }, 403);
+    await next();
+  });
   for (const routes of [statusRoutes, catalogRoutes, bindingRoutes, ingestRoutes, searchRoutes, readRoutes, summaryRoutes]) app.route("/v1", routes(deps));
+  app.route("/v1/dashboard", dashboardRoutes(deps));
+  app.route("/mcp/chat", mcpRoutes(deps, deps.chat?.runs ?? new ChatRuns(0)));
 
   app.notFound((c) => c.json({ error: "not_found", message: "no such route" }, 404));
   app.onError((err, c) => {

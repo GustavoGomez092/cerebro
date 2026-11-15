@@ -65,6 +65,8 @@ export interface EmbedOptions {
   leaseSeconds?: number;
   maxAttempts?: number;
   route?: EmbedRoute;
+  /** Called with the number of chunks each committed batch stored (the dashboard's chunks per minute). */
+  onEmbedded?: (n: number) => void;
 }
 
 /**
@@ -127,6 +129,7 @@ export async function embedPending(sql: SQL, embedder: Embedder, opts: EmbedOpti
       await tx`delete from embed_queue where chunk_id = any(${tx.array(items.map((x) => x.chunk_id), "int8")})`;
     });
     result.embedded += items.length;
+    opts.onEmbedded?.(items.length);
     state.lastSuccessAt = new Date().toISOString();
     if (laneState) { laneState.lastSuccessAt = state.lastSuccessAt; laneState.lastError = null; }
     state.pauseMs = 0;
@@ -266,7 +269,9 @@ export async function requeueDead(sql: SQL): Promise<number> {
 }
 
 /** Runs each lane (see embedLanes) in its own loop, so a slow or stuck lane never holds up another; never throws. */
-export function startEmbedWorker(sql: SQL, embedder: Embedder, opts: { state: WorkerState; gate?: EmbedGate; idleMs?: number }) {
+export function startEmbedWorker(
+  sql: SQL, embedder: Embedder, opts: { state: WorkerState; gate?: EmbedGate; idleMs?: number; onEmbedded?: (n: number) => void },
+) {
   let stopped = false;
   const loops = embedLanes(sql, embedder, opts).map((lane) => {
     const loop = { current: Promise.resolve() as Promise<unknown>, timer: undefined as ReturnType<typeof setTimeout> | undefined };

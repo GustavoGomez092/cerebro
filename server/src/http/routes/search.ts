@@ -20,11 +20,12 @@ const schema = z.object({
   include: z.enum(["all", "summaries", "raw"]).optional(),
 }).refine((b) => !b.from || !b.to || Date.parse(b.from) <= Date.parse(b.to), { message: "from must not be after to" });
 
-export function searchRoutes({ sql, embedder, gate }: AppDeps) {
+export function searchRoutes({ sql, embedder, gate, metrics }: AppDeps) {
   const r = new Hono<Env>();
   r.post("/search", async (c) => {
     const b = await parseBody(c, schema);
     if (b instanceof Response) return b;
+    const done = metrics?.trackSearch(b.query, c.get("machine").name);
     try {
       // The query embeds on the asking machine's own Ollama (EMBED_MACHINE_URLS), else on the Zima.
       return c.json(await search(sql, embedderFor(embedder, c.get("machine").name), b, { gate }));
@@ -32,6 +33,8 @@ export function searchRoutes({ sql, embedder, gate }: AppDeps) {
       if (e instanceof ScopeError) return c.json({ error: "scope_required", message: e.message }, 400);
       if (e instanceof BindingError) return c.json({ error: "invalid_subpath", message: e.message }, 400);
       throw e;
+    } finally {
+      done?.();
     }
   });
   return r;

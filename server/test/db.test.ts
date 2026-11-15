@@ -81,6 +81,7 @@ test("loadConfig applies defaults and validates", () => {
   expect(loadConfig({ DATABASE_URL: "postgres://x" })).toEqual({
     databaseUrl: "postgres://x", port: 8790, embedUrl: null, embedMachineUrls: {}, embedModelDigest: null, embedModel: "bge-m3", embedDims: 1024,
     summariser: { enabled: true, share: 0.2, windowTokens: 2000000, cmd: "claude" },
+    chat: { model: "sonnet", timeoutMs: 300_000, maxConcurrent: 1 },
   });
   expect(() => loadConfig({})).toThrow(/DATABASE_URL/);
   expect(() => loadConfig({ DATABASE_URL: "x", PORT: "" })).not.toThrow();

@@ -12,7 +12,17 @@ export interface Config {
   embedModel: string;
   embedDims: number;
   summariser: { enabled: boolean; share: number; windowTokens: number; cmd: string };
+  /** The dashboard's chat agent: `claude -p` on the same subscription login as the summariser (SUMMARISER_CMD). */
+  chat: { model: string; timeoutMs: number; maxConcurrent: number };
 }
+
+/**
+ * The web dashboard's machine token (`token create web-ui`). It may call /v1/dashboard/* and nothing else, and no
+ * other token may call those (http/app.ts). It never uploads sessions and is never an embed lane (refused in
+ * EMBED_MACHINE_URLS below), so its searches embed on the Zima.
+ */
+export const WEB_UI_MACHINE = "web-ui";
+const WEB_UI = WEB_UI_MACHINE;
 
 function shareEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
   const raw = env[name];
@@ -42,7 +52,23 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return n;
 }
 
-const isHttpUrl = (raw: string) => {
+function rangeEnv(env: Record<string, string | undefined>, name: string, fallback: number, min: number, max: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  return n;
+}
+
+/** A model alias or id for `claude --model` (sonnet, opus, claude-sonnet-4-5…): one word, no flags. */
+function modelEnv(env: Record<string, string | undefined>, name: string, fallback: string): string {
+  const raw = (env[name] ?? "").trim();
+  if (raw === "") return fallback;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/.test(raw)) throw new Error(`${name} must be a model alias or id, such as sonnet`);
+  return raw;
+}
+
+const isHttpUrl =(raw: string) => {
   try {
     const u = new URL(raw);
     return ["http:", "https:"].includes(u.protocol) && !!u.hostname;
@@ -69,6 +95,7 @@ function machineUrlsEnv(env: Record<string, string | undefined>, name: string): 
     if (!machine || !url) throw new Error(`${name} must be machine=url pairs separated by commas`);
     if (!isHttpUrl(url)) throw new Error(`${name}: the URL for ${machine} must be an http(s) URL`);
     if (out.has(machine)) throw new Error(`${name} names ${machine} twice`);
+    if (machine === WEB_UI) throw new Error(`${name} may not name ${WEB_UI}: the dashboard's token is not a Mac and never embeds`);
     out.set(machine, url);
   }
   return Object.fromEntries(out);
@@ -104,6 +131,11 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       share: shareEnv(env, "SUMMARY_SHARE", 0.2),
       windowTokens: intEnv(env, "SUBSCRIPTION_TOKENS_PER_5H", 2000000),
       cmd: env.SUMMARISER_CMD || "claude",
+    },
+    chat: {
+      model: modelEnv(env, "CHAT_MODEL", "sonnet"),
+      timeoutMs: intEnv(env, "CHAT_TIMEOUT_MS", 300_000),
+      maxConcurrent: rangeEnv(env, "CHAT_MAX_CONCURRENT", 1, 1, 2),
     },
   };
 }
