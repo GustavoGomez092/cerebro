@@ -90,3 +90,29 @@ test("the browser bundle holds no server module, secret name or token", () => {
     expect(all).not.toContain(s);
   }
 });
+
+test("client-side navigation works over plain http: same-origin pages send a Referer the CSRF check accepts", async () => {
+  // Chrome sends no Sec-Fetch-Site to an http (not secure) origin and no Origin on a same-origin GET, so TanStack
+  // Start's CSRF check on server functions has only the Referer to go on; "no-referrer" made every one a 403.
+  const login = await get("/login");
+  expect(login.headers.get("referrer-policy")).toBe("same-origin");
+  expect(await login.text()).not.toContain(`content="no-referrer"`);
+
+  const signIn = await fetchApp(new Request(`${BASE}/api/auth/sign-in/email`, {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: BASE, "X-Forwarded-For": "10.1.1.3" },
+    body: JSON.stringify({ email: "owner@home.lab", password: "app-test-password-1234" }),
+  }));
+  expect(signIn.status).toBe(200);
+  const cookie = (signIn.headers.get("set-cookie") ?? "").split(";")[0];
+  const dir = join(WEB, "dist", "client", "assets");
+  const ids = readdirSync(dir).filter((f) => f.endsWith(".js"))
+    .flatMap((f) => [...readFileSync(join(dir, f), "utf8").matchAll(/\(`([0-9a-f]{64})`\)/g)].map((m) => m[1]));
+  expect(ids.length).toBeGreaterThan(0);
+  // What the browser sends for a GET server function under "same-origin": the cookie and the page as Referer.
+  const statuses = await Promise.all(ids.map(async (id) =>
+    (await fetchApp(new Request(`${BASE}/_serverFn/${id}`, { headers: { cookie, Referer: `${BASE}/clients` } }))).status));
+  expect(statuses).not.toContain(403);
+  // A cross-site Referer is still refused.
+  const cross = await fetchApp(new Request(`${BASE}/_serverFn/${ids[0]}`, { headers: { cookie, Referer: "http://evil.example/" } }));
+  expect(cross.status).toBe(403);
+});

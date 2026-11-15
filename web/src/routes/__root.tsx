@@ -9,7 +9,7 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { name: "color-scheme", content: "light dark" },
-      { name: "referrer", content: "no-referrer" },
+      { name: "referrer", content: "same-origin" },
       { title: "Cerebro" },
     ],
     links: [{ rel: "stylesheet", href: css }],

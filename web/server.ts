@@ -6,7 +6,7 @@ type Handler = { fetch: (req: Request) => Response | Promise<Response> };
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
-  "Referrer-Policy": "no-referrer",
+  "Referrer-Policy": "same-origin",
   "X-Frame-Options": "DENY",
   "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
 };
