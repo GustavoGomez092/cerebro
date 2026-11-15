@@ -356,6 +356,21 @@ printf '%s %s\n' "$SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | zssh "sudo tee $STATE
 zfn install_ops "$SRC" "$APP/zima" ||
   say "warning: could not install the backup scripts into $APP/zima; backups run from there (re-run the deploy)"
 
+# The web dashboard (cerebro-web) runs once its secrets exist (deploy/zima/README.md, "Web dashboard"). It is
+# not part of the health gate: a failed build or start is a warning and leaves the server release live.
+WEB_IMAGE=cerebro-web:$SHA
+WEB_OK=0
+if zssh "sudo test -s $SECRETS/web.env"; then
+  say "building $WEB_IMAGE on the server"
+  if zssh "sudo docker build -t $WEB_IMAGE -f $SRC/web/Dockerfile $SRC" &&
+    zssh "sudo docker compose -f $COMPOSE --profile web up -d --no-deps web"; then
+    WEB_OK=1
+    say "$WEB_IMAGE is running"
+  else
+    say "warning: the web dashboard ($WEB_IMAGE) did not build or start; $IMAGE is live; see: sudo docker logs cerebro-web"
+  fi
+fi
+
 if ! zssh "sudo test -s $SECRETS/check.token"; then
   zfn create_check_token "$SECRETS/check.token" ||
     say "warning: could not create the check machine token; check.sh needs $SECRETS/check.token"
@@ -390,10 +405,20 @@ stale=""
 for t in $(zssh "sudo docker images cerebro-server --format '{{.Repository}}:{{.Tag}}'" || true); do
   case $t in
     "$IMAGE" | cerebro-server:prev | "$stored_tag" | *"<none>") ;;
-    *) stale="$stale $t" ;;
+    cerebro-server:*) stale="$stale $t" ;;
   esac
 done
 if [[ -n $stale ]]; then zssh "sudo docker rmi$stale" || say "warning: could not untag$stale"; fi
+# Old web images, only once this release's web container is up (a failed one keeps the last that ran).
+if ((WEB_OK)); then
+  stale=""
+  for t in $(zssh "sudo docker images cerebro-web --format '{{.Repository}}:{{.Tag}}'" || true); do
+    case $t in
+      cerebro-web:*) [[ $t == "$WEB_IMAGE" || $t == *"<none>" ]] || stale="$stale $t" ;;
+    esac
+  done
+  if [[ -n $stale ]]; then zssh "sudo docker rmi$stale" || say "warning: could not untag$stale"; fi
+fi
 zssh "sudo docker builder prune -f --filter until=168h >/dev/null" || say "warning: build cache prune failed"
 
 say "$IMAGE is live (instance ${instance:-unknown})"

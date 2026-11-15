@@ -17,6 +17,7 @@ case $1 in
       printf 'zzz9999 from thief at 2026-11-14T00:00:00Z\n' > "$FAKE_ROOT/DATA/AppData/cerebro/state/deploy.lock/owner"
     fi
     rc=${FAKE_BUILD_RC:-0}
+    [[ "$*" == *web/Dockerfile* ]] && rc=${FAKE_WEB_BUILD_RC:-$rc}
     while (($#)); do [[ $1 == -t && $rc == 0 ]] && echo "$2" >> "$st/images"; shift; done
     exit "$rc" ;;
   tag) echo "$3" >> "$st/images"; exit 0 ;;

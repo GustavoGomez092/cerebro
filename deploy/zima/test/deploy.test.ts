@@ -491,6 +491,48 @@ describe("deploy.sh", () => {
     expect(s.calls()).toContain("docker builder prune -f --filter until=168h");
   });
 
+  test("with web.env, deploy builds cerebro-web and starts it after the server passed the gate; old web images go", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    writeFileSync(s.app("secrets/web.env"), "BETTER_AUTH_SECRET=x\n");
+    writeFileSync(join(s.state, "images"), readFileSync(join(s.state, "images"), "utf8") + "cerebro-web:old1111\n");
+    s.commit("README.md", "web\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh");
+    expect(r.code, show(r)).toBe(0);
+    const calls = s.calls().split("\n");
+    const build = calls.findIndex((l) => l.startsWith("docker build") && l.includes(`cerebro-web:${s.sha()}`) && l.includes("web/Dockerfile"));
+    const gate = calls.findIndex((l) => l.startsWith("compose-up-server"));
+    const up = calls.findIndex((l) => l.startsWith("docker compose") && l.includes("--profile web") && / up -d .*\bweb$/.test(l));
+    expect(build, s.calls()).toBeGreaterThan(-1);
+    expect(up, s.calls()).toBeGreaterThan(gate);
+    expect(s.images()).toContain(`cerebro-web:${s.sha()}`);
+    expect(s.images()).not.toContain("cerebro-web:old1111");
+  });
+
+  test("without web.env, deploy leaves the web dashboard alone", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    s.commit("README.md", "noweb\n");
+    s.clearCalls();
+    const r = s.run("deploy.sh");
+    expect(r.code, show(r)).toBe(0);
+    expect(s.calls()).not.toContain("cerebro-web");
+    expect(s.calls()).not.toContain("--profile web");
+  });
+
+  test("a failed web build is a warning: the server release stays live and nothing rolls back", () => {
+    const s = sandbox();
+    expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
+    writeFileSync(s.app("secrets/web.env"), "BETTER_AUTH_SECRET=x\n");
+    s.commit("README.md", "webfail\n");
+    const r = s.run("deploy.sh", [], { FAKE_WEB_BUILD_RC: "1" });
+    expect(r.code, show(r)).toBe(0);
+    expect(r.out + r.err).toContain("warning: the web dashboard");
+    expect(s.running()).toBe(`cerebro-server:${s.sha()}`);
+    expect(s.calls()).not.toContain("--profile web");
+  });
+
   test("later runs refresh the stored ZimaOS compose and restart app management only when metadata changed", () => {
     const s = sandbox();
     expect(s.run("deploy.sh", ["--first-run"]).code).toBe(0);
