@@ -107,8 +107,8 @@ x-casaos:
     en_us: Cerebro
   tagline:
     en_us: Private memory server
-  icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/postgresql.png
+  icon: https://api.iconify.design/fluent-emoji-flat/brain.svg
   category: Utilities
   port_map: "80"
-  hostname: cerebro.home.lab
-  index: /health
+  hostname: brain.home.lab # the tile opens the dashboard (cerebro-web); the API stays on cerebro.home.lab
+  index: /
